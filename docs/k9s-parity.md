@@ -1,0 +1,70 @@
+# K9s interaction parity
+
+Kux follows K9s's command grammar and key placement without importing K9s code. This matrix makes
+the current boundary explicit: **implemented** performs the action, **interaction** recognizes the
+K9s key and reports that its backend is pending, and **planned** is not yet exposed.
+
+## Global and navigation
+
+| Interaction | Key or command | Status |
+| --- | --- | --- |
+| Active help | `?` | Implemented |
+| Resource aliases | `Ctrl-A` | Implemented for every discovered listable resource; chooser replaces the body |
+| Quit | `:q`, `:quit`, `Ctrl-C` | Implemented |
+| Previous/next view | `Esc`, `[`, `-`, `]` | Implemented with hidden view history |
+| Resource command | `:pod`, `:secret`, `:plural.group` | Implemented; discovery includes CRDs and aggregated APIs |
+| CustomResourceDefinition command | `:crd`, `:crds` | Implemented as exact aliases for the CRD resource |
+| Resource in namespace | `:pod ns-x` | Implemented |
+| Regex, inverse, fuzzy, label filter | `/x`, `/!x`, `/-f x`, `/-l k=v` | Implemented |
+| Command/filter in in-place views | `:`, `/` | Implemented for resource, resource chooser, namespace chooser, context, details, YAML, describe, logs, container, and policy bodies |
+| Restore previous/clear filter input | `Tab`, `Ctrl-U` | Implemented with muted history hint |
+| Cancel mode | `Esc` | Implemented |
+| Context chooser/direct context | `:ctx`, `:ctx name` | Implemented; body columns are Name/Cluster/User/Namespace, switching rebuilds the client, and `Ctrl-D` confirms deletion of inactive persisted contexts |
+| Namespace chooser/direct namespace | `:ns`, `:ns name` | Implemented; body columns are Name/Status/Age, `y` opens the selected Namespace YAML, and direct selection switches immediately |
+| Recent namespace shortcuts | `0`…`9` | Implemented; `0` is always all namespaces and `1`…`9` are named recents |
+| K9s-style header menu | automatic | Implemented as a lossless responsive header: cluster information is measured and wrapped first, the upright logo is shown only when it fits, and only complete namespace/action hotkey columns are admitted in priority order |
+| Command completion | `Tab`, `Shift-Tab` | Implemented for discovered resource names, built-in aliases, contexts, and namespaces |
+| Refresh | `Ctrl-R` | Implemented |
+
+## Table interaction
+
+| Interaction | Key | Status |
+| --- | --- | --- |
+| Mark, range mark, clear | `Space`, `Ctrl-Space`, `Ctrl-\` | Implemented |
+| Faults, wide, header, logo | `Ctrl-Z/W/E/L` | Implemented |
+| Select column | `Shift-Left`, `Shift-Right` | Implemented |
+| Sort selected/name/age/namespace/status | `Shift-O/N/A/P/S` | Implemented |
+| Sort by mouse | Left-click a column header | Implemented; repeated clicks reverse direction |
+| Copy name/namespace | `c`, `n` | Implemented with native clipboard commands and OSC 52 fallback |
+| Decode Secret data | `x` | Implemented for exact core/v1 Secrets; list rows open decoded data only, while full YAML toggles encoded/decoded values |
+| Details/YAML/object description | `Enter`, `y`, `d` | Implemented in place; `d` runs qualified `kubectl describe` |
+| Warp to namespace | `w` | Implemented in all-namespace views |
+| Pod and node metrics columns | automatic | Implemented through `metrics.k8s.io` |
+| Node → pods on node | `Enter` on Node | Implemented with server-side field selector |
+| Pod → containers | `Enter` on Pod | Implemented for regular, init, and ephemeral containers |
+| Container → logs | `Enter` on container | Implemented with explicit container selection |
+| APIService status table | `:apiservice` | Implemented with `NAME`, `SERVICE`, `AVAILABLE`, and `AGE` |
+| ServiceAccount effective rules | `Enter` on ServiceAccount | Implemented by matching RoleBindings and ClusterRoleBindings and resolving referenced roles |
+| RBAC rule view | `Enter` on Role/ClusterRole/RoleBinding/ClusterRoleBinding | Implemented as a resource, API group, binding, and verb matrix |
+
+## Content and mutations
+
+| Interaction | Key | Status |
+| --- | --- | --- |
+| Pod/container logs/previous logs | `l`, `p` | Implemented, last 500 lines |
+| Copy YAML/toggle managed fields | `c`, `m` in YAML | Implemented; copy uses the visible variant |
+| Copy decoded Secret data | `c` in Secret data view | Implemented; copies the data-only body |
+| Wrap/timestamps/fullscreen | `w`, `t`, `f` in content view | Implemented UI toggles |
+| Delete resource or inactive context with Tab + Enter confirmation | `Ctrl-D` | Implemented; active/synthetic contexts and resources without delete capability remain protected |
+| Kill without confirmation | `Ctrl-K` | Implemented with zero grace period |
+| Pod shell/attach | `s`, `a` | Interaction; backend pending |
+| Edit | `e` | Interaction; backend pending |
+| Port-forward list/start | `f`, `Shift-F` | Interaction; backend pending |
+| Owner navigation | `Shift-J` | Interaction; backend pending |
+| Service benchmark | `b` | Interaction; backend pending |
+| Cordon/uncordon and drain | `u`, `r` on Nodes | Interaction; backend pending |
+| Workload restart | `r` on Deployments/StatefulSets/DaemonSets | Interaction; backend pending |
+| Namespace use, UsedBy, CronJob trigger | `u`, `t` | Planned with those resource views |
+
+Mutations are enabled by default for K9s-compatible operation. `--read-only` disables resource and
+context deletion, kill, and every future mutation path.

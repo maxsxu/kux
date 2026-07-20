@@ -1,0 +1,2787 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::{Debug, Write as _},
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use futures::StreamExt;
+use k8s_openapi::api::{
+    apps::v1::{DaemonSet, Deployment, StatefulSet},
+    core::v1::{ContainerStatus, Namespace, Node, Pod, Service},
+    rbac::v1::{ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, Subject},
+};
+use kube::{
+    Api, Client, Config, Resource, ResourceExt,
+    api::{DeleteParams, ListParams, LogParams},
+    config::KubeConfigOptions,
+    core::{ApiResource, DynamicObject, GroupVersionKind},
+    runtime::{WatchStreamExt, watcher},
+};
+use rustc_hash::FxHashMap;
+use serde::de::DeserializeOwned;
+use tokio::{
+    process::Command,
+    sync::{mpsc, watch},
+};
+
+use crate::{
+    app::{ActionIntent, ContainerTarget, ContentKind, ResourceTarget},
+    model::{
+        ContainerData, NamespaceInfo, NodeData, PodData, PolicyData, ResourceData,
+        ResourceDescriptor, ResourceKind, ResourceRow, ResourceSnapshot, SourceState,
+    },
+};
+
+use super::{ActionResult, KubernetesSettings, WatchRequest, discovery::discover_resources};
+
+pub async fn run_manager(
+    client: Client,
+    settings: KubernetesSettings,
+    mut requests: mpsc::Receiver<WatchRequest>,
+    snapshots: watch::Sender<ResourceSnapshot>,
+    mut actions: mpsc::Receiver<ActionIntent>,
+    action_results: mpsc::Sender<ActionResult>,
+) {
+    let mut client = client;
+    let mut active_context = settings.initial_context.clone();
+    refresh_cluster_metadata(
+        client.clone(),
+        active_context.clone(),
+        action_results.clone(),
+    );
+    let mut running: Option<tokio::task::JoinHandle<()>> = None;
+    loop {
+        tokio::select! {
+            Some(request) = requests.recv() => {
+                if request.context != active_context {
+                    match client_for_context(&request.context).await {
+                        Ok(next_client) => {
+                            client = next_client;
+                            active_context.clone_from(&request.context);
+                            refresh_cluster_metadata(
+                                client.clone(),
+                                active_context.clone(),
+                                action_results.clone(),
+                            );
+                        }
+                        Err(error) => {
+                            let _ = action_results.send(ActionResult::Error(error)).await;
+                            continue;
+                        }
+                    }
+                }
+                if let Some(task) = running.take() {
+                    task.abort();
+                }
+                let client = client.clone();
+                let settings = settings.clone();
+                let snapshots = snapshots.clone();
+                running = Some(tokio::spawn(async move {
+                    run_watch(client, settings, request, snapshots).await;
+                }));
+            }
+            Some(action) = actions.recv() => {
+                let client = client.clone();
+                let context = active_context.clone();
+                let action_results = action_results.clone();
+                tokio::spawn(async move {
+                    let result = handle_action(client, &context, action).await;
+                    let _ = action_results.send(result).await;
+                });
+            }
+            else => break,
+        }
+    }
+    if let Some(task) = running {
+        task.abort();
+    }
+}
+
+fn refresh_cluster_metadata(
+    client: Client,
+    context: String,
+    action_results: mpsc::Sender<ActionResult>,
+) {
+    tokio::spawn(async move {
+        if let Ok(resources) = discover_resources(client.clone()).await {
+            let _ = action_results
+                .send(ActionResult::ResourceOptions {
+                    context: context.clone(),
+                    resources,
+                })
+                .await;
+        }
+        if let Ok(version) = client.apiserver_version().await {
+            let _ = action_results
+                .send(ActionResult::ServerVersion(version.git_version))
+                .await;
+        }
+        let Ok(namespaces) = Api::<Namespace>::all(client)
+            .list(&ListParams::default())
+            .await
+        else {
+            return;
+        };
+        let mut namespaces: Vec<NamespaceInfo> =
+            namespaces.items.iter().map(namespace_info).collect();
+        namespaces.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        namespaces.dedup_by(|left, right| left.name == right.name);
+        let _ = action_results
+            .send(ActionResult::NamespaceOptions {
+                context,
+                namespaces,
+            })
+            .await;
+    });
+}
+
+fn namespace_info(namespace: &Namespace) -> NamespaceInfo {
+    NamespaceInfo::discovered(
+        namespace.name_any(),
+        namespace
+            .status
+            .as_ref()
+            .and_then(|status| status.phase.clone())
+            .unwrap_or_else(|| "Unknown".to_owned()),
+        namespace
+            .metadata
+            .creation_timestamp
+            .as_ref()
+            .map(|time| time.0.as_second()),
+    )
+}
+
+async fn client_for_context(context: &str) -> Result<Client, String> {
+    let config = Config::from_kubeconfig(&KubeConfigOptions {
+        context: Some(context.to_owned()),
+        ..KubeConfigOptions::default()
+    })
+    .await
+    .map_err(|error| format!("Unable to load context {context:?}: {error}"))?;
+    Client::try_from(config)
+        .map_err(|error| format!("Unable to create client for context {context:?}: {error}"))
+}
+
+async fn run_watch(
+    client: Client,
+    settings: KubernetesSettings,
+    request: WatchRequest,
+    snapshots: watch::Sender<ResourceSnapshot>,
+) {
+    let _ = snapshots.send(ResourceSnapshot::loading(
+        request.generation,
+        request.kind.clone(),
+    ));
+    match request.kind.known_kind() {
+        Some(ResourceKind::Pods) => {
+            let api = namespaced_api::<Pod>(client.clone(), request.namespace.as_deref());
+            watch_api(api, client, settings, request, snapshots, pod_row).await;
+        }
+        Some(ResourceKind::Deployments) => {
+            let api = namespaced_api::<Deployment>(client.clone(), request.namespace.as_deref());
+            watch_api(api, client, settings, request, snapshots, deployment_row).await;
+        }
+        Some(ResourceKind::StatefulSets) => {
+            let api = namespaced_api::<StatefulSet>(client.clone(), request.namespace.as_deref());
+            watch_api(api, client, settings, request, snapshots, stateful_set_row).await;
+        }
+        Some(ResourceKind::DaemonSets) => {
+            let api = namespaced_api::<DaemonSet>(client.clone(), request.namespace.as_deref());
+            watch_api(api, client, settings, request, snapshots, daemon_set_row).await;
+        }
+        Some(ResourceKind::Services) => {
+            let api = namespaced_api::<Service>(client.clone(), request.namespace.as_deref());
+            watch_api(api, client, settings, request, snapshots, service_row).await;
+        }
+        Some(ResourceKind::Nodes) => {
+            let api = Api::<Node>::all(client.clone());
+            watch_api(api, client, settings, request, snapshots, node_row).await;
+        }
+        None => {
+            let api = dynamic_api(client.clone(), &request.kind, request.namespace.as_deref());
+            if request.kind.operations.watchable() {
+                watch_api(api, client, settings, request, snapshots, dynamic_row).await;
+            } else {
+                poll_dynamic_api(api, settings, request, snapshots).await;
+            }
+        }
+    }
+}
+
+fn namespaced_api<K>(client: Client, namespace: Option<&str>) -> Api<K>
+where
+    K: Resource<Scope = kube::core::NamespaceResourceScope>,
+    K::DynamicType: Default,
+{
+    match namespace {
+        Some(namespace) => Api::<K>::namespaced(client, namespace),
+        None => Api::<K>::all(client),
+    }
+}
+
+fn api_resource(resource: &ResourceDescriptor) -> ApiResource {
+    ApiResource {
+        group: resource.group.to_string(),
+        version: resource.version.to_string(),
+        api_version: resource.api_version.to_string(),
+        kind: resource.kind.to_string(),
+        plural: resource.plural.to_string(),
+    }
+}
+
+fn dynamic_api(
+    client: Client,
+    resource: &ResourceDescriptor,
+    namespace: Option<&str>,
+) -> Api<DynamicObject> {
+    let api_resource = api_resource(resource);
+    if resource.is_namespaced() {
+        namespace.map_or_else(
+            || Api::<DynamicObject>::all_with(client.clone(), &api_resource),
+            |namespace| {
+                Api::<DynamicObject>::namespaced_with(client.clone(), namespace, &api_resource)
+            },
+        )
+    } else {
+        Api::<DynamicObject>::all_with(client, &api_resource)
+    }
+}
+
+async fn handle_action(client: Client, context: &str, action: ActionIntent) -> ActionResult {
+    let result = match action {
+        ActionIntent::Delete { target, immediate } => {
+            delete_resource(client, &target, immediate).await.map(|()| {
+                ActionResult::Notice(format!(
+                    "{} {}/{}",
+                    if immediate { "Killed" } else { "Deleted" },
+                    target.namespace.as_deref().unwrap_or("cluster"),
+                    target.name
+                ))
+            })
+        }
+        ActionIntent::DeleteContext { name } => delete_context(context, &name).await,
+        ActionIntent::Content { target, content } => {
+            fetch_content(client, context, &target, content).await
+        }
+        ActionIntent::Containers { target } => load_containers(client, target).await,
+        ActionIntent::ContainerLogs { target, previous } => {
+            fetch_container_logs(client, target, previous).await
+        }
+        ActionIntent::AuthorizationPolicy { target } => {
+            load_authorization_policy(client, target).await
+        }
+    };
+    result.unwrap_or_else(ActionResult::Error)
+}
+
+async fn delete_resource(
+    client: Client,
+    target: &ResourceTarget,
+    immediate: bool,
+) -> Result<(), String> {
+    ensure_deletable(target)?;
+    let mut params = DeleteParams::background();
+    if immediate {
+        params.grace_period_seconds = Some(0);
+    }
+    delete_from(dynamic_target_api(client, target)?, target, &params).await
+}
+
+fn ensure_deletable(target: &ResourceTarget) -> Result<(), String> {
+    if !target.kind.operations.deletable() {
+        return Err(format!(
+            "{} does not advertise delete support",
+            target.kind.qualified_name()
+        ));
+    }
+    Ok(())
+}
+
+fn context_delete_args(name: &str) -> [&str; 3] {
+    ["config", "delete-context", name]
+}
+
+async fn delete_context(active_context: &str, name: &str) -> Result<ActionResult, String> {
+    let output = Command::new("kubectl")
+        .args(context_delete_args(name))
+        .output()
+        .await
+        .map_err(|error| format!("Unable to run kubectl config delete-context: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if stderr.is_empty() {
+            format!(
+                "kubectl config delete-context failed with {}",
+                output.status
+            )
+        } else {
+            stderr
+        });
+    }
+    let catalog = crate::kubeconfig::read_contexts(Some(active_context))?;
+    Ok(ActionResult::ContextOptions {
+        context: active_context.to_owned(),
+        contexts: catalog.contexts,
+        notice: format!("Deleted context {name}"),
+    })
+}
+
+async fn delete_from<K>(
+    api: Api<K>,
+    target: &ResourceTarget,
+    params: &DeleteParams,
+) -> Result<(), String>
+where
+    K: Clone + Resource + DeserializeOwned + Debug,
+{
+    api.delete(&target.name, params)
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+async fn fetch_content(
+    client: Client,
+    context: &str,
+    target: &ResourceTarget,
+    content_kind: ContentKind,
+) -> Result<ActionResult, String> {
+    if content_kind == ContentKind::SecretData {
+        return fetch_secret_data(client, target).await;
+    }
+    if content_kind == ContentKind::Describe {
+        return describe_resource(context, target).await;
+    }
+    if matches!(content_kind, ContentKind::Logs | ContentKind::PreviousLogs) {
+        if target.kind.known_kind() != Some(ResourceKind::Pods) {
+            return Err("Logs are currently supported for pods only".to_owned());
+        }
+        let api = namespaced_target_api::<Pod>(client, target)?;
+        let body = api
+            .logs(
+                &target.name,
+                &LogParams {
+                    previous: content_kind == ContentKind::PreviousLogs,
+                    tail_lines: Some(500),
+                    ..LogParams::default()
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let label = if content_kind == ContentKind::PreviousLogs {
+            "Previous Logs"
+        } else {
+            "Logs"
+        };
+        return Ok(ActionResult::Content {
+            title: format!("{label} · {}", target.name),
+            body,
+            managed_fields: None,
+            decoded_body: None,
+            decoded_managed_fields: None,
+            content: content_kind,
+        });
+    }
+
+    if !target.kind.operations.gettable() {
+        return Err(format!(
+            "{} does not advertise get support",
+            target.kind.qualified_name()
+        ));
+    }
+    let yaml = yaml_from(dynamic_target_api(client, target)?, target).await?;
+    Ok(ActionResult::Content {
+        title: yaml_title(target),
+        body: yaml.body,
+        managed_fields: yaml.with_managed_fields,
+        decoded_body: yaml.decoded_body,
+        decoded_managed_fields: yaml.decoded_with_managed_fields,
+        content: content_kind,
+    })
+}
+
+async fn fetch_secret_data(
+    client: Client,
+    target: &ResourceTarget,
+) -> Result<ActionResult, String> {
+    if !target.kind.is_core_v1_secret() {
+        return Err("Secret decoding is supported for core/v1 Secrets only".to_owned());
+    }
+    let object = dynamic_target_api(client, target)?
+        .get(&target.name)
+        .await
+        .map_err(|error| error.to_string())?;
+    secret_data_content(&object, target)
+}
+
+fn secret_data_content(
+    object: &DynamicObject,
+    target: &ResourceTarget,
+) -> Result<ActionResult, String> {
+    let values = decode_secret_data(object)?;
+    let body = serde_yaml::to_string(&values).map_err(|error| error.to_string())?;
+    Ok(ActionResult::Content {
+        title: target.namespace.as_deref().map_or_else(
+            || format!("Secret({})", target.name),
+            |namespace| format!("Secret({namespace}/{})", target.name),
+        ),
+        body,
+        managed_fields: None,
+        decoded_body: None,
+        decoded_managed_fields: None,
+        content: ContentKind::SecretData,
+    })
+}
+
+async fn describe_resource(context: &str, target: &ResourceTarget) -> Result<ActionResult, String> {
+    let output = Command::new("kubectl")
+        .args(describe_args(context, target))
+        .output()
+        .await
+        .map_err(|error| format!("Unable to run kubectl describe: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if stderr.is_empty() {
+            format!("kubectl describe failed with {}", output.status)
+        } else {
+            stderr
+        });
+    }
+    Ok(ActionResult::Content {
+        title: format!("Describe · {}", target.name),
+        body: String::from_utf8_lossy(&output.stdout).into_owned(),
+        managed_fields: None,
+        decoded_body: None,
+        decoded_managed_fields: None,
+        content: ContentKind::Describe,
+    })
+}
+
+fn describe_args(context: &str, target: &ResourceTarget) -> Vec<String> {
+    let mut args = vec![
+        "describe".to_owned(),
+        target.kind.qualified_name(),
+        target.name.clone(),
+        "--context".to_owned(),
+        context.to_owned(),
+    ];
+    if let Some(namespace) = &target.namespace {
+        args.extend(["--namespace".to_owned(), namespace.clone()]);
+    }
+    args
+}
+
+struct YamlContent {
+    body: String,
+    with_managed_fields: Option<String>,
+    decoded_body: Option<String>,
+    decoded_with_managed_fields: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResourceUsage {
+    cpu_millis: Option<u64>,
+    memory_bytes: Option<u64>,
+}
+
+enum EnrichmentUpdate {
+    PodUsage(FxHashMap<Arc<str>, ResourceUsage>),
+    NodeUsage(FxHashMap<Arc<str>, ResourceUsage>),
+    NodePods(FxHashMap<Arc<str>, u32>),
+}
+
+#[derive(Default)]
+struct EnrichmentState {
+    pod_usage: FxHashMap<Arc<str>, ResourceUsage>,
+    node_usage: FxHashMap<Arc<str>, ResourceUsage>,
+    node_pods: FxHashMap<Arc<str>, u32>,
+}
+
+impl EnrichmentState {
+    fn update(&mut self, update: EnrichmentUpdate) {
+        match update {
+            EnrichmentUpdate::PodUsage(usage) => self.pod_usage = usage,
+            EnrichmentUpdate::NodeUsage(usage) => self.node_usage = usage,
+            EnrichmentUpdate::NodePods(pods) => self.node_pods = pods,
+        }
+    }
+
+    fn apply(&self, row: &mut ResourceRow) {
+        match &mut row.data {
+            ResourceData::Pod(data) => {
+                if let Some(usage) = self.pod_usage.get(&row.key) {
+                    data.cpu_millis = usage.cpu_millis;
+                    data.memory_bytes = usage.memory_bytes;
+                }
+            }
+            ResourceData::Node(data) => {
+                if let Some(usage) = self.node_usage.get(row.name.as_ref()) {
+                    data.cpu_millis = usage.cpu_millis;
+                    data.memory_bytes = usage.memory_bytes;
+                }
+                data.pods = self.node_pods.get(row.name.as_ref()).copied().unwrap_or(0);
+            }
+            ResourceData::Generic | ResourceData::Container(_) | ResourceData::Policy(_) => {}
+        }
+    }
+
+    fn apply_all(&self, rows: &mut FxHashMap<Arc<str>, Arc<ResourceRow>>) {
+        for row in rows.values_mut() {
+            self.apply(Arc::make_mut(row));
+        }
+    }
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn spawn_enrichment_tasks(
+    client: Client,
+    request: &WatchRequest,
+    settings: &KubernetesSettings,
+    updates: mpsc::Sender<EnrichmentUpdate>,
+) -> Vec<AbortOnDrop> {
+    match request.kind.known_kind() {
+        Some(ResourceKind::Pods) if request.field_selector.is_none() => vec![AbortOnDrop(
+            tokio::spawn(pod_metrics_loop(client, request.namespace.clone(), updates)),
+        )],
+        Some(ResourceKind::Nodes) => vec![
+            AbortOnDrop(tokio::spawn(node_metrics_loop(
+                client.clone(),
+                updates.clone(),
+            ))),
+            AbortOnDrop(tokio::spawn(node_pod_count_loop(
+                client,
+                settings.streaming_lists,
+                updates,
+            ))),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+async fn pod_metrics_loop(
+    client: Client,
+    namespace: Option<String>,
+    updates: mpsc::Sender<EnrichmentUpdate>,
+) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(5));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        if let Ok(usage) = fetch_pod_metrics(client.clone(), namespace.as_deref()).await {
+            let _ = updates.try_send(EnrichmentUpdate::PodUsage(usage));
+        }
+    }
+}
+
+async fn node_metrics_loop(client: Client, updates: mpsc::Sender<EnrichmentUpdate>) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(5));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        if let Ok(usage) = fetch_node_metrics(client.clone()).await {
+            let _ = updates.try_send(EnrichmentUpdate::NodeUsage(usage));
+        }
+    }
+}
+
+async fn fetch_pod_metrics(
+    client: Client,
+    namespace: Option<&str>,
+) -> Result<FxHashMap<Arc<str>, ResourceUsage>, kube::Error> {
+    let resource = metrics_resource("PodMetrics", "pods");
+    let api = match namespace {
+        Some(namespace) => Api::<DynamicObject>::namespaced_with(client, namespace, &resource),
+        None => Api::<DynamicObject>::all_with(client, &resource),
+    };
+    let metrics = api.list(&ListParams::default()).await?;
+    let usage = metrics
+        .items
+        .into_iter()
+        .filter_map(|metric| {
+            let namespace = metric.namespace()?;
+            let name = metric.metadata.name.as_deref()?;
+            let containers = metric.data.get("containers")?.as_array()?;
+            let mut cpu_millis = 0_u64;
+            let mut memory_bytes = 0_u64;
+            let mut has_cpu = false;
+            let mut has_memory = false;
+            for container in containers {
+                let container_usage = container.get("usage")?;
+                if let Some(value) = container_usage
+                    .get("cpu")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(parse_cpu_millis)
+                {
+                    cpu_millis = cpu_millis.saturating_add(value);
+                    has_cpu = true;
+                }
+                if let Some(value) = container_usage
+                    .get("memory")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(parse_memory_bytes)
+                {
+                    memory_bytes = memory_bytes.saturating_add(value);
+                    has_memory = true;
+                }
+            }
+            Some((
+                Arc::from(format!("{namespace}/{name}")),
+                ResourceUsage {
+                    cpu_millis: has_cpu.then_some(cpu_millis),
+                    memory_bytes: has_memory.then_some(memory_bytes),
+                },
+            ))
+        })
+        .collect();
+    Ok(usage)
+}
+
+async fn fetch_node_metrics(
+    client: Client,
+) -> Result<FxHashMap<Arc<str>, ResourceUsage>, kube::Error> {
+    let resource = metrics_resource("NodeMetrics", "nodes");
+    let metrics = Api::<DynamicObject>::all_with(client, &resource)
+        .list(&ListParams::default())
+        .await?;
+    Ok(metrics
+        .items
+        .into_iter()
+        .filter_map(|metric| {
+            let name = Arc::<str>::from(metric.metadata.name.as_deref()?);
+            let usage = metric.data.get("usage")?;
+            Some((
+                name,
+                ResourceUsage {
+                    cpu_millis: usage
+                        .get("cpu")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(parse_cpu_millis),
+                    memory_bytes: usage
+                        .get("memory")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(parse_memory_bytes),
+                },
+            ))
+        })
+        .collect())
+}
+
+fn metrics_resource(kind: &str, plural: &str) -> ApiResource {
+    ApiResource::from_gvk_with_plural(
+        &GroupVersionKind::gvk("metrics.k8s.io", "v1beta1", kind),
+        plural,
+    )
+}
+
+async fn node_pod_count_loop(
+    client: Client,
+    streaming_lists: bool,
+    updates: mpsc::Sender<EnrichmentUpdate>,
+) {
+    let config = if streaming_lists {
+        watcher::Config::default().streaming_lists()
+    } else {
+        watcher::Config::default().page_size(500)
+    };
+    let stream = watcher::watcher(Api::<Pod>::all(client), config).default_backoff();
+    tokio::pin!(stream);
+    let mut assignments: FxHashMap<Arc<str>, Arc<str>> = FxHashMap::default();
+    let mut initializing: Option<FxHashMap<Arc<str>, Arc<str>>> = None;
+    let mut dirty = false;
+    let mut ticker = tokio::time::interval(Duration::from_millis(250));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            event = stream.next() => match event {
+                Some(Ok(watcher::Event::Init)) => {
+                    initializing = Some(FxHashMap::default());
+                }
+                Some(Ok(watcher::Event::InitApply(pod))) => {
+                    if let Some((key, node)) = pod_assignment(&pod) {
+                        initializing.get_or_insert_with(FxHashMap::default).insert(key, node);
+                    }
+                }
+                Some(Ok(watcher::Event::InitDone)) => {
+                    if let Some(initial) = initializing.take() {
+                        assignments = initial;
+                    }
+                    let counts = assignment_counts(&assignments);
+                    let _ = updates.try_send(EnrichmentUpdate::NodePods(counts));
+                    dirty = false;
+                }
+                Some(Ok(watcher::Event::Apply(pod))) => {
+                    update_assignment(&mut assignments, &pod);
+                    dirty = true;
+                }
+                Some(Ok(watcher::Event::Delete(pod))) => {
+                    assignments.remove(&pod_key(&pod));
+                    dirty = true;
+                }
+                Some(Err(_)) => {}
+                None => return,
+            },
+            _ = ticker.tick(), if dirty && initializing.is_none() => {
+                let counts = assignment_counts(&assignments);
+                let _ = updates.try_send(EnrichmentUpdate::NodePods(counts));
+                dirty = false;
+            }
+        }
+    }
+}
+
+fn pod_key(pod: &Pod) -> Arc<str> {
+    Arc::from(format!(
+        "{}/{}",
+        pod.namespace().unwrap_or_default(),
+        pod.name_any()
+    ))
+}
+
+fn pod_assignment(pod: &Pod) -> Option<(Arc<str>, Arc<str>)> {
+    let node = pod.spec.as_ref()?.node_name.as_deref()?;
+    Some((pod_key(pod), Arc::from(node)))
+}
+
+fn update_assignment(assignments: &mut FxHashMap<Arc<str>, Arc<str>>, pod: &Pod) {
+    let key = pod_key(pod);
+    if let Some((_, node)) = pod_assignment(pod) {
+        assignments.insert(key, node);
+    } else {
+        assignments.remove(&key);
+    }
+}
+
+fn assignment_counts(assignments: &FxHashMap<Arc<str>, Arc<str>>) -> FxHashMap<Arc<str>, u32> {
+    let mut counts = FxHashMap::default();
+    for node in assignments.values() {
+        let count = counts.entry(Arc::clone(node)).or_insert(0_u32);
+        *count = count.saturating_add(1);
+    }
+    counts
+}
+
+fn namespaced_target_api<K>(client: Client, target: &ResourceTarget) -> Result<Api<K>, String>
+where
+    K: Resource<Scope = kube::core::NamespaceResourceScope>,
+    K::DynamicType: Default,
+{
+    target
+        .namespace
+        .as_deref()
+        .map(|namespace| Api::<K>::namespaced(client, namespace))
+        .ok_or_else(|| format!("{} requires a namespace", target.name))
+}
+
+fn dynamic_target_api(
+    client: Client,
+    target: &ResourceTarget,
+) -> Result<Api<DynamicObject>, String> {
+    if target.kind.is_namespaced() && target.namespace.is_none() {
+        return Err(format!("{} requires a namespace", target.name));
+    }
+    Ok(dynamic_api(
+        client,
+        &target.kind,
+        target.namespace.as_deref(),
+    ))
+}
+
+fn yaml_title(target: &ResourceTarget) -> String {
+    target.namespace.as_deref().map_or_else(
+        || format!("YAML({})", target.name),
+        |namespace| format!("YAML({namespace}/{})", target.name),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum PolicyRoleKind {
+    Role,
+    ClusterRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PolicyReference {
+    role_kind: PolicyRoleKind,
+    role_namespace: Option<String>,
+    role_name: String,
+    scope: String,
+    binding: String,
+}
+
+struct PolicyRules {
+    scope: String,
+    binding: String,
+    rules: Vec<PolicyRule>,
+}
+
+async fn load_authorization_policy(
+    client: Client,
+    target: ResourceTarget,
+) -> Result<ActionResult, String> {
+    let kind = target.kind.kind.as_ref();
+    let namespace = target.namespace.as_deref();
+    let (title, sources) = match kind {
+        "ServiceAccount" => {
+            let namespace = namespace
+                .ok_or_else(|| "ServiceAccount authorization requires a namespace".to_owned())?;
+            let references =
+                service_account_references(client.clone(), namespace, &target.name).await?;
+            (
+                format!("policy(ServiceAccount:{namespace}/{})", target.name),
+                resolve_policy_references(client, references).await?,
+            )
+        }
+        "Role" => {
+            let namespace = namespace.ok_or_else(|| "Role requires a namespace".to_owned())?;
+            let role = Api::<Role>::namespaced(client, namespace)
+                .get(&target.name)
+                .await
+                .map_err(|error| error.to_string())?;
+            (
+                format!("rbac(Role:{namespace}/{})", target.name),
+                vec![PolicyRules {
+                    scope: namespace.to_owned(),
+                    binding: format!("RO:{}", target.name),
+                    rules: role.rules.unwrap_or_default(),
+                }],
+            )
+        }
+        "ClusterRole" => {
+            let role = Api::<ClusterRole>::all(client)
+                .get(&target.name)
+                .await
+                .map_err(|error| error.to_string())?;
+            (
+                format!("rbac(ClusterRole:{})", target.name),
+                vec![PolicyRules {
+                    scope: "-".to_owned(),
+                    binding: format!("CR:{}", target.name),
+                    rules: role.rules.unwrap_or_default(),
+                }],
+            )
+        }
+        "RoleBinding" => {
+            let namespace =
+                namespace.ok_or_else(|| "RoleBinding requires a namespace".to_owned())?;
+            let binding = Api::<RoleBinding>::namespaced(client.clone(), namespace)
+                .get(&target.name)
+                .await
+                .map_err(|error| error.to_string())?;
+            let reference = reference_from_role_binding(&binding, true)?;
+            (
+                format!("rbac(RoleBinding:{namespace}/{})", target.name),
+                resolve_policy_references(client, BTreeSet::from([reference])).await?,
+            )
+        }
+        "ClusterRoleBinding" => {
+            let binding = Api::<ClusterRoleBinding>::all(client.clone())
+                .get(&target.name)
+                .await
+                .map_err(|error| error.to_string())?;
+            let reference = reference_from_cluster_role_binding(&binding, true)?;
+            (
+                format!("rbac(ClusterRoleBinding:{})", target.name),
+                resolve_policy_references(client, BTreeSet::from([reference])).await?,
+            )
+        }
+        _ => {
+            return Err(format!(
+                "{} is not an RBAC authorization resource",
+                target.kind
+            ));
+        }
+    };
+    Ok(ActionResult::Policy {
+        target,
+        title,
+        rows: policy_rows(sources),
+    })
+}
+
+async fn service_account_references(
+    client: Client,
+    namespace: &str,
+    name: &str,
+) -> Result<BTreeSet<PolicyReference>, String> {
+    let (mut references, cluster_references) = tokio::try_join!(
+        collect_policy_references(Api::<RoleBinding>::all(client.clone()), |binding| {
+            let binding_namespace = binding.namespace().unwrap_or_default();
+            let matches = binding.subjects.as_deref().is_some_and(|subjects| {
+                subjects.iter().any(|subject| {
+                    service_account_subject_matches(
+                        subject,
+                        namespace,
+                        name,
+                        Some(&binding_namespace),
+                    )
+                })
+            });
+            matches
+                .then(|| reference_from_role_binding(binding, false))
+                .transpose()
+        }),
+        collect_policy_references(Api::<ClusterRoleBinding>::all(client), |binding| {
+            let matches = binding.subjects.as_deref().is_some_and(|subjects| {
+                subjects
+                    .iter()
+                    .any(|subject| service_account_subject_matches(subject, namespace, name, None))
+            });
+            matches
+                .then(|| reference_from_cluster_role_binding(binding, false))
+                .transpose()
+        })
+    )?;
+    references.extend(cluster_references);
+    Ok(references)
+}
+
+async fn collect_policy_references<K, F>(
+    api: Api<K>,
+    mut project: F,
+) -> Result<BTreeSet<PolicyReference>, String>
+where
+    K: Clone + DeserializeOwned + Debug,
+    F: FnMut(&K) -> Result<Option<PolicyReference>, String>,
+{
+    let mut references = BTreeSet::new();
+    let mut token = None;
+    loop {
+        let params = token.as_deref().map_or_else(
+            || ListParams::default().limit(500),
+            |token| ListParams::default().limit(500).continue_token(token),
+        );
+        let page = api.list(&params).await.map_err(|error| error.to_string())?;
+        for item in &page.items {
+            if let Some(reference) = project(item)? {
+                references.insert(reference);
+            }
+        }
+        token = page.metadata.continue_.filter(|token| !token.is_empty());
+        if token.is_none() {
+            return Ok(references);
+        }
+    }
+}
+
+fn service_account_subject_matches(
+    subject: &Subject,
+    namespace: &str,
+    name: &str,
+    binding_namespace: Option<&str>,
+) -> bool {
+    subject.kind == "ServiceAccount"
+        && subject.name == name
+        && subject.namespace.as_deref().or(binding_namespace) == Some(namespace)
+}
+
+fn reference_from_role_binding(
+    binding: &RoleBinding,
+    include_binding: bool,
+) -> Result<PolicyReference, String> {
+    let namespace = binding
+        .namespace()
+        .ok_or_else(|| format!("RoleBinding {} has no namespace", binding.name_any()))?;
+    let role_kind = match binding.role_ref.kind.as_str() {
+        "Role" => PolicyRoleKind::Role,
+        "ClusterRole" => PolicyRoleKind::ClusterRole,
+        kind => return Err(format!("Unsupported RoleBinding roleRef kind {kind:?}")),
+    };
+    let prefix = if role_kind == PolicyRoleKind::Role {
+        "RO"
+    } else {
+        "CR"
+    };
+    let role = format!("{prefix}:{}", binding.role_ref.name);
+    Ok(PolicyReference {
+        role_namespace: (role_kind == PolicyRoleKind::Role).then(|| namespace.clone()),
+        role_kind,
+        role_name: binding.role_ref.name.clone(),
+        scope: namespace,
+        binding: if include_binding {
+            format!("RB:{}→{role}", binding.name_any())
+        } else {
+            role
+        },
+    })
+}
+
+fn reference_from_cluster_role_binding(
+    binding: &ClusterRoleBinding,
+    include_binding: bool,
+) -> Result<PolicyReference, String> {
+    if binding.role_ref.kind != "ClusterRole" {
+        return Err(format!(
+            "Unsupported ClusterRoleBinding roleRef kind {:?}",
+            binding.role_ref.kind
+        ));
+    }
+    let role = format!("CR:{}", binding.role_ref.name);
+    Ok(PolicyReference {
+        role_kind: PolicyRoleKind::ClusterRole,
+        role_namespace: None,
+        role_name: binding.role_ref.name.clone(),
+        scope: "-".to_owned(),
+        binding: if include_binding {
+            format!("CRB:{}→{role}", binding.name_any())
+        } else {
+            role
+        },
+    })
+}
+
+async fn resolve_policy_references(
+    client: Client,
+    references: BTreeSet<PolicyReference>,
+) -> Result<Vec<PolicyRules>, String> {
+    let references: Vec<_> = references.into_iter().collect();
+    let role_keys: BTreeSet<_> = references
+        .iter()
+        .map(|reference| {
+            (
+                reference.role_kind.clone(),
+                reference.role_namespace.clone(),
+                reference.role_name.clone(),
+            )
+        })
+        .collect();
+    let tasks = role_keys.into_iter().map(|role_key| {
+        let client = client.clone();
+        async move {
+            let rules = match &role_key.0 {
+                PolicyRoleKind::Role => {
+                    let namespace = role_key
+                        .1
+                        .as_deref()
+                        .ok_or_else(|| "Role reference has no namespace".to_owned())?;
+                    Api::<Role>::namespaced(client, namespace)
+                        .get(&role_key.2)
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .rules
+                        .unwrap_or_default()
+                }
+                PolicyRoleKind::ClusterRole => Api::<ClusterRole>::all(client)
+                    .get(&role_key.2)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .rules
+                    .unwrap_or_default(),
+            };
+            Ok::<_, String>((role_key, rules))
+        }
+    });
+    let mut resolved = BTreeMap::new();
+    for result in futures::stream::iter(tasks)
+        .buffer_unordered(16)
+        .collect::<Vec<_>>()
+        .await
+    {
+        let (role_key, rules) = result?;
+        resolved.insert(role_key, rules);
+    }
+    references
+        .into_iter()
+        .map(|reference| {
+            let role_key = (
+                reference.role_kind,
+                reference.role_namespace,
+                reference.role_name,
+            );
+            let rules = resolved.get(&role_key).cloned().ok_or_else(|| {
+                "Resolved role disappeared from the authorization cache".to_owned()
+            })?;
+            Ok(PolicyRules {
+                scope: reference.scope,
+                binding: reference.binding,
+                rules,
+            })
+        })
+        .collect()
+}
+
+fn policy_rows(sources: Vec<PolicyRules>) -> Vec<Arc<ResourceRow>> {
+    let mut policies: BTreeMap<(String, String, String, String), BTreeSet<String>> =
+        BTreeMap::new();
+    for source in sources {
+        for rule in &source.rules {
+            let mut groups: Vec<_> = rule
+                .api_groups
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(String::as_str)
+                .collect();
+            if groups.is_empty() {
+                groups.push("");
+            }
+            for group in groups {
+                let display_group = if group.is_empty() {
+                    "core".to_owned()
+                } else {
+                    group.to_owned()
+                };
+                for resource in rule.resources.as_deref().unwrap_or_default() {
+                    let resource_names = rule.resource_names.as_deref().unwrap_or_default();
+                    if resource_names.is_empty() {
+                        insert_policy(
+                            &mut policies,
+                            &source,
+                            &display_group,
+                            resource,
+                            &rule.verbs,
+                        );
+                    } else {
+                        for name in resource_names {
+                            insert_policy(
+                                &mut policies,
+                                &source,
+                                &display_group,
+                                &format!("{resource}/{name}"),
+                                &rule.verbs,
+                            );
+                        }
+                    }
+                }
+            }
+            for url in rule.non_resource_urls.as_deref().unwrap_or_default() {
+                insert_policy(&mut policies, &source, "-", url, &rule.verbs);
+            }
+        }
+    }
+    policies
+        .into_iter()
+        .map(|((scope, binding, group, resource), verbs)| {
+            let extras = verbs
+                .iter()
+                .filter(|verb| {
+                    !matches!(
+                        verb.as_str(),
+                        "*" | "get"
+                            | "list"
+                            | "watch"
+                            | "create"
+                            | "patch"
+                            | "update"
+                            | "delete"
+                            | "deletecollection"
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",");
+            let key = format!("{scope}/{group}/{resource}/{binding}");
+            let mut row = ResourceRow::new(scope, resource, group, binding, extras, 0)
+                .with_policy_data(PolicyData {
+                    verbs: verbs.into_iter().map(Arc::from).collect(),
+                });
+            row.key = Arc::from(key);
+            Arc::new(row)
+        })
+        .collect()
+}
+
+fn insert_policy(
+    policies: &mut BTreeMap<(String, String, String, String), BTreeSet<String>>,
+    source: &PolicyRules,
+    group: &str,
+    resource: &str,
+    verbs: &[String],
+) {
+    policies
+        .entry((
+            source.scope.clone(),
+            source.binding.clone(),
+            group.to_owned(),
+            resource.to_owned(),
+        ))
+        .or_default()
+        .extend(verbs.iter().map(|verb| verb.to_ascii_lowercase()));
+}
+
+async fn load_containers(client: Client, target: ResourceTarget) -> Result<ActionResult, String> {
+    if target.kind.known_kind() != Some(ResourceKind::Pods) {
+        return Err("Container navigation is supported for pods only".to_owned());
+    }
+    let pod = namespaced_target_api::<Pod>(client, &target)?
+        .get(&target.name)
+        .await
+        .map_err(|error| error.to_string())?;
+    let rows = container_rows(&pod).into_iter().map(Arc::new).collect();
+    Ok(ActionResult::Containers { target, rows })
+}
+
+async fn fetch_container_logs(
+    client: Client,
+    target: ContainerTarget,
+    previous: bool,
+) -> Result<ActionResult, String> {
+    let body = Api::<Pod>::namespaced(client, &target.namespace)
+        .logs(
+            &target.pod,
+            &LogParams {
+                container: Some(target.container.clone()),
+                previous,
+                tail_lines: Some(500),
+                ..LogParams::default()
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let label = if previous { "Previous Logs" } else { "Logs" };
+    Ok(ActionResult::Content {
+        title: format!(
+            "{label}({}/{}/{})",
+            target.namespace, target.pod, target.container
+        ),
+        body,
+        managed_fields: None,
+        decoded_body: None,
+        decoded_managed_fields: None,
+        content: if previous {
+            ContentKind::PreviousLogs
+        } else {
+            ContentKind::Logs
+        },
+    })
+}
+
+fn container_rows(pod: &Pod) -> Vec<ResourceRow> {
+    let Some(spec) = &pod.spec else {
+        return Vec::new();
+    };
+    let status = pod.status.as_ref();
+    let namespace = pod.namespace().unwrap_or_default();
+    let created_unix = pod
+        .meta()
+        .creation_timestamp
+        .as_ref()
+        .map_or(0, |time| time.0.as_second());
+    let mut rows = Vec::new();
+    for container in &spec.containers {
+        rows.push(container_row(
+            &namespace,
+            &container.name,
+            container.image.as_deref().unwrap_or("-"),
+            "container",
+            status.and_then(|status| status.container_statuses.as_deref()),
+            created_unix,
+        ));
+    }
+    for container in spec.init_containers.as_deref().unwrap_or_default() {
+        rows.push(container_row(
+            &namespace,
+            &container.name,
+            container.image.as_deref().unwrap_or("-"),
+            "init",
+            status.and_then(|status| status.init_container_statuses.as_deref()),
+            created_unix,
+        ));
+    }
+    for container in spec.ephemeral_containers.as_deref().unwrap_or_default() {
+        rows.push(container_row(
+            &namespace,
+            &container.name,
+            container.image.as_deref().unwrap_or("-"),
+            "ephemeral",
+            status.and_then(|status| status.ephemeral_container_statuses.as_deref()),
+            created_unix,
+        ));
+    }
+    rows.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    rows
+}
+
+fn container_row(
+    namespace: &str,
+    name: &str,
+    image: &str,
+    kind: &str,
+    statuses: Option<&[ContainerStatus]>,
+    created_unix: i64,
+) -> ResourceRow {
+    let status = statuses.and_then(|statuses| statuses.iter().find(|status| status.name == name));
+    let ready = status.is_some_and(|status| status.ready);
+    let restarts = status.map_or(0, |status| status.restart_count.max(0));
+    ResourceRow::new(
+        namespace,
+        name,
+        status.map_or_else(|| "Unknown".to_owned(), container_status),
+        if ready { "true" } else { "false" },
+        image,
+        created_unix,
+    )
+    .with_container_data(ContainerData {
+        image: Arc::from(image),
+        kind: Arc::from(kind),
+        restarts: u32::try_from(restarts).unwrap_or(0),
+    })
+}
+
+fn container_status(status: &ContainerStatus) -> String {
+    let Some(state) = &status.state else {
+        return "Unknown".to_owned();
+    };
+    if let Some(waiting) = &state.waiting {
+        return waiting
+            .reason
+            .clone()
+            .unwrap_or_else(|| "Waiting".to_owned());
+    }
+    if let Some(terminated) = &state.terminated {
+        return terminated
+            .reason
+            .clone()
+            .filter(|reason| !reason.is_empty())
+            .unwrap_or_else(|| format!("ExitCode:{}", terminated.exit_code));
+    }
+    if state.running.is_some() {
+        "Running".to_owned()
+    } else {
+        "Unknown".to_owned()
+    }
+}
+
+async fn yaml_from(
+    api: Api<DynamicObject>,
+    target: &ResourceTarget,
+) -> Result<YamlContent, String> {
+    let object = api
+        .get(&target.name)
+        .await
+        .map_err(|error| error.to_string())?;
+    yaml_content_from_object(object, target)
+}
+
+fn yaml_content_from_object(
+    mut object: DynamicObject,
+    target: &ResourceTarget,
+) -> Result<YamlContent, String> {
+    let mut decoded = is_core_v1_secret(target)
+        .then(|| decode_secret_object(&object))
+        .flatten();
+    let has_managed_fields = object
+        .meta()
+        .managed_fields
+        .as_ref()
+        .is_some_and(|fields| !fields.is_empty());
+    let with_managed_fields = has_managed_fields
+        .then(|| serde_yaml::to_string(&object))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let decoded_with_managed_fields = if has_managed_fields {
+        decoded
+            .as_ref()
+            .map(serde_yaml::to_string)
+            .transpose()
+            .map_err(|error| error.to_string())?
+    } else {
+        None
+    };
+    object.meta_mut().managed_fields = None;
+    if let Some(decoded) = &mut decoded {
+        decoded.meta_mut().managed_fields = None;
+    }
+    let body = serde_yaml::to_string(&object).map_err(|error| error.to_string())?;
+    let decoded_body = decoded
+        .as_ref()
+        .map(serde_yaml::to_string)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    Ok(YamlContent {
+        body,
+        with_managed_fields,
+        decoded_body,
+        decoded_with_managed_fields,
+    })
+}
+
+fn is_core_v1_secret(target: &ResourceTarget) -> bool {
+    target.kind.is_core_v1_secret()
+}
+
+fn decode_secret_object(object: &DynamicObject) -> Option<DynamicObject> {
+    let values = decode_secret_data(object).ok()?;
+    let mut decoded = object.clone();
+    let Some(root) = decoded.data.as_object_mut() else {
+        return Some(decoded);
+    };
+    root.insert(
+        "data".to_owned(),
+        serde_json::Value::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, serde_json::Value::String(value)))
+                .collect(),
+        ),
+    );
+    Some(decoded)
+}
+
+fn decode_secret_data(object: &DynamicObject) -> Result<BTreeMap<String, String>, String> {
+    let Some(root) = object.data.as_object() else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(data) = root.get("data") else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(data) = data.as_object() else {
+        return Ok(BTreeMap::new());
+    };
+    data.iter()
+        .map(|(key, value)| {
+            let encoded = value
+                .as_str()
+                .ok_or_else(|| format!("Secret data key {key:?} is not base64 text"))?;
+            let bytes = BASE64_STANDARD
+                .decode(encoded)
+                .map_err(|error| format!("Unable to decode Secret data key {key:?}: {error}"))?;
+            Ok((key.clone(), decoded_secret_value(&bytes)))
+        })
+        .collect()
+}
+
+fn decoded_secret_value(bytes: &[u8]) -> String {
+    if let Ok(value) = std::str::from_utf8(bytes) {
+        return value.to_owned();
+    }
+    let mut value = String::with_capacity(2 + bytes.len() * 2);
+    value.push_str("0x");
+    for byte in bytes {
+        let _ = write!(value, "{byte:02x}");
+    }
+    value
+}
+
+async fn watch_api<K, F>(
+    api: Api<K>,
+    client: Client,
+    settings: KubernetesSettings,
+    request: WatchRequest,
+    snapshots: watch::Sender<ResourceSnapshot>,
+    map_row: F,
+) where
+    K: Clone + Resource + DeserializeOwned + Debug + Send + 'static,
+    F: Fn(&K) -> ResourceRow + Copy + Send + 'static,
+{
+    let (enrichment_sender, mut enrichment_updates) = mpsc::channel(8);
+    let _enrichment_tasks =
+        spawn_enrichment_tasks(client, &request, &settings, enrichment_sender.clone());
+    let _enrichment_sender = enrichment_sender;
+    let mut enrichment = EnrichmentState::default();
+    let mut watcher_config = if settings.streaming_lists && request.kind.known_kind().is_some() {
+        watcher::Config::default().streaming_lists()
+    } else {
+        watcher::Config::default().page_size(500)
+    };
+    if let Some(selector) = &request.field_selector {
+        watcher_config = watcher_config.fields(selector);
+    }
+    let stream = watcher::watcher(api, watcher_config).default_backoff();
+    tokio::pin!(stream);
+
+    let mut rows: FxHashMap<Arc<str>, Arc<ResourceRow>> = FxHashMap::default();
+    let mut initializing: Option<FxHashMap<Arc<str>, Arc<ResourceRow>>> = None;
+    let mut revision = 0_u64;
+    let mut dirty = false;
+    let mut ticker = tokio::time::interval(settings.publish_interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            event = stream.next() => {
+                match event {
+                    Some(Ok(watcher::Event::Init)) => {
+                        initializing = Some(FxHashMap::default());
+                    }
+                    Some(Ok(watcher::Event::InitApply(object))) => {
+                        let mut row = map_row(&object);
+                        enrichment.apply(&mut row);
+                        let row = Arc::new(row);
+                        initializing.get_or_insert_with(FxHashMap::default).insert(Arc::clone(&row.key), row);
+                    }
+                    Some(Ok(watcher::Event::InitDone)) => {
+                        if let Some(initial) = initializing.take() {
+                            rows = initial;
+                        }
+                        revision = revision.wrapping_add(1);
+                        publish(&snapshots, &request, &rows, SourceState::Ready, revision);
+                        dirty = false;
+                    }
+                    Some(Ok(watcher::Event::Apply(object))) => {
+                        let mut row = map_row(&object);
+                        enrichment.apply(&mut row);
+                        let row = Arc::new(row);
+                        rows.insert(Arc::clone(&row.key), row);
+                        dirty = true;
+                    }
+                    Some(Ok(watcher::Event::Delete(object))) => {
+                        let row = map_row(&object);
+                        rows.remove(&row.key);
+                        dirty = true;
+                    }
+                    Some(Err(error)) => {
+                        revision = revision.wrapping_add(1);
+                        publish(
+                            &snapshots,
+                            &request,
+                            &rows,
+                            SourceState::Error(Arc::from(error.to_string())),
+                            revision,
+                        );
+                    }
+                    None => {
+                        revision = revision.wrapping_add(1);
+                        publish(
+                            &snapshots,
+                            &request,
+                            &rows,
+                            SourceState::Error(Arc::from("Kubernetes watch ended")),
+                            revision,
+                        );
+                        return;
+                    }
+                }
+            }
+            Some(update) = enrichment_updates.recv() => {
+                enrichment.update(update);
+                enrichment.apply_all(&mut rows);
+                if let Some(initializing) = &mut initializing {
+                    enrichment.apply_all(initializing);
+                }
+                dirty = true;
+            }
+            _ = ticker.tick(), if dirty && initializing.is_none() => {
+                revision = revision.wrapping_add(1);
+                publish(&snapshots, &request, &rows, SourceState::Ready, revision);
+                dirty = false;
+            }
+        }
+    }
+}
+
+async fn poll_dynamic_api(
+    api: Api<DynamicObject>,
+    settings: KubernetesSettings,
+    request: WatchRequest,
+    snapshots: watch::Sender<ResourceSnapshot>,
+) {
+    let mut revision = 0_u64;
+    let poll_interval = settings.publish_interval.max(Duration::from_secs(5));
+    let mut ticker = tokio::time::interval(poll_interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        match list_dynamic_pages(&api, request.field_selector.as_deref()).await {
+            Ok(objects) => {
+                let rows: FxHashMap<Arc<str>, Arc<ResourceRow>> = objects
+                    .iter()
+                    .map(dynamic_row)
+                    .map(|row| (Arc::clone(&row.key), Arc::new(row)))
+                    .collect();
+                revision = revision.wrapping_add(1);
+                publish(&snapshots, &request, &rows, SourceState::Ready, revision);
+            }
+            Err(error) => {
+                revision = revision.wrapping_add(1);
+                publish(
+                    &snapshots,
+                    &request,
+                    &FxHashMap::default(),
+                    SourceState::Error(Arc::from(error.to_string())),
+                    revision,
+                );
+            }
+        }
+    }
+}
+
+async fn list_dynamic_pages(
+    api: &Api<DynamicObject>,
+    field_selector: Option<&str>,
+) -> Result<Vec<DynamicObject>, kube::Error> {
+    let mut objects = Vec::new();
+    let mut continue_token: Option<String> = None;
+    loop {
+        let mut params = ListParams::default().limit(500);
+        if let Some(selector) = field_selector {
+            params = params.fields(selector);
+        }
+        if let Some(token) = &continue_token {
+            params = params.continue_token(token);
+        }
+        let page = api.list(&params).await?;
+        continue_token.clone_from(&page.metadata.continue_);
+        objects.extend(page.items);
+        if continue_token.as_deref().is_none_or(str::is_empty) {
+            return Ok(objects);
+        }
+    }
+}
+
+fn publish(
+    snapshots: &watch::Sender<ResourceSnapshot>,
+    request: &WatchRequest,
+    rows: &FxHashMap<Arc<str>, Arc<ResourceRow>>,
+    state: SourceState,
+    revision: u64,
+) {
+    if snapshots.is_closed() {
+        return;
+    }
+    let mut compact: Vec<_> = rows.values().cloned().collect();
+    compact.sort_unstable_by(|left, right| {
+        left.namespace
+            .cmp(&right.namespace)
+            .then(left.name.cmp(&right.name))
+    });
+    let _ = snapshots.send(ResourceSnapshot {
+        generation: request.generation,
+        kind: request.kind.clone(),
+        rows: Arc::new(compact),
+        state,
+        revision,
+        emitted_at: Instant::now(),
+    });
+}
+
+fn pod_row(pod: &Pod) -> ResourceRow {
+    let namespace = pod.namespace().unwrap_or_default();
+    let name = pod.name_any();
+    let deleting = pod.meta().deletion_timestamp.is_some();
+    let status = pod.status.as_ref();
+    let container_statuses = status.and_then(|status| status.container_statuses.as_ref());
+    let total = pod.spec.as_ref().map_or(0, |spec| spec.containers.len());
+    let ready = container_statuses.map_or(0, |statuses| {
+        statuses.iter().filter(|container| container.ready).count()
+    });
+    let restarts: i32 = container_statuses.map_or(0, |statuses| {
+        statuses
+            .iter()
+            .map(|container| container.restart_count)
+            .sum()
+    });
+    let phase = if deleting {
+        "Terminating".to_owned()
+    } else {
+        status
+            .and_then(|status| status.phase.clone())
+            .unwrap_or_else(|| "Unknown".to_owned())
+    };
+    let (cpu_request_millis, cpu_limit_millis, memory_request_bytes, memory_limit_bytes) =
+        pod_resource_totals(pod);
+    let node = pod
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.node_name.clone())
+        .unwrap_or_else(|| "-".to_owned());
+    resource_row(
+        pod,
+        namespace,
+        name,
+        phase,
+        format!("{ready}/{total}"),
+        restarts.to_string(),
+    )
+    .with_pod_data(PodData {
+        restarts: u32::try_from(restarts.max(0)).unwrap_or(0),
+        node: Arc::from(node),
+        cpu_millis: None,
+        cpu_request_millis,
+        cpu_limit_millis,
+        memory_bytes: None,
+        memory_request_bytes,
+        memory_limit_bytes,
+    })
+}
+
+fn deployment_row(deployment: &Deployment) -> ResourceRow {
+    let desired = deployment
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.replicas)
+        .unwrap_or(1);
+    let ready = deployment
+        .status
+        .as_ref()
+        .and_then(|status| status.ready_replicas)
+        .unwrap_or(0);
+    let available = deployment
+        .status
+        .as_ref()
+        .and_then(|status| status.available_replicas)
+        .unwrap_or(0);
+    resource_row(
+        deployment,
+        deployment.namespace().unwrap_or_default(),
+        deployment.name_any(),
+        workload_status(
+            deployment.meta().deletion_timestamp.is_some(),
+            ready,
+            desired,
+        ),
+        format!("{ready}/{desired}"),
+        format!("{available} available"),
+    )
+}
+
+fn stateful_set_row(stateful_set: &StatefulSet) -> ResourceRow {
+    let desired = stateful_set
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.replicas)
+        .unwrap_or(1);
+    let ready = stateful_set
+        .status
+        .as_ref()
+        .and_then(|status| status.ready_replicas)
+        .unwrap_or(0);
+    resource_row(
+        stateful_set,
+        stateful_set.namespace().unwrap_or_default(),
+        stateful_set.name_any(),
+        workload_status(
+            stateful_set.meta().deletion_timestamp.is_some(),
+            ready,
+            desired,
+        ),
+        format!("{ready}/{desired}"),
+        stateful_set
+            .status
+            .as_ref()
+            .and_then(|status| status.current_revision.clone())
+            .unwrap_or_else(|| "-".to_owned()),
+    )
+}
+
+fn daemon_set_row(daemon_set: &DaemonSet) -> ResourceRow {
+    let desired = daemon_set
+        .status
+        .as_ref()
+        .map_or(0, |status| status.desired_number_scheduled);
+    let ready = daemon_set
+        .status
+        .as_ref()
+        .map_or(0, |status| status.number_ready);
+    resource_row(
+        daemon_set,
+        daemon_set.namespace().unwrap_or_default(),
+        daemon_set.name_any(),
+        workload_status(
+            daemon_set.meta().deletion_timestamp.is_some(),
+            ready,
+            desired,
+        ),
+        format!("{ready}/{desired}"),
+        format!(
+            "{} available",
+            daemon_set
+                .status
+                .as_ref()
+                .and_then(|status| status.number_available)
+                .unwrap_or(0)
+        ),
+    )
+}
+
+fn service_row(service: &Service) -> ResourceRow {
+    let spec = service.spec.as_ref();
+    let service_type = spec
+        .and_then(|spec| spec.type_.clone())
+        .unwrap_or_else(|| "ClusterIP".to_owned());
+    let cluster_ip = spec
+        .and_then(|spec| spec.cluster_ip.clone())
+        .unwrap_or_else(|| "-".to_owned());
+    let ports = spec
+        .and_then(|spec| spec.ports.as_ref())
+        .map_or(0, Vec::len);
+    resource_row(
+        service,
+        service.namespace().unwrap_or_default(),
+        service.name_any(),
+        service_type,
+        format!("{ports} ports"),
+        cluster_ip,
+    )
+}
+
+fn dynamic_row(object: &DynamicObject) -> ResourceRow {
+    if object.types.as_ref().is_some_and(|types| {
+        types.api_version.starts_with("apiregistration.k8s.io/") && types.kind == "APIService"
+    }) {
+        return api_service_row(object);
+    }
+    let status = dynamic_string(&object.data, &["/status/phase", "/status/state"])
+        .or_else(|| dynamic_ready_condition(&object.data))
+        .or_else(|| dynamic_string(&object.data, &["/type", "/spec/type"]))
+        .unwrap_or_else(|| "-".to_owned());
+    let ready = dynamic_ready(&object.data).unwrap_or_else(|| "-".to_owned());
+    let details = dynamic_string(
+        &object.data,
+        &["/status/reason", "/status/message", "/spec/type", "/type"],
+    )
+    .unwrap_or_else(|| "-".to_owned());
+    resource_row(
+        object,
+        object.namespace().unwrap_or_else(|| "-".to_owned()),
+        object.name_any(),
+        status,
+        ready,
+        details,
+    )
+}
+
+fn api_service_row(object: &DynamicObject) -> ResourceRow {
+    let service = object
+        .data
+        .pointer("/spec/service")
+        .filter(|service| !service.is_null())
+        .and_then(|service| {
+            Some(format!(
+                "{}/{}",
+                service.get("namespace")?.as_str()?,
+                service.get("name")?.as_str()?
+            ))
+        })
+        .unwrap_or_else(|| "Local".to_owned());
+    let available = object
+        .data
+        .pointer("/status/conditions")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|conditions| {
+            conditions.iter().find(|condition| {
+                condition.get("type").and_then(serde_json::Value::as_str) == Some("Available")
+            })
+        })
+        .map_or_else(
+            || "Unknown".to_owned(),
+            |condition| {
+                let status = condition
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Unknown");
+                let reason = condition
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|reason| !reason.is_empty());
+                if status == "True" {
+                    status.to_owned()
+                } else {
+                    reason.map_or_else(
+                        || status.to_owned(),
+                        |reason| format!("{status} ({reason})"),
+                    )
+                }
+            },
+        );
+    resource_row(
+        object,
+        "-".to_owned(),
+        object.name_any(),
+        available,
+        service,
+        "-".to_owned(),
+    )
+}
+
+fn dynamic_string(value: &serde_json::Value, pointers: &[&str]) -> Option<String> {
+    pointers.iter().find_map(|pointer| {
+        let value = value.pointer(pointer)?;
+        value
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| value.as_bool().map(|value| value.to_string()))
+            .or_else(|| value.as_i64().map(|value| value.to_string()))
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn dynamic_ready_condition(value: &serde_json::Value) -> Option<String> {
+    value
+        .pointer("/status/conditions")?
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|condition| {
+            condition.get("status").and_then(serde_json::Value::as_str) == Some("True")
+        })?
+        .get("type")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn dynamic_ready(value: &serde_json::Value) -> Option<String> {
+    let ready = value
+        .pointer("/status/readyReplicas")
+        .and_then(serde_json::Value::as_u64)?;
+    let desired = value
+        .pointer("/spec/replicas")
+        .or_else(|| value.pointer("/status/replicas"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(ready);
+    Some(format!("{ready}/{desired}"))
+}
+
+fn node_row(node: &Node) -> ResourceRow {
+    let is_ready = node
+        .status
+        .as_ref()
+        .and_then(|status| status.conditions.as_ref())
+        .and_then(|conditions| {
+            conditions
+                .iter()
+                .find(|condition| condition.type_ == "Ready")
+        })
+        .is_some_and(|condition| condition.status == "True");
+    let role = node
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| {
+            labels
+                .keys()
+                .find_map(|key| key.strip_prefix("node-role.kubernetes.io/"))
+        })
+        .filter(|role| !role.is_empty())
+        .unwrap_or("worker");
+    let version = node
+        .status
+        .as_ref()
+        .and_then(|status| status.node_info.as_ref())
+        .map_or_else(|| "-".to_owned(), |info| info.kubelet_version.clone());
+    let taint_count = node
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.taints.as_ref())
+        .map_or(0, Vec::len);
+    let taints = node
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.taints.as_ref())
+        .filter(|taints| !taints.is_empty())
+        .map_or_else(
+            || "<none>".to_owned(),
+            |taints| {
+                taints
+                    .iter()
+                    .map(|taint| {
+                        let value = taint
+                            .value
+                            .as_deref()
+                            .map_or_else(String::new, |value| format!("={value}"));
+                        format!("{}{}:{}", taint.key, value, taint.effect)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            },
+        );
+    let allocatable = node
+        .status
+        .as_ref()
+        .and_then(|status| status.allocatable.as_ref());
+    let cpu_allocatable_millis = allocatable
+        .and_then(|values| values.get("cpu"))
+        .and_then(|quantity| parse_cpu_millis(&quantity.0))
+        .unwrap_or(0);
+    let memory_allocatable_bytes = allocatable
+        .and_then(|values| values.get("memory"))
+        .and_then(|quantity| parse_memory_bytes(&quantity.0))
+        .unwrap_or(0);
+    resource_row(
+        node,
+        "-".to_owned(),
+        node.name_any(),
+        if is_ready { "Ready" } else { "NotReady" }.to_owned(),
+        role.to_owned(),
+        version.clone(),
+    )
+    .with_node_data(NodeData {
+        taints: Arc::from(taints),
+        taint_count: u32::try_from(taint_count).unwrap_or(u32::MAX),
+        version: Arc::from(version),
+        pods: 0,
+        cpu_millis: None,
+        cpu_allocatable_millis,
+        memory_bytes: None,
+        memory_allocatable_bytes,
+    })
+}
+
+fn pod_resource_totals(pod: &Pod) -> (u64, u64, u64, u64) {
+    let mut cpu_requests = 0_u64;
+    let mut cpu_limits = 0_u64;
+    let mut memory_requests = 0_u64;
+    let mut memory_limits = 0_u64;
+    let Some(spec) = &pod.spec else {
+        return (0, 0, 0, 0);
+    };
+    for container in &spec.containers {
+        let Some(resources) = &container.resources else {
+            continue;
+        };
+        cpu_requests = cpu_requests.saturating_add(
+            resources
+                .requests
+                .as_ref()
+                .and_then(|values| values.get("cpu"))
+                .and_then(|quantity| parse_cpu_millis(&quantity.0))
+                .unwrap_or(0),
+        );
+        cpu_limits = cpu_limits.saturating_add(
+            resources
+                .limits
+                .as_ref()
+                .and_then(|values| values.get("cpu"))
+                .and_then(|quantity| parse_cpu_millis(&quantity.0))
+                .unwrap_or(0),
+        );
+        memory_requests = memory_requests.saturating_add(
+            resources
+                .requests
+                .as_ref()
+                .and_then(|values| values.get("memory"))
+                .and_then(|quantity| parse_memory_bytes(&quantity.0))
+                .unwrap_or(0),
+        );
+        memory_limits = memory_limits.saturating_add(
+            resources
+                .limits
+                .as_ref()
+                .and_then(|values| values.get("memory"))
+                .and_then(|quantity| parse_memory_bytes(&quantity.0))
+                .unwrap_or(0),
+        );
+    }
+    (cpu_requests, cpu_limits, memory_requests, memory_limits)
+}
+
+fn parse_cpu_millis(quantity: &str) -> Option<u64> {
+    let (number, numerator, denominator) = if let Some(number) = quantity.strip_suffix('n') {
+        (number, 1_u128, 1_000_000_u128)
+    } else if let Some(number) = quantity.strip_suffix('u') {
+        (number, 1, 1_000)
+    } else if let Some(number) = quantity.strip_suffix('m') {
+        (number, 1, 1)
+    } else {
+        (quantity, 1_000, 1)
+    };
+    parse_decimal_scaled(number, numerator, denominator)
+}
+
+fn parse_memory_bytes(quantity: &str) -> Option<u64> {
+    const SUFFIXES: [(&str, u128); 12] = [
+        ("Ki", 1_024),
+        ("Mi", 1_048_576),
+        ("Gi", 1_073_741_824),
+        ("Ti", 1_099_511_627_776),
+        ("Pi", 1_125_899_906_842_624),
+        ("Ei", 1_152_921_504_606_846_976),
+        ("K", 1_000),
+        ("M", 1_000_000),
+        ("G", 1_000_000_000),
+        ("T", 1_000_000_000_000),
+        ("P", 1_000_000_000_000_000),
+        ("E", 1_000_000_000_000_000_000),
+    ];
+    let (number, multiplier) = SUFFIXES
+        .iter()
+        .find_map(|(suffix, multiplier)| {
+            quantity
+                .strip_suffix(suffix)
+                .map(|number| (number, *multiplier))
+        })
+        .unwrap_or((quantity, 1));
+    parse_decimal_scaled(number, multiplier, 1)
+}
+
+fn parse_decimal_scaled(number: &str, numerator: u128, denominator: u128) -> Option<u64> {
+    let number = number.strip_prefix('+').unwrap_or(number);
+    if number.starts_with('-') || denominator == 0 {
+        return None;
+    }
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+    if whole.is_empty() && fraction.is_empty() {
+        return None;
+    }
+    let scale = 10_u128.checked_pow(u32::try_from(fraction.len()).ok()?)?;
+    let whole = if whole.is_empty() {
+        0
+    } else {
+        whole.parse::<u128>().ok()?
+    };
+    let fraction = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse::<u128>().ok()?
+    };
+    let raw = whole.checked_mul(scale)?.checked_add(fraction)?;
+    let scaled = raw.checked_mul(numerator)?;
+    let divisor = scale.checked_mul(denominator)?;
+    let rounded_up = scaled.checked_add(divisor.saturating_sub(1))? / divisor;
+    u64::try_from(rounded_up).ok()
+}
+
+fn workload_status(deleting: bool, ready: i32, desired: i32) -> String {
+    if deleting {
+        "Terminating"
+    } else if ready >= desired {
+        "Ready"
+    } else {
+        "Progressing"
+    }
+    .to_owned()
+}
+
+fn resource_row<K: ResourceExt>(
+    resource: &K,
+    namespace: String,
+    name: String,
+    status: String,
+    ready: String,
+    details: String,
+) -> ResourceRow {
+    let created_unix = resource
+        .meta()
+        .creation_timestamp
+        .as_ref()
+        .map_or(0, |time| time.0.as_second());
+    let labels = resource
+        .meta()
+        .labels
+        .as_ref()
+        .map(|labels| {
+            labels
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    ResourceRow::new(namespace, name, status, ready, details, created_unix).with_labels(labels)
+}
+
+#[cfg(test)]
+mod tests {
+    use k8s_openapi::{
+        api::core::v1::{
+            Container, ContainerState, ContainerStateWaiting, ContainerStatus, NamespaceStatus,
+            PodSpec, PodStatus,
+        },
+        apimachinery::pkg::apis::meta::v1::{ManagedFieldsEntry, ObjectMeta, Time},
+    };
+
+    use super::*;
+
+    #[test]
+    fn maps_namespace_status_and_creation_time() {
+        let namespace = Namespace {
+            metadata: ObjectMeta {
+                name: Some("payments".to_owned()),
+                creation_timestamp: Some(Time(
+                    k8s_openapi::jiff::Timestamp::from_second(3_600).expect("valid timestamp"),
+                )),
+                ..ObjectMeta::default()
+            },
+            status: Some(NamespaceStatus {
+                phase: Some("Active".to_owned()),
+                ..NamespaceStatus::default()
+            }),
+            ..Namespace::default()
+        };
+
+        assert_eq!(
+            namespace_info(&namespace),
+            NamespaceInfo::discovered("payments", "Active", Some(3_600))
+        );
+    }
+
+    #[test]
+    fn builds_explicit_kubectl_context_delete_arguments() {
+        assert_eq!(
+            context_delete_args("prod; touch /tmp/nope"),
+            ["config", "delete-context", "prod; touch /tmp/nope"]
+        );
+    }
+
+    #[test]
+    fn refuses_resources_without_discovery_delete_capability() {
+        let target = ResourceTarget {
+            kind: ResourceDescriptor::new(
+                "example.io",
+                "v1",
+                "example.io/v1",
+                "Widget",
+                "widgets",
+                true,
+                crate::model::ResourceOperations::default(),
+            ),
+            namespace: Some("prod".to_owned()),
+            name: "one".to_owned(),
+        };
+        assert_eq!(
+            ensure_deletable(&target).expect_err("delete must be refused"),
+            "widgets.example.io does not advertise delete support"
+        );
+    }
+
+    #[test]
+    fn compacts_pod_to_display_row() {
+        let pod = Pod {
+            metadata: ObjectMeta {
+                name: Some("api-0".into()),
+                namespace: Some("prod".into()),
+                ..ObjectMeta::default()
+            },
+            spec: Some(PodSpec {
+                containers: vec![Container {
+                    name: "api".into(),
+                    ..Container::default()
+                }],
+                ..PodSpec::default()
+            }),
+            status: Some(PodStatus {
+                phase: Some("Running".into()),
+                container_statuses: Some(vec![ContainerStatus {
+                    name: "api".into(),
+                    ready: true,
+                    restart_count: 3,
+                    image: "api:latest".into(),
+                    image_id: String::new(),
+                    ..ContainerStatus::default()
+                }]),
+                ..PodStatus::default()
+            }),
+        };
+        let row = pod_row(&pod);
+        assert_eq!(row.key.as_ref(), "prod/api-0");
+        assert_eq!(row.ready.as_ref(), "1/1");
+        assert_eq!(row.details.as_ref(), "3");
+        let data = row.pod_data().expect("pod data");
+        assert_eq!(data.restarts, 3);
+        assert_eq!(data.node.as_ref(), "-");
+    }
+
+    #[test]
+    fn parses_kubernetes_cpu_and_memory_quantities() {
+        assert_eq!(parse_cpu_millis("250m"), Some(250));
+        assert_eq!(parse_cpu_millis("1.5"), Some(1_500));
+        assert_eq!(parse_cpu_millis("1500000n"), Some(2));
+        assert_eq!(parse_memory_bytes("64Mi"), Some(64 * 1_048_576));
+        assert_eq!(parse_memory_bytes("1.5Gi"), Some(1_610_612_736));
+    }
+
+    #[test]
+    fn enrichment_updates_compact_rows_without_kubernetes_objects() {
+        let mut row =
+            ResourceRow::new("prod", "api-0", "Running", "1/1", "0", 0).with_pod_data(PodData {
+                restarts: 0,
+                node: Arc::from("worker-0"),
+                cpu_request_millis: 100,
+                cpu_limit_millis: 200,
+                memory_request_bytes: 128,
+                memory_limit_bytes: 256,
+                ..PodData::default()
+            });
+        let mut state = EnrichmentState::default();
+        state.update(EnrichmentUpdate::PodUsage(FxHashMap::from_iter([(
+            Arc::clone(&row.key),
+            ResourceUsage {
+                cpu_millis: Some(25),
+                memory_bytes: Some(64),
+            },
+        )])));
+        state.apply(&mut row);
+        let data = row.pod_data().expect("pod metrics");
+        assert_eq!(data.cpu_millis, Some(25));
+        assert_eq!(data.memory_bytes, Some(64));
+    }
+
+    #[test]
+    fn builds_explicit_kubectl_describe_arguments() {
+        let pod = ResourceTarget {
+            kind: ResourceKind::Pods.into(),
+            namespace: Some("prod".to_owned()),
+            name: "api-0".to_owned(),
+        };
+        assert_eq!(
+            describe_args("staging", &pod),
+            [
+                "describe",
+                "pods",
+                "api-0",
+                "--context",
+                "staging",
+                "--namespace",
+                "prod",
+            ]
+        );
+
+        let node = ResourceTarget {
+            kind: ResourceKind::Nodes.into(),
+            namespace: None,
+            name: "worker-0".to_owned(),
+        };
+        assert_eq!(
+            describe_args("staging", &node),
+            ["describe", "nodes", "worker-0", "--context", "staging"]
+        );
+
+        let widget = ResourceTarget {
+            kind: ResourceDescriptor::new(
+                "example.io",
+                "v1",
+                "example.io/v1",
+                "Widget",
+                "widgets",
+                true,
+                crate::model::ResourceOperations::all(),
+            ),
+            namespace: Some("prod".to_owned()),
+            name: "primary".to_owned(),
+        };
+        assert_eq!(describe_args("staging", &widget)[1], "widgets.example.io");
+    }
+
+    #[test]
+    fn compacts_secret_like_dynamic_objects() {
+        let resource = ApiResource::from_gvk_with_plural(
+            &GroupVersionKind::gvk("", "v1", "Secret"),
+            "secrets",
+        );
+        let object = DynamicObject::new("api-token", &resource)
+            .within("prod")
+            .data(serde_json::json!({
+                "type": "Opaque",
+                "data": {"token": "c2VjcmV0"}
+            }));
+        let row = dynamic_row(&object);
+        assert_eq!(row.key.as_ref(), "prod/api-token");
+        assert_eq!(row.status.as_ref(), "Opaque");
+        assert!(row.search.contains("api-token"));
+    }
+
+    #[test]
+    fn projects_local_and_remote_api_services_to_k9s_columns() {
+        let local: DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "apiregistration.k8s.io/v1",
+            "kind": "APIService",
+            "metadata": {
+                "name": "v1.",
+                "creationTimestamp": "2024-01-01T00:00:00Z"
+            },
+            "spec": {},
+            "status": {
+                "conditions": [{"type": "Available", "status": "True"}]
+            }
+        }))
+        .expect("local APIService");
+        let row = dynamic_row(&local);
+        assert_eq!(row.namespace.as_ref(), "-");
+        assert_eq!(row.name.as_ref(), "v1.");
+        assert_eq!(row.ready.as_ref(), "Local");
+        assert_eq!(row.status.as_ref(), "True");
+        assert_eq!(row.created_unix, 1_704_067_200);
+
+        let remote: DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "apiregistration.k8s.io/v1",
+            "kind": "APIService",
+            "metadata": {"name": "v1beta1.metrics.k8s.io"},
+            "spec": {
+                "service": {"namespace": "kube-system", "name": "metrics-server"}
+            },
+            "status": {
+                "conditions": [{
+                    "type": "Available",
+                    "status": "False",
+                    "reason": "MissingEndpoints"
+                }]
+            }
+        }))
+        .expect("remote APIService");
+        let row = dynamic_row(&remote);
+        assert_eq!(row.name.as_ref(), "v1beta1.metrics.k8s.io");
+        assert_eq!(row.ready.as_ref(), "kube-system/metrics-server");
+        assert_eq!(row.status.as_ref(), "False (MissingEndpoints)");
+
+        let unknown: DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "apiregistration.k8s.io/v1",
+            "kind": "APIService",
+            "metadata": {"name": "v1.example.io"},
+            "spec": {"service": null}
+        }))
+        .expect("APIService without a condition");
+        let row = dynamic_row(&unknown);
+        assert_eq!(row.ready.as_ref(), "Local");
+        assert_eq!(row.status.as_ref(), "Unknown");
+    }
+
+    #[test]
+    fn secret_yaml_has_encoded_and_lossless_decoded_variants() {
+        let resource = ApiResource::from_gvk_with_plural(
+            &GroupVersionKind::gvk("", "v1", "Secret"),
+            "secrets",
+        );
+        let mut object = DynamicObject::new("api-token", &resource)
+            .within("prod")
+            .data(serde_json::json!({
+                "type": "Opaque",
+                "data": {
+                    "token": "c2VjcmV0Cg==",
+                    "binary": "AP8Q"
+                }
+            }));
+        object.metadata.managed_fields = Some(vec![ManagedFieldsEntry::default()]);
+        let target = ResourceTarget {
+            kind: ResourceDescriptor::new(
+                "",
+                "v1",
+                "v1",
+                "Secret",
+                "secrets",
+                true,
+                crate::model::ResourceOperations::all(),
+            ),
+            namespace: Some("prod".to_owned()),
+            name: "api-token".to_owned(),
+        };
+
+        let yaml = yaml_content_from_object(object, &target).expect("secret yaml");
+        assert!(yaml.body.contains("c2VjcmV0Cg=="));
+        assert!(!yaml.body.contains("managedFields"));
+        let decoded = yaml.decoded_body.expect("decoded body");
+        let decoded_value: serde_json::Value =
+            serde_yaml::from_str(&decoded).expect("decoded yaml value");
+        assert_eq!(decoded_value["data"]["token"], "secret\n");
+        assert_eq!(decoded_value["data"]["binary"], "0x00ff10");
+        let decoded_managed = yaml
+            .decoded_with_managed_fields
+            .expect("decoded managed body");
+        assert!(decoded_managed.contains("managedFields"));
+        assert!(decoded_managed.contains("0x00ff10"));
+    }
+
+    #[test]
+    fn secret_data_content_contains_only_decoded_data() {
+        let resource = ApiResource::from_gvk_with_plural(
+            &GroupVersionKind::gvk("", "v1", "Secret"),
+            "secrets",
+        );
+        let mut object = DynamicObject::new("api-token", &resource)
+            .within("prod")
+            .data(serde_json::json!({
+                "type": "Opaque",
+                "data": {
+                    "token": "c2VjcmV0Cg==",
+                    "binary": "AP8Q"
+                }
+            }));
+        object.metadata.labels = Some(BTreeMap::from([(
+            "app".to_owned(),
+            "must-not-leak".to_owned(),
+        )]));
+        let target = ResourceTarget {
+            kind: ResourceDescriptor::new(
+                "",
+                "v1",
+                "v1",
+                "Secret",
+                "secrets",
+                true,
+                crate::model::ResourceOperations::all(),
+            ),
+            namespace: Some("prod".to_owned()),
+            name: "api-token".to_owned(),
+        };
+
+        let ActionResult::Content {
+            title,
+            body,
+            managed_fields,
+            decoded_body,
+            decoded_managed_fields,
+            content,
+        } = secret_data_content(&object, &target).expect("decoded Secret data")
+        else {
+            panic!("expected content result");
+        };
+        assert_eq!(title, "Secret(prod/api-token)");
+        assert_eq!(content, ContentKind::SecretData);
+        assert!(managed_fields.is_none());
+        assert!(decoded_body.is_none());
+        assert!(decoded_managed_fields.is_none());
+
+        let values: BTreeMap<String, String> = serde_yaml::from_str(&body).expect("data-only YAML");
+        assert_eq!(
+            values,
+            BTreeMap::from([
+                ("binary".to_owned(), "0x00ff10".to_owned()),
+                ("token".to_owned(), "secret\n".to_owned()),
+            ])
+        );
+        for forbidden in ["apiVersion", "kind", "metadata", "must-not-leak", "Opaque"] {
+            assert!(
+                !body.contains(forbidden),
+                "unexpected {forbidden} in {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn secret_decode_requires_exact_core_identity_and_valid_base64() {
+        let resource = ApiResource::from_gvk_with_plural(
+            &GroupVersionKind::gvk("", "v1", "Secret"),
+            "secrets",
+        );
+        let invalid = DynamicObject::new("broken", &resource)
+            .within("prod")
+            .data(serde_json::json!({"data": {"token": "not base64!"}}));
+        assert!(decode_secret_object(&invalid).is_none());
+
+        let target = ResourceTarget {
+            kind: ResourceDescriptor::new(
+                "example.io",
+                "v1",
+                "example.io/v1",
+                "Secret",
+                "secrets",
+                true,
+                crate::model::ResourceOperations::all(),
+            ),
+            namespace: Some("prod".to_owned()),
+            name: "custom".to_owned(),
+        };
+        assert!(!is_core_v1_secret(&target));
+        let yaml = yaml_content_from_object(invalid, &target).expect("custom secret yaml");
+        assert!(yaml.decoded_body.is_none());
+    }
+
+    #[test]
+    fn service_account_subject_matching_obeys_namespace_and_kind() {
+        let explicit: Subject = serde_json::from_value(serde_json::json!({
+            "kind": "ServiceAccount",
+            "name": "apiserver-admin",
+            "namespace": "argo"
+        }))
+        .expect("subject");
+        assert!(service_account_subject_matches(
+            &explicit,
+            "argo",
+            "apiserver-admin",
+            None,
+        ));
+        assert!(!service_account_subject_matches(
+            &explicit,
+            "other",
+            "apiserver-admin",
+            None,
+        ));
+
+        let implicit: Subject = serde_json::from_value(serde_json::json!({
+            "kind": "ServiceAccount",
+            "name": "apiserver-admin"
+        }))
+        .expect("subject");
+        assert!(service_account_subject_matches(
+            &implicit,
+            "argo",
+            "apiserver-admin",
+            Some("argo"),
+        ));
+        assert!(!service_account_subject_matches(
+            &implicit,
+            "argo",
+            "apiserver-admin",
+            Some("default"),
+        ));
+
+        let user: Subject = serde_json::from_value(serde_json::json!({
+            "kind": "User",
+            "name": "apiserver-admin",
+            "namespace": "argo"
+        }))
+        .expect("subject");
+        assert!(!service_account_subject_matches(
+            &user,
+            "argo",
+            "apiserver-admin",
+            None,
+        ));
+    }
+
+    #[test]
+    fn policy_rows_expand_resources_names_and_non_resource_urls() {
+        let rules: Vec<PolicyRule> = serde_json::from_value(serde_json::json!([
+            {
+                "apiGroups": [""],
+                "resources": ["secrets"],
+                "resourceNames": ["workflow-auth0-creds"],
+                "verbs": ["get", "list", "impersonate"]
+            },
+            {
+                "apiGroups": ["apps"],
+                "resources": ["deployments"],
+                "verbs": ["*"]
+            },
+            {
+                "nonResourceURLs": ["/healthz"],
+                "verbs": ["get"]
+            }
+        ]))
+        .expect("policy rules");
+        let rows = policy_rows(vec![PolicyRules {
+            scope: "argo".to_owned(),
+            binding: "RO:apiserver-admin-reader".to_owned(),
+            rules,
+        }]);
+
+        let named = rows
+            .iter()
+            .find(|row| row.name.as_ref() == "secrets/workflow-auth0-creds")
+            .expect("resourceNames policy");
+        assert_eq!(named.namespace.as_ref(), "argo");
+        assert_eq!(named.status.as_ref(), "core");
+        assert_eq!(named.ready.as_ref(), "RO:apiserver-admin-reader");
+        assert_eq!(named.details.as_ref(), "impersonate");
+        let policy = named.policy_data().expect("verb matrix");
+        assert!(policy.allows("get"));
+        assert!(policy.allows("list"));
+        assert!(!policy.allows("watch"));
+        assert!(
+            rows.iter().all(|row| row.name.as_ref() != "secrets"),
+            "resourceNames must not be presented as access to every Secret"
+        );
+
+        let deployments = rows
+            .iter()
+            .find(|row| row.name.as_ref() == "deployments")
+            .expect("deployments policy");
+        let policy = deployments.policy_data().expect("wildcard verb matrix");
+        for verb in [
+            "get",
+            "list",
+            "watch",
+            "create",
+            "patch",
+            "update",
+            "delete",
+            "deletecollection",
+        ] {
+            assert!(policy.allows(verb), "wildcard should allow {verb}");
+        }
+
+        let health = rows
+            .iter()
+            .find(|row| row.name.as_ref() == "/healthz")
+            .expect("non-resource URL policy");
+        assert_eq!(health.status.as_ref(), "-");
+        assert!(health.policy_data().expect("verbs").allows("get"));
+    }
+
+    #[test]
+    fn builds_regular_and_init_container_rows_with_runtime_status() {
+        let pod = Pod {
+            metadata: ObjectMeta {
+                name: Some("api-0".to_owned()),
+                namespace: Some("prod".to_owned()),
+                ..ObjectMeta::default()
+            },
+            spec: Some(PodSpec {
+                containers: vec![Container {
+                    name: "api".to_owned(),
+                    image: Some("example/api:v1".to_owned()),
+                    ..Container::default()
+                }],
+                init_containers: Some(vec![Container {
+                    name: "migrate".to_owned(),
+                    image: Some("example/migrate:v1".to_owned()),
+                    ..Container::default()
+                }]),
+                ..PodSpec::default()
+            }),
+            status: Some(PodStatus {
+                container_statuses: Some(vec![ContainerStatus {
+                    name: "api".to_owned(),
+                    ready: false,
+                    restart_count: 4,
+                    image: "example/api:v1".to_owned(),
+                    image_id: String::new(),
+                    state: Some(ContainerState {
+                        waiting: Some(ContainerStateWaiting {
+                            reason: Some("CrashLoopBackOff".to_owned()),
+                            ..ContainerStateWaiting::default()
+                        }),
+                        ..ContainerState::default()
+                    }),
+                    ..ContainerStatus::default()
+                }]),
+                init_container_statuses: Some(vec![ContainerStatus {
+                    name: "migrate".to_owned(),
+                    ready: true,
+                    restart_count: 0,
+                    image: "example/migrate:v1".to_owned(),
+                    image_id: String::new(),
+                    ..ContainerStatus::default()
+                }]),
+                ..PodStatus::default()
+            }),
+        };
+        let rows = container_rows(&pod);
+        assert_eq!(rows.len(), 2);
+        let api = rows.iter().find(|row| row.name.as_ref() == "api").unwrap();
+        assert_eq!(api.status.as_ref(), "CrashLoopBackOff");
+        assert_eq!(api.container_data().unwrap().restarts, 4);
+        let init = rows
+            .iter()
+            .find(|row| row.name.as_ref() == "migrate")
+            .unwrap();
+        assert_eq!(init.container_data().unwrap().kind.as_ref(), "init");
+    }
+
+    #[test]
+    fn yaml_titles_include_namespace_and_name() {
+        let pod = ResourceTarget {
+            kind: ResourceKind::Pods.into(),
+            namespace: Some("prod".to_owned()),
+            name: "api-0".to_owned(),
+        };
+        let node = ResourceTarget {
+            kind: ResourceKind::Nodes.into(),
+            namespace: None,
+            name: "worker-0".to_owned(),
+        };
+        assert_eq!(yaml_title(&pod), "YAML(prod/api-0)");
+        assert_eq!(yaml_title(&node), "YAML(worker-0)");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires access to a Kubernetes cluster"]
+    async fn live_dynamic_api_lists_secret_crd_and_aggregated_resources() {
+        let client = Client::try_default().await.expect("Kubernetes client");
+        let resources = discover_resources(client.clone())
+            .await
+            .expect("API discovery");
+        for qualified_name in [
+            "secrets",
+            "customresourcedefinitions.apiextensions.k8s.io",
+            "nodes.metrics.k8s.io",
+        ] {
+            let resource = resources
+                .iter()
+                .find(|resource| resource.qualified_name() == qualified_name)
+                .unwrap_or_else(|| panic!("missing {qualified_name}"));
+            let objects = dynamic_api(client.clone(), resource, None)
+                .list(&ListParams::default().limit(1))
+                .await
+                .unwrap_or_else(|error| panic!("list {qualified_name}: {error}"));
+            assert!(!objects.items.is_empty(), "no {qualified_name} objects");
+        }
+    }
+}

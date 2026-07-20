@@ -1,0 +1,105 @@
+mod demo;
+mod discovery;
+mod kubernetes;
+
+use std::time::Duration;
+
+use kube::Client;
+use tokio::sync::{mpsc, watch};
+
+use crate::{
+    app::{ActionIntent, ResourceTarget},
+    kubeconfig::ContextInfo,
+    model::{NamespaceInfo, ResourceDescriptor, ResourceRow, ResourceSnapshot},
+};
+
+pub use discovery::discover_resources;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchRequest {
+    pub generation: u64,
+    pub context: String,
+    pub kind: ResourceDescriptor,
+    pub namespace: Option<String>,
+    pub field_selector: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct KubernetesSettings {
+    pub initial_context: String,
+    pub publish_interval: Duration,
+    pub streaming_lists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionResult {
+    Notice(String),
+    Content {
+        title: String,
+        body: String,
+        managed_fields: Option<String>,
+        decoded_body: Option<String>,
+        decoded_managed_fields: Option<String>,
+        content: crate::app::ContentKind,
+    },
+    NamespaceOptions {
+        context: String,
+        namespaces: Vec<NamespaceInfo>,
+    },
+    ContextOptions {
+        context: String,
+        contexts: Vec<ContextInfo>,
+        notice: String,
+    },
+    ResourceOptions {
+        context: String,
+        resources: Vec<ResourceDescriptor>,
+    },
+    Containers {
+        target: ResourceTarget,
+        rows: Vec<std::sync::Arc<ResourceRow>>,
+    },
+    Policy {
+        target: ResourceTarget,
+        title: String,
+        rows: Vec<std::sync::Arc<ResourceRow>>,
+    },
+    ServerVersion(String),
+    Error(String),
+}
+
+#[must_use = "the source task should be retained and aborted during shutdown"]
+pub fn spawn_kubernetes(
+    client: Client,
+    settings: KubernetesSettings,
+    requests: mpsc::Receiver<WatchRequest>,
+    snapshots: watch::Sender<ResourceSnapshot>,
+    actions: mpsc::Receiver<ActionIntent>,
+    action_results: mpsc::Sender<ActionResult>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(kubernetes::run_manager(
+        client,
+        settings,
+        requests,
+        snapshots,
+        actions,
+        action_results,
+    ))
+}
+
+#[must_use = "the source task should be retained and aborted during shutdown"]
+pub fn spawn_demo(
+    item_count: usize,
+    requests: mpsc::Receiver<WatchRequest>,
+    snapshots: watch::Sender<ResourceSnapshot>,
+    actions: mpsc::Receiver<ActionIntent>,
+    action_results: mpsc::Sender<ActionResult>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(demo::run_manager(
+        item_count,
+        requests,
+        snapshots,
+        actions,
+        action_results,
+    ))
+}
