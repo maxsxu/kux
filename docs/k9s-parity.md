@@ -58,7 +58,7 @@ K9s key and reports that its backend is pending, and **planned** is not yet expo
 | Delete resource or inactive context with Tab + Enter confirmation | `Ctrl-D` | Implemented; active/synthetic contexts and resources without delete capability remain protected |
 | Kill without confirmation | `Ctrl-K` | Implemented with zero grace period |
 | Pod shell/attach | `s`, `a` | Interaction; backend pending |
-| Edit | `e` | Interaction; backend pending |
+| Edit any Kubernetes resource | `e` | Implemented through interactive `kubectl edit` with the active context and selected resource namespace; unavailable in read-only mode |
 | Port-forward list/start | `f`, `Shift-F` | Interaction; backend pending |
 | Owner navigation | `Shift-J` | Interaction; backend pending |
 | Service benchmark | `b` | Interaction; backend pending |

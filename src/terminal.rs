@@ -9,7 +9,10 @@ use crossterm::{
     cursor,
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+        enable_raw_mode,
+    },
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 
@@ -39,6 +42,39 @@ impl TerminalGuard {
 
     pub const fn terminal_mut(&mut self) -> &mut KuxTerminal {
         &mut self.terminal
+    }
+
+    /// Restores the host terminal while an interactive child process runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when raw mode or terminal commands cannot be updated.
+    pub fn suspend(&mut self) -> Result<()> {
+        disable_raw_mode()?;
+        execute!(
+            self.terminal.backend_mut(),
+            DisableMouseCapture,
+            LeaveAlternateScreen,
+            cursor::Show
+        )?;
+        Ok(())
+    }
+
+    /// Re-enters the Kux terminal after an interactive child process exits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when raw mode, terminal commands, or screen clearing fails.
+    pub fn resume(&mut self) -> Result<()> {
+        enable_raw_mode()?;
+        execute!(
+            self.terminal.backend_mut(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            cursor::Hide,
+            Clear(ClearType::All)
+        )?;
+        Ok(())
     }
 
     /// Copies text through the host clipboard when available, falling back to

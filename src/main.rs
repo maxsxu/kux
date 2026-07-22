@@ -6,7 +6,7 @@ use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::StreamExt;
 use kube::{Client, Config, config::KubeConfigOptions};
 use kux::{
-    app::{App, AppCommand, Overlay},
+    app::{App, AppCommand, Overlay, ResourceTarget},
     cli::Cli,
     kubeconfig::{ContextCatalog, ContextInfo, fallback_contexts},
     model::ResourceSnapshot,
@@ -14,7 +14,10 @@ use kux::{
     terminal::TerminalGuard,
     ui,
 };
-use tokio::sync::{mpsc, watch};
+use tokio::{
+    process::Command,
+    sync::{mpsc, watch},
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -157,6 +160,22 @@ async fn run(
                             AppCommand::Copy(value) => {
                                 handle_copy(&mut app, &mut terminal, &value);
                             }
+                            AppCommand::Edit(target) => {
+                                let result = edit_resource(&mut terminal, &app.context, &target)
+                                    .await
+                                    .context("restore terminal after resource edit")?;
+                                match result {
+                                    Ok(status) if status.success() => app.show_transient_notice(format!(
+                                        "Edited {} {}",
+                                        target.kind.qualified_name(),
+                                        target.name
+                                    )),
+                                    Ok(status) => app.show_transient_notice(format!(
+                                        "Edit failed: kubectl edit exited with {status}"
+                                    )),
+                                    Err(error) => app.show_transient_notice(format!("Edit failed: {error}")),
+                                }
+                            }
                             AppCommand::Action(action) => {
                                 actions.send(action).await.context("action worker stopped")?;
                                 app.show_notice("Working…");
@@ -251,5 +270,89 @@ fn handle_copy(app: &mut App, terminal: &mut TerminalGuard, value: &str) {
     match terminal.copy_to_clipboard(value) {
         Ok(()) => app.show_transient_notice(message),
         Err(error) => app.show_transient_notice(format!("Copy failed: {error}")),
+    }
+}
+
+fn edit_args(context: &str, target: &ResourceTarget) -> Vec<String> {
+    let mut args = vec![
+        "edit".to_owned(),
+        target.kind.qualified_name(),
+        target.name.clone(),
+        "--context".to_owned(),
+        context.to_owned(),
+    ];
+    if let Some(namespace) = &target.namespace {
+        args.extend(["--namespace".to_owned(), namespace.clone()]);
+    }
+    args
+}
+
+async fn edit_resource(
+    terminal: &mut TerminalGuard,
+    context: &str,
+    target: &ResourceTarget,
+) -> Result<Result<std::process::ExitStatus, String>> {
+    terminal
+        .suspend()
+        .context("suspend terminal for resource edit")?;
+    let status = Command::new("kubectl")
+        .args(edit_args(context, target))
+        .status()
+        .await
+        .map_err(|error| format!("Unable to run kubectl edit: {error}"));
+    terminal.resume()?;
+    Ok(status)
+}
+
+#[cfg(test)]
+mod tests {
+    use kux::{
+        app::ResourceTarget,
+        model::{ResourceDescriptor, ResourceOperations},
+    };
+
+    use super::edit_args;
+
+    fn target(group: &str, kind: &str, plural: &str, namespace: Option<&str>) -> ResourceTarget {
+        ResourceTarget {
+            kind: ResourceDescriptor::new(
+                group,
+                "v1",
+                if group.is_empty() {
+                    "v1".to_owned()
+                } else {
+                    format!("{group}/v1")
+                },
+                kind,
+                plural,
+                namespace.is_some(),
+                ResourceOperations::all(),
+            ),
+            namespace: namespace.map(str::to_owned),
+            name: "selected".to_owned(),
+        }
+    }
+
+    #[test]
+    fn edit_args_qualify_dynamic_resources_and_preserve_scope() {
+        assert_eq!(
+            edit_args(
+                "prod",
+                &target("example.io", "Widget", "widgets", Some("team-a"))
+            ),
+            [
+                "edit",
+                "widgets.example.io",
+                "selected",
+                "--context",
+                "prod",
+                "--namespace",
+                "team-a",
+            ]
+        );
+        assert_eq!(
+            edit_args("prod", &target("", "Namespace", "namespaces", None)),
+            ["edit", "namespaces", "selected", "--context", "prod"]
+        );
     }
 }

@@ -484,6 +484,9 @@ fn action_hints(app: &App) -> Vec<HeaderHint> {
                 action_hint("j/k", "Move"),
                 action_hint("esc", "Back"),
             ]);
+            if !app.read_only {
+                hints.push(action_hint("e", "Edit"));
+            }
         }
         Overlay::Contexts => {
             hints.extend([
@@ -501,6 +504,9 @@ fn action_hints(app: &App) -> Vec<HeaderHint> {
                 action_hint("d", "Describe"),
                 action_hint("esc", "Back"),
             ]);
+            if !app.read_only {
+                hints.push(action_hint("e", "Edit"));
+            }
         }
         _ if app.is_policy_view() => {
             hints.extend([
@@ -553,6 +559,7 @@ fn resource_action_hints(app: &App) -> Vec<HeaderHint> {
         hints.push(action_hint("w", "Warp Namespace"));
     }
     if !app.read_only {
+        hints.push(action_hint("e", "Edit"));
         hints.push(action_hint("ctrl-d", "Delete"));
         hints.push(action_hint("ctrl-k", "Kill"));
     }
@@ -1147,7 +1154,7 @@ fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ("Shift-N/A", "Sort name / age"),
         ("Shift-P/S", "Sort namespace / status"),
         ("c / n", "Copy name / namespace"),
-        ("y / d", "YAML / describe"),
+        ("y/d/e", "YAML / describe / edit"),
         ("Mouse", "Click header to sort"),
         ("Tab/Ctrl-U", "Complete, restore, clear input"),
     ];
@@ -2236,6 +2243,29 @@ mod tests {
                 .iter()
                 .any(|hint| hint.key == "y" && hint.label == "YAML")
         );
+    }
+
+    #[test]
+    fn resource_edit_hint_is_available_only_when_mutations_are_enabled() {
+        let mut app = app_with_rendered_pod();
+        for overlay in [Overlay::None, Overlay::Namespaces, Overlay::Details] {
+            app.overlay = overlay;
+            assert!(
+                action_hints(&app)
+                    .iter()
+                    .any(|hint| hint.key == "e" && hint.label == "Edit"),
+                "{overlay:?}"
+            );
+        }
+
+        app.read_only = true;
+        for overlay in [Overlay::None, Overlay::Namespaces, Overlay::Details] {
+            app.overlay = overlay;
+            assert!(
+                action_hints(&app).iter().all(|hint| hint.key != "e"),
+                "{overlay:?}"
+            );
+        }
     }
 
     #[test]

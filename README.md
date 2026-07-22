@@ -83,7 +83,7 @@ Navigation stays in place instead of stacking popups:
 Node ──Enter──▶ Pods on node ──Enter──▶ Containers ──Enter──▶ Logs
 ServiceAccount ──Enter──▶ Effective RBAC policy matrix
 Secret ──x──▶ Decoded data only
-Resource ──y / d──▶ Formatted YAML / kubectl describe
+Resource ──y / d / e──▶ Formatted YAML / kubectl describe / interactive kubectl edit
 ```
 
 Command and filter mode remain available from resource tables, contexts, details, YAML, describe,
@@ -142,6 +142,7 @@ The header always shows the actions available in the current view. These are the
 | `j`/`k`, arrows, `PgUp`/`PgDn`, `g`/`G` | Navigate |
 | `Enter` | Drill into the selected resource |
 | `y`, `d` | YAML and `kubectl describe` |
+| `e` | Edit the selected resource with `kubectl edit` |
 | `l`, `p` | Current and previous logs |
 | `c`, `n` | Copy resource name or namespace |
 | `x` on Secret | Open decoded data only; in YAML, toggle decoded values |
@@ -165,7 +166,8 @@ Press `?` for the active keymap. The full compatibility surface is documented in
   mutation paths.
 - `Ctrl-D` uses a guarded confirmation and refuses the active context; `Ctrl-K` intentionally
   requests zero-grace resource deletion.
-- `kubectl` is required for describe views and kubeconfig context deletion.
+- `kubectl` is required for describe views, interactive resource editing, and kubeconfig context
+  deletion.
 - The Metrics API is optional; Pod and Node usage columns remain unavailable when it is absent.
 - Use `--legacy-list` for API servers that do not support streaming initial lists.
 - Use `--no-logo` for compact terminals; `Ctrl-L` toggles the logo at runtime.

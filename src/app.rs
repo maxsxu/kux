@@ -205,6 +205,7 @@ pub enum AppCommand {
     Quit,
     Request(ViewState),
     Copy(String),
+    Edit(ResourceTarget),
     Action(ActionIntent),
 }
 
@@ -819,7 +820,7 @@ impl App {
             KeyCode::Char('a') if known_kind == Some(ResourceKind::Pods) => {
                 self.unsupported("Attach is not implemented yet")
             }
-            KeyCode::Char('e') => self.mutation_unavailable("Edit is not implemented yet"),
+            KeyCode::Char('e') if self.is_resource_view() => self.edit_action(),
             KeyCode::Char('f')
                 if matches!(
                     known_kind,
@@ -1083,6 +1084,7 @@ impl App {
         }
         match key.code {
             KeyCode::Char('y') => self.namespace_content_action(&visible),
+            KeyCode::Char('e') => self.namespace_edit_action(&visible),
             KeyCode::Enter => {
                 let Some(index) = visible
                     .iter()
@@ -1112,15 +1114,30 @@ impl App {
     }
 
     fn namespace_content_action(&self, visible: &[usize]) -> AppCommand {
-        let Some(namespace) = visible
+        self.selected_namespace_target(visible)
+            .map_or(AppCommand::None, |target| {
+                AppCommand::Action(ActionIntent::Content {
+                    target,
+                    content: ContentKind::Yaml,
+                })
+            })
+    }
+
+    fn namespace_edit_action(&mut self, visible: &[usize]) -> AppCommand {
+        if self.read_only {
+            return self.unsupported("Edit is disabled in read-only mode");
+        }
+        self.selected_namespace_target(visible)
+            .map_or(AppCommand::None, AppCommand::Edit)
+    }
+
+    fn selected_namespace_target(&self, visible: &[usize]) -> Option<ResourceTarget> {
+        let namespace = visible
             .iter()
             .copied()
             .find(|index| *index == self.overlay_selected)
             .and_then(|index| self.namespace_options.get(index))
-            .filter(|namespace| namespace.name != "<all>")
-        else {
-            return AppCommand::None;
-        };
+            .filter(|namespace| namespace.name != "<all>")?;
         let kind = self
             .resource_options
             .iter()
@@ -1142,13 +1159,10 @@ impl App {
                     ResourceOperations::all(),
                 )
             });
-        AppCommand::Action(ActionIntent::Content {
-            target: ResourceTarget {
-                kind,
-                namespace: None,
-                name: namespace.name.clone(),
-            },
-            content: ContentKind::Yaml,
+        Some(ResourceTarget {
+            kind,
+            namespace: None,
+            name: namespace.name.clone(),
         })
     }
 
@@ -1304,6 +1318,13 @@ impl App {
 
     fn handle_details_overlay(&mut self, key: KeyEvent) -> AppCommand {
         match key.code {
+            KeyCode::Char('e') => {
+                let command = self.edit_action();
+                if matches!(&command, AppCommand::Edit(_)) {
+                    self.overlay = Overlay::None;
+                }
+                command
+            }
             KeyCode::Char('y') => {
                 self.overlay = Overlay::None;
                 self.content_action(ContentKind::Yaml)
@@ -2169,6 +2190,14 @@ impl App {
         })
     }
 
+    fn edit_action(&mut self) -> AppCommand {
+        if self.read_only {
+            return self.unsupported("Edit is disabled in read-only mode");
+        }
+        self.selected_target()
+            .map_or(AppCommand::None, AppCommand::Edit)
+    }
+
     fn copy_name(&self) -> AppCommand {
         self.selected_row().map_or(AppCommand::None, |row| {
             AppCommand::Copy(row.name.to_string())
@@ -2884,6 +2913,51 @@ mod tests {
     }
 
     #[test]
+    fn read_only_mode_blocks_resource_edit() {
+        let widget = descriptor(
+            "example.io",
+            "v1",
+            "example.io/v1",
+            "Widget",
+            "widgets",
+            true,
+        );
+        let mut app = app_with_descriptor(
+            widget,
+            Some("prod"),
+            ResourceRow::new("prod", "selected", "Ready", "1/1", "-", 0),
+        );
+        app.read_only = true;
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)),
+            AppCommand::None
+        );
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Edit is disabled in read-only mode")
+        );
+    }
+
+    #[test]
+    fn read_only_edit_keeps_the_details_body_open() {
+        let mut app = app_with_rows();
+        app.read_only = true;
+        app.details_row = app.selected_row().cloned();
+        app.overlay = Overlay::Details;
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)),
+            AppCommand::None
+        );
+        assert_eq!(app.overlay, Overlay::Details);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Edit is disabled in read-only mode")
+        );
+    }
+
+    #[test]
     fn context_delete_result_preserves_active_context_and_nearest_selection() {
         let mut app = app_with_contexts(false);
         app.overlay = Overlay::Contexts;
@@ -3000,6 +3074,46 @@ mod tests {
                         name: "selected".to_owned(),
                     },
                     content: ContentKind::Yaml,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn e_targets_namespaced_and_cluster_scoped_dynamic_resources() {
+        let cases = vec![
+            (
+                descriptor(
+                    "example.io",
+                    "v1",
+                    "example.io/v1",
+                    "Widget",
+                    "widgets",
+                    true,
+                ),
+                "prod",
+                Some("prod".to_owned()),
+            ),
+            (
+                descriptor("", "v1", "v1", "Namespace", "namespaces", false),
+                "-",
+                None,
+            ),
+        ];
+
+        for (kind, row_namespace, expected_namespace) in cases {
+            let mut app = app_with_descriptor(
+                kind.clone(),
+                expected_namespace.as_deref(),
+                ResourceRow::new(row_namespace, "selected", "Ready", "1/1", "-", 0),
+            );
+
+            assert_eq!(
+                app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)),
+                AppCommand::Edit(ResourceTarget {
+                    kind,
+                    namespace: expected_namespace,
+                    name: "selected".to_owned(),
                 })
             );
         }
@@ -3176,6 +3290,62 @@ mod tests {
                     name: "prod".to_owned(),
                 },
                 content: ContentKind::Yaml,
+            })
+        );
+    }
+
+    #[test]
+    fn namespace_chooser_e_edits_the_selected_namespace() {
+        let namespace = descriptor("", "v1", "v1", "Namespace", "namespaces", false);
+        let mut app = app_with_rows();
+        let mut resources = app.resource_options.clone();
+        resources.push(namespace.clone());
+        app.set_resource_options(resources);
+        app.set_namespace_options(
+            "demo",
+            vec![NamespaceInfo::discovered("prod", "Active", None)],
+        );
+        assert_eq!(type_input(&mut app, ':', "ns"), AppCommand::None);
+        app.overlay_selected = app
+            .namespace_options
+            .iter()
+            .position(|option| option.name == "prod")
+            .expect("prod namespace");
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)),
+            AppCommand::Edit(ResourceTarget {
+                kind: namespace,
+                namespace: None,
+                name: "prod".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn details_body_e_edits_the_selected_resource() {
+        let widget = descriptor(
+            "example.io",
+            "v1",
+            "example.io/v1",
+            "Widget",
+            "widgets",
+            true,
+        );
+        let mut app = app_with_descriptor(
+            widget.clone(),
+            Some("prod"),
+            ResourceRow::new("prod", "selected", "Ready", "1/1", "-", 0),
+        );
+        app.details_row = app.selected_row().cloned();
+        app.overlay = Overlay::Details;
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)),
+            AppCommand::Edit(ResourceTarget {
+                kind: widget,
+                namespace: Some("prod".to_owned()),
+                name: "selected".to_owned(),
             })
         );
     }
