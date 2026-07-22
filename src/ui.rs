@@ -84,17 +84,18 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         Overlay::Aliases => draw_aliases(frame, app, chunks[2]),
         Overlay::Namespaces => draw_namespaces(frame, app, chunks[2]),
         Overlay::Contexts => draw_contexts(frame, app, chunks[2]),
+        Overlay::Help => draw_help(frame, app, chunks[2]),
         Overlay::Content => draw_content(frame, app, chunks[2]),
         Overlay::Details => draw_details(frame, app, chunks[2]),
         _ => draw_resources(frame, app, chunks[2]),
     }
 
     match app.overlay {
-        Overlay::Help => draw_help(frame, app, area),
         Overlay::ConfirmDelete => draw_delete_confirmation(frame, app, area),
         Overlay::Aliases
         | Overlay::Namespaces
         | Overlay::Contexts
+        | Overlay::Help
         | Overlay::Content
         | Overlay::Details
         | Overlay::None => {}
@@ -1126,65 +1127,98 @@ fn prompt_line(
 }
 
 fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let left = [
-        ("?", "Help / active mnemonics"),
-        ("Ctrl-A", "Resource aliases"),
-        (":", "Command mode"),
-        ("/", "Filter mode"),
-        ("Esc", "Back / clear filter"),
-        ("[ / ]", "History back / forward"),
-        ("j/k", "Move selection"),
-        ("PgUp/PgDn", "Move one page"),
-        ("Space", "Mark resource"),
-        ("Ctrl-Space", "Mark range"),
-        ("Ctrl-\\", "Clear marks"),
-        ("Ctrl-R", "Refresh view"),
-        ("Ctrl-C", "Quit"),
-        ("0…9", "Recent namespaces"),
-    ];
-    let right = [
-        ("Ctrl-D", "Delete with confirmation"),
-        ("Ctrl-K", "Kill immediately"),
-        ("Ctrl-Z", "Toggle faults"),
-        ("Ctrl-W", "Toggle wide columns"),
-        ("Ctrl-E", "Toggle header"),
-        ("Ctrl-L", "Toggle logo"),
-        ("Shift-←/→", "Select column"),
-        ("Shift-O", "Sort selected column"),
-        ("Shift-N/A", "Sort name / age"),
-        ("Shift-P/S", "Sort namespace / status"),
-        ("c / n", "Copy name / namespace"),
-        ("y/d/e", "YAML / describe / edit"),
-        ("Mouse", "Click header to sort"),
-        ("Tab/Ctrl-U", "Complete, restore, clear input"),
-    ];
-    let rows = left.iter().zip(right.iter()).map(|((lk, lv), (rk, rv))| {
-        Row::new(vec![
-            Cell::from(*lk).style(Style::default().fg(CYAN).bold()),
-            Cell::from(*lv),
-            Cell::from(*rk).style(Style::default().fg(PURPLE).bold()),
-            Cell::from(*rv),
-        ])
-    });
-    let popup = centered_rect(90, 22, area);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Table::new(
-            rows,
-            [
-                Constraint::Length(14),
-                Constraint::Percentage(36),
-                Constraint::Length(14),
-                Constraint::Percentage(36),
+    const CATEGORIES: &[(&str, &[(&str, &str)])] = &[
+        (
+            "NAVIGATION",
+            &[
+                ("j", "Down"),
+                ("k", "Up"),
+                ("h", "Left / Back"),
+                ("l", "Right / Open"),
+                ("g / Home", "Go to top"),
+                ("Shift-G / End", "Go to bottom"),
+                ("Ctrl-B / PgUp", "Page up"),
+                ("Ctrl-F / PgDn", "Page down"),
+                ("[", "History back"),
+                ("-", "History back"),
+                ("]", "History forward"),
             ],
-        )
-        .header(
-            Row::new(["KEY", "ACTION", "KEY", "ACTION"])
-                .style(Style::default().fg(YELLOW).bold())
-                .bottom_margin(1),
-        )
-        .block(popup_block(&format!(" Help · {} ", app.kind.label()))),
-        popup,
+        ),
+        (
+            "GENERAL",
+            &[
+                ("?", "Help"),
+                ("Ctrl-A", "Resource aliases"),
+                (":", "Command mode"),
+                ("/", "Filter mode"),
+                ("Esc", "Back / clear filter"),
+                ("Ctrl-R", "Refresh view"),
+                ("Ctrl-C", "Quit"),
+                ("0…9", "Recent namespaces"),
+            ],
+        ),
+        (
+            "RESOURCES",
+            &[
+                ("Enter", "Open selected resource"),
+                ("Space", "Mark resource"),
+                ("Ctrl-Space", "Mark range"),
+                ("Ctrl-\\", "Clear marks"),
+                ("c / n", "Copy name / namespace"),
+                ("y / d / e", "YAML / describe / edit"),
+                ("l / p", "Logs / previous logs"),
+            ],
+        ),
+        (
+            "DISPLAY",
+            &[
+                ("Ctrl-E", "Toggle header"),
+                ("Ctrl-L", "Toggle logo"),
+                ("Ctrl-W", "Toggle wide columns"),
+                ("Shift-← / Shift-→", "Select column"),
+                ("Shift-O", "Sort selected column"),
+                ("Shift-N / A", "Sort name / age"),
+                ("Shift-P / S", "Sort namespace / status"),
+                ("Mouse", "Click header to sort"),
+            ],
+        ),
+        (
+            "MUTATION",
+            &[
+                ("Ctrl-D", "Delete with confirmation"),
+                ("Ctrl-K", "Kill immediately"),
+                ("Ctrl-Z", "Toggle faults"),
+            ],
+        ),
+    ];
+    let mut lines = Vec::new();
+    for (category_index, (category, entries)) in CATEGORIES.iter().enumerate() {
+        if category_index > 0 {
+            lines.push(Line::raw(""));
+        }
+        lines.push(Line::from(Span::styled(
+            format!("  {category}"),
+            Style::default().fg(CYAN).bold(),
+        )));
+        for (key, action) in *entries {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {:<24}", format!("<{key}>")),
+                    Style::default().fg(GREEN).bold(),
+                ),
+                Span::styled((*action).to_owned(), Style::default().fg(Color::White)),
+            ]));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(notice_block(
+                popup_block(&format!(" Help · {} ", app.kind.label()))
+                    .title_alignment(Alignment::Center),
+                app,
+            ))
+            .scroll((app.content_scroll, app.content_horizontal_scroll)),
+        area,
     );
 }
 
@@ -1483,7 +1517,7 @@ fn draw_details(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 popup_block(&title).title_alignment(Alignment::Center),
                 app,
             ))
-            .wrap(Wrap { trim: false }),
+            .scroll((app.content_scroll, app.content_horizontal_scroll)),
         area,
     );
 }
@@ -1514,7 +1548,7 @@ fn draw_content(frame: &mut Frame<'_>, app: &App, area: Rect) {
             popup_block(&title).title_alignment(Alignment::Center),
             app,
         ))
-        .scroll((app.content_scroll, 0));
+        .scroll((app.content_scroll, app.content_horizontal_scroll));
     let paragraph = if app.ui.wrap() {
         paragraph.wrap(Wrap { trim: false })
     } else {
@@ -2206,20 +2240,26 @@ mod tests {
     }
 
     #[test]
-    fn help_and_delete_confirmation_remain_centered_popups() {
+    fn help_renders_categorized_in_the_body_while_delete_remains_a_popup() {
         let mut app = app_with_rendered_pod();
-        let backend = TestBackend::new(100, 30);
+        let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).expect("modal terminal");
 
         app.overlay = Overlay::Help;
         terminal
             .draw(|frame| draw(frame, &mut app))
-            .expect("draw help popup");
-        let help = rendered_lines(&terminal, 100)
+            .expect("draw help body");
+        let help_lines = rendered_lines(&terminal, 100);
+        let help = help_lines
             .into_iter()
             .find(|line| line.contains("Help · Pods"))
             .expect("help title");
-        assert!(!help.starts_with('╭'));
+        assert!(help.starts_with('╭'));
+        let rendered = rendered_lines(&terminal, 100).join("\n");
+        assert!(rendered.contains("NAVIGATION"));
+        assert!(rendered.contains("GENERAL"));
+        assert!(rendered.contains("<j>"));
+        assert!(rendered.contains("Down"));
 
         app.overlay = Overlay::None;
         app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));

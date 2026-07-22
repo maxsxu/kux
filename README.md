@@ -140,7 +140,7 @@ The header always shows the actions available in the current view. These are the
 | --- | --- |
 | `:`, `/` | Command mode and filter mode |
 | `0`, `1`…`9` | All namespaces, then the nine most recent named namespaces |
-| `j`/`k`, arrows, `PgUp`/`PgDn`, `g`/`G` | Navigate |
+| `h`/`j`/`k`/`l`, arrows, `Ctrl-B`/`Ctrl-F`, `PgUp`/`PgDn`, `g`/`G` | Navigate, go back, or open contextually |
 | `Enter` | Drill into the selected resource |
 | `y`, `d` | YAML and `kubectl describe` |
 | `e` | Edit the selected resource with `kubectl edit` |
@@ -154,7 +154,7 @@ The header always shows the actions available in the current view. These are the
 | `Ctrl-L`, `Ctrl-E`, `Ctrl-W` | Toggle logo, header, and wide columns |
 | `:q`, `Ctrl-C` | Quit |
 
-Press `?` for the active keymap. The full compatibility surface is documented in the
+Press `?` for the categorized keymap in the body. The full compatibility surface is documented in the
 [K9s interaction matrix](docs/k9s-parity.md).
 
 ## Safety and requirements

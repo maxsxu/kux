@@ -23,6 +23,7 @@ K9s key and reports that its backend is pending, and **planned** is not yet expo
 | Namespace chooser/direct namespace | `:ns`, `:ns name` | Implemented; body columns are Name/Status/Age, `y` opens the selected Namespace YAML, and direct selection switches immediately |
 | Recent namespace shortcuts | `0`…`9` | Implemented; `0` is always all namespaces and `1`…`9` are named recents |
 | K9s-style header menu | automatic | Implemented as a lossless responsive header: cluster information is measured and wrapped first, the upright logo is shown only when it fits, and only complete namespace/action hotkey columns are admitted in priority order |
+| Categorized help body | `?` | Implemented in place with Navigation, General, Resources, Display, and Mutation categories |
 | Command completion | `Tab`, `Shift-Tab` | Implemented for discovered resource names and short names, built-in aliases, contexts, and namespaces |
 | Refresh | `Ctrl-R` | Implemented |
 
@@ -30,6 +31,7 @@ K9s key and reports that its backend is pending, and **planned** is not yet expo
 
 | Interaction | Key | Status |
 | --- | --- | --- |
+| Vim navigation | `h/j/k/l`, `g/G`, `Ctrl-B/F` | Implemented contextually across resource lists, choosers, text bodies, help, details, and confirmation actions |
 | Mark, range mark, clear | `Space`, `Ctrl-Space`, `Ctrl-\` | Implemented |
 | Faults, wide, header, logo | `Ctrl-Z/W/E/L` | Implemented |
 | Select column | `Shift-Left`, `Shift-Right` | Implemented |

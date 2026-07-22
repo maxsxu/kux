@@ -392,6 +392,7 @@ pub struct App {
     pub content_decoded_managed_fields: Option<String>,
     pub content_kind: Option<ContentKind>,
     pub content_scroll: u16,
+    pub content_horizontal_scroll: u16,
     pub details_row: Option<ResourceRow>,
     pub notice: Option<String>,
     pub filter_error: Option<String>,
@@ -482,6 +483,7 @@ impl App {
             content_decoded_managed_fields: None,
             content_kind: None,
             content_scroll: 0,
+            content_horizontal_scroll: 0,
             details_row: None,
             notice: None,
             filter_error: None,
@@ -668,6 +670,10 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return AppCommand::Quit;
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
+            self.ui.toggle(UiFlags::HEADER);
+            return AppCommand::None;
+        }
         if self.input_mode != InputMode::Browse {
             return self.handle_input_key(key);
         }
@@ -758,10 +764,10 @@ impl App {
             KeyCode::Char('?') => self.open_overlay(Overlay::Help),
             KeyCode::Char(':') => self.start_input(InputMode::Command),
             KeyCode::Char('/') => self.start_input(InputMode::Filter),
-            KeyCode::Esc => self.escape_view(),
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => self.escape_view(),
             KeyCode::Char('[' | '-') => self.navigate_history(-1),
             KeyCode::Char(']') => self.navigate_history(1),
-            KeyCode::Enter => self.open_selected(),
+            KeyCode::Enter | KeyCode::Right => self.open_selected(),
             KeyCode::Down | KeyCode::Char('j') => {
                 self.move_selection_down(1);
                 AppCommand::None
@@ -811,6 +817,7 @@ impl App {
             KeyCode::Char('l') if known_kind == Some(ResourceKind::Pods) => {
                 self.content_action(ContentKind::Logs)
             }
+            KeyCode::Char('l') => self.open_selected(),
             KeyCode::Char('p') if known_kind == Some(ResourceKind::Pods) => {
                 self.content_action(ContentKind::PreviousLogs)
             }
@@ -864,6 +871,14 @@ impl App {
         match key.code {
             KeyCode::Char('a') => self.open_aliases(),
             KeyCode::Char('r') => self.request_view(self.current_view(), false),
+            KeyCode::Char('f') => {
+                self.move_selection_down(self.viewport_height);
+                AppCommand::None
+            }
+            KeyCode::Char('b') => {
+                self.move_selection_up(self.viewport_height);
+                AppCommand::None
+            }
             KeyCode::Char('d') => self.open_delete_confirmation(),
             KeyCode::Char('k') => self.immediate_delete(),
             KeyCode::Char('z') => {
@@ -873,10 +888,6 @@ impl App {
             }
             KeyCode::Char('w') => {
                 self.ui.toggle(UiFlags::WIDE);
-                AppCommand::None
-            }
-            KeyCode::Char('e') => {
-                self.ui.toggle(UiFlags::HEADER);
                 AppCommand::None
             }
             KeyCode::Char('l') => {
@@ -993,13 +1004,14 @@ impl App {
 
     fn handle_overlay_key(&mut self, key: KeyEvent) -> AppCommand {
         match self.overlay {
+            Overlay::Help => self.handle_help_overlay(key),
             Overlay::Aliases => self.handle_alias_overlay(key),
             Overlay::Namespaces => self.handle_namespace_overlay(key),
             Overlay::Contexts => self.handle_context_overlay(key),
             Overlay::ConfirmDelete => self.handle_confirm_overlay(key),
             Overlay::Content => self.handle_content_overlay(key),
             Overlay::Details => self.handle_details_overlay(key),
-            _ => self.close_overlay_on(key),
+            Overlay::None => self.close_overlay_on(key),
         }
     }
 
@@ -1027,7 +1039,13 @@ impl App {
             KeyCode::PageDown => {
                 self.move_chooser_selection(visible, self.viewport_height, true);
             }
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_chooser_selection(visible, self.viewport_height, true);
+            }
             KeyCode::PageUp => {
+                self.move_chooser_selection(visible, self.viewport_height, false);
+            }
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.move_chooser_selection(visible, self.viewport_height, false);
             }
             KeyCode::Home | KeyCode::Char('g') => {
@@ -1047,7 +1065,7 @@ impl App {
             return AppCommand::None;
         }
         match key.code {
-            KeyCode::Enter => {
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 let Some(index) = visible
                     .iter()
                     .copied()
@@ -1085,7 +1103,7 @@ impl App {
         match key.code {
             KeyCode::Char('y') => self.namespace_content_action(&visible),
             KeyCode::Char('e') => self.namespace_edit_action(&visible),
-            KeyCode::Enter => {
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 let Some(index) = visible
                     .iter()
                     .copied()
@@ -1175,7 +1193,7 @@ impl App {
             return AppCommand::None;
         }
         match key.code {
-            KeyCode::Enter => {
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 let Some(index) = visible
                     .iter()
                     .copied()
@@ -1207,6 +1225,14 @@ impl App {
 
     fn handle_confirm_overlay(&mut self, key: KeyEvent) -> AppCommand {
         match key.code {
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.confirm_armed = false;
+                AppCommand::None
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.confirm_armed = true;
+                AppCommand::None
+            }
             KeyCode::Tab => {
                 self.confirm_armed = !self.confirm_armed;
                 AppCommand::None
@@ -1247,27 +1273,10 @@ impl App {
     }
 
     fn handle_content_overlay(&mut self, key: KeyEvent) -> AppCommand {
+        if self.handle_body_navigation(&key) {
+            return AppCommand::None;
+        }
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.content_scroll = self.content_scroll.saturating_add(1);
-                AppCommand::None
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.content_scroll = self.content_scroll.saturating_sub(1);
-                AppCommand::None
-            }
-            KeyCode::PageDown => {
-                self.content_scroll = self.content_scroll.saturating_add(20);
-                AppCommand::None
-            }
-            KeyCode::PageUp => {
-                self.content_scroll = self.content_scroll.saturating_sub(20);
-                AppCommand::None
-            }
-            KeyCode::Home | KeyCode::Char('g') => {
-                self.content_scroll = 0;
-                AppCommand::None
-            }
             KeyCode::Char('c')
                 if matches!(
                     self.content_kind,
@@ -1281,7 +1290,7 @@ impl App {
                     && self.content_managed_fields.is_some() =>
             {
                 self.ui.toggle(UiFlags::MANAGED_FIELDS);
-                self.content_scroll = 0;
+                self.reset_body_scroll();
                 AppCommand::None
             }
             KeyCode::Char('x')
@@ -1289,7 +1298,7 @@ impl App {
                     && self.content_decoded_body.is_some() =>
             {
                 self.ui.toggle(UiFlags::SECRET_DECODED);
-                self.content_scroll = 0;
+                self.reset_body_scroll();
                 self.notice = Some(
                     if self.ui.secret_decoded() {
                         "Secret values decoded"
@@ -1317,6 +1326,9 @@ impl App {
     }
 
     fn handle_details_overlay(&mut self, key: KeyEvent) -> AppCommand {
+        if self.handle_body_navigation(&key) {
+            return AppCommand::None;
+        }
         match key.code {
             KeyCode::Char('e') => {
                 let command = self.edit_action();
@@ -1337,8 +1349,58 @@ impl App {
         }
     }
 
+    fn handle_help_overlay(&mut self, key: KeyEvent) -> AppCommand {
+        if self.handle_body_navigation(&key) {
+            AppCommand::None
+        } else {
+            self.close_overlay_on(key)
+        }
+    }
+
+    fn handle_body_navigation(&mut self, key: &KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.content_scroll = self.content_scroll.saturating_add(1);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.content_scroll = self.content_scroll.saturating_sub(1);
+            }
+            KeyCode::PageDown => {
+                self.content_scroll = self.content_scroll.saturating_add(20);
+            }
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.content_scroll = self.content_scroll.saturating_add(20);
+            }
+            KeyCode::PageUp => {
+                self.content_scroll = self.content_scroll.saturating_sub(20);
+            }
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.content_scroll = self.content_scroll.saturating_sub(20);
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                self.content_scroll = 0;
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.content_horizontal_scroll = self.content_horizontal_scroll.saturating_sub(1);
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.content_horizontal_scroll = self.content_horizontal_scroll.saturating_add(1);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn reset_body_scroll(&mut self) {
+        self.content_scroll = 0;
+        self.content_horizontal_scroll = 0;
+    }
+
     fn close_overlay_on(&mut self, key: KeyEvent) -> AppCommand {
-        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q' | '?')) {
+        if matches!(
+            key.code,
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h' | 'q' | '?')
+        ) {
             self.overlay = Overlay::None;
             self.pending_delete = None;
             self.confirm_armed = false;
@@ -1763,6 +1825,7 @@ impl App {
     fn open_overlay(&mut self, overlay: Overlay) -> AppCommand {
         self.overlay = overlay;
         self.overlay_selected = 0;
+        self.reset_body_scroll();
         AppCommand::None
     }
 
@@ -2033,6 +2096,7 @@ impl App {
                 self.details_row = self.selected_row().cloned();
                 if self.details_row.is_some() {
                     self.body_query.clear();
+                    self.reset_body_scroll();
                     self.overlay = Overlay::Details;
                 }
                 AppCommand::None
@@ -2259,7 +2323,7 @@ impl App {
         if self.ui.managed_fields() {
             self.ui.toggle(UiFlags::MANAGED_FIELDS);
         }
-        self.content_scroll = 0;
+        self.reset_body_scroll();
         self.overlay = Overlay::Content;
         self.body_query.clear();
         self.filter_error = None;
@@ -2656,6 +2720,162 @@ mod tests {
 
     fn control_d() -> KeyEvent {
         KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn ctrl_e_toggles_the_header_from_every_view_and_input_mode() {
+        for overlay in [
+            Overlay::None,
+            Overlay::Help,
+            Overlay::Aliases,
+            Overlay::Namespaces,
+            Overlay::Contexts,
+            Overlay::Details,
+            Overlay::Content,
+            Overlay::ConfirmDelete,
+        ] {
+            let mut app = app_with_rows();
+            app.overlay = overlay;
+
+            assert!(app.ui.header(), "{overlay:?} starts with the header");
+            assert_eq!(
+                app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+                AppCommand::None
+            );
+            assert!(!app.ui.header(), "{overlay:?} toggles the header");
+            assert_eq!(app.overlay, overlay, "{overlay:?} stays open");
+        }
+
+        let mut app = app_with_rows();
+        app.input_mode = InputMode::Command;
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+            AppCommand::None
+        );
+        assert!(!app.ui.header());
+        assert_eq!(app.input_mode, InputMode::Command);
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn vim_navigation_is_contextual_in_lists_and_choosers() {
+        let mut list = app_with_rows();
+        list.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(
+            list.selected_row().map(|row| row.name.as_ref()),
+            Some("worker-0")
+        );
+        list.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(
+            list.selected_row().map(|row| row.name.as_ref()),
+            Some("api-0")
+        );
+        list.viewport_height = 1;
+        list.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert_eq!(
+            list.selected_row().map(|row| row.name.as_ref()),
+            Some("worker-0")
+        );
+        list.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert_eq!(
+            list.selected_row().map(|row| row.name.as_ref()),
+            Some("api-0")
+        );
+        list.query = "api".to_owned();
+        list.rebuild_filter(None);
+        list.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert!(list.query.is_empty());
+
+        let widget = descriptor(
+            "example.io",
+            "v1",
+            "example.io/v1",
+            "Widget",
+            "widgets",
+            true,
+        );
+        let mut resource = app_with_descriptor(
+            widget,
+            Some("prod"),
+            ResourceRow::new("prod", "selected", "Ready", "1/1", "-", 0),
+        );
+        assert_eq!(
+            resource.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)),
+            AppCommand::None
+        );
+        assert_eq!(resource.overlay, Overlay::Details);
+
+        let mut pods = app_with_rows();
+        assert!(matches!(
+            pods.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)),
+            AppCommand::Action(ActionIntent::Content {
+                content: ContentKind::Logs,
+                ..
+            })
+        ));
+
+        let mut chooser = app_with_rows();
+        chooser.open_aliases();
+        assert!(matches!(
+            chooser.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)),
+            AppCommand::Request(_)
+        ));
+        let mut chooser = app_with_rows();
+        chooser.open_aliases();
+        chooser.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert_eq!(chooser.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn vim_navigation_scrolls_every_text_body() {
+        fn exercise(app: &mut App, label: &str) {
+            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+            assert_eq!(app.content_scroll, 1, "{label} scrolls down");
+            app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+            assert_eq!(app.content_scroll, 0, "{label} scrolls up");
+            app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+            assert_eq!(app.content_scroll, 20, "{label} moves one page down");
+            app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+            assert_eq!(app.content_scroll, 0, "{label} moves one page up");
+            app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+            assert_eq!(app.content_scroll, 0, "{label} goes to the top");
+            app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+            assert_eq!(app.content_horizontal_scroll, 1, "{label} scrolls right");
+            app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+            assert_eq!(app.content_horizontal_scroll, 0, "{label} scrolls left");
+        }
+
+        let mut content = app_with_rows();
+        content.show_content(
+            "YAML(prod/api-0)",
+            "kind: Pod",
+            None,
+            None,
+            None,
+            ContentKind::Yaml,
+        );
+        exercise(&mut content, "content");
+
+        let mut help = app_with_rows();
+        help.open_overlay(Overlay::Help);
+        exercise(&mut help, "help");
+
+        let mut details = app_with_rows();
+        details.details_row = details.selected_row().cloned();
+        details.overlay = Overlay::Details;
+        exercise(&mut details, "details");
+    }
+
+    #[test]
+    fn vim_navigation_selects_confirmation_actions() {
+        let mut app = app_with_rows();
+        app.open_delete_confirmation();
+        assert!(!app.confirm_armed);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert!(app.confirm_armed);
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert!(!app.confirm_armed);
     }
 
     #[test]
