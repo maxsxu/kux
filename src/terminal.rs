@@ -9,12 +9,12 @@ use crossterm::{
     cursor,
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
-    terminal::{
-        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-        enable_raw_mode,
-    },
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{
+    Terminal,
+    backend::{Backend, CrosstermBackend},
+};
 
 pub type KuxTerminal = Terminal<CrosstermBackend<Stdout>>;
 
@@ -71,9 +71,9 @@ impl TerminalGuard {
             self.terminal.backend_mut(),
             EnterAlternateScreen,
             EnableMouseCapture,
-            cursor::Hide,
-            Clear(ClearType::All)
+            cursor::Hide
         )?;
+        force_full_redraw(&mut self.terminal)?;
         Ok(())
     }
 
@@ -93,6 +93,11 @@ impl TerminalGuard {
         )?;
         Ok(())
     }
+}
+
+fn force_full_redraw<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
+    let area = terminal.size()?.into();
+    terminal.resize(area)
 }
 
 #[cfg(target_os = "macos")]
@@ -144,5 +149,32 @@ impl Drop for TerminalGuard {
             LeaveAlternateScreen,
             cursor::Show
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::{
+        Terminal,
+        backend::{Backend, TestBackend},
+        buffer::Buffer,
+    };
+
+    use super::force_full_redraw;
+
+    #[test]
+    fn force_full_redraw_resets_ratatui_back_buffer() {
+        let mut terminal = Terminal::new(TestBackend::new(3, 1)).expect("terminal");
+        terminal
+            .draw(|frame| frame.render_widget("abc", frame.area()))
+            .expect("first draw");
+
+        terminal.backend_mut().clear().expect("external clear");
+        force_full_redraw(&mut terminal).expect("reset frame state");
+        terminal
+            .draw(|frame| frame.render_widget("abc", frame.area()))
+            .expect("redraw");
+
+        assert_eq!(terminal.backend().buffer(), &Buffer::with_lines(["abc"]));
     }
 }

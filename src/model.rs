@@ -124,6 +124,7 @@ pub struct ResourceDescriptor {
     pub api_version: Arc<str>,
     pub kind: Arc<str>,
     pub plural: Arc<str>,
+    pub short_names: Arc<[Arc<str>]>,
     pub namespaced: bool,
     pub operations: ResourceOperations,
 }
@@ -184,9 +185,27 @@ impl ResourceDescriptor {
             api_version: api_version.into(),
             kind: kind.into(),
             plural: plural.into(),
+            short_names: Arc::from([]),
             namespaced,
             operations,
         }
+    }
+
+    #[must_use]
+    pub fn with_short_names<I, S>(mut self, short_names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<Arc<str>>,
+    {
+        let mut names = Vec::new();
+        for name in short_names {
+            let name = name.into();
+            if !name.is_empty() && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        self.short_names = names.into();
+        self
     }
 
     /// Returns the specialized built-in kind only for its exact Kubernetes
@@ -246,13 +265,18 @@ impl ResourceDescriptor {
     }
 
     /// Names accepted by command mode for this resource. Built-ins retain
-    /// their K9s-style aliases, while discovered resources are addressable by
-    /// lowercase kind, plural, and group-qualified plural.
+    /// their K9s-style aliases, while discovered resources include
+    /// server-provided short names, lowercase kind, plural, and
+    /// group-qualified plural.
     #[must_use]
     pub fn command_aliases(&self) -> Vec<String> {
-        let mut aliases = Vec::new();
+        let mut aliases: Vec<_> = self.short_names.iter().map(ToString::to_string).collect();
         if let Some(kind) = self.known_kind() {
-            aliases.extend(kind.aliases().split_whitespace().map(str::to_owned));
+            for alias in kind.aliases().split_whitespace() {
+                if !aliases.iter().any(|candidate| candidate == alias) {
+                    aliases.push(alias.to_owned());
+                }
+            }
         } else {
             for alias in [self.kind.to_ascii_lowercase(), self.plural.to_string()] {
                 if !aliases.contains(&alias) {
@@ -693,7 +717,8 @@ mod tests {
             "widgets",
             true,
             ResourceOperations::all(),
-        );
+        )
+        .with_short_names(["wdg", "wg"]);
         assert_eq!(widget.known_kind(), None);
         assert_eq!(widget.label(), "Widget");
         assert_eq!(widget.short_label(), "widgets");
@@ -701,6 +726,8 @@ mod tests {
         assert_eq!(
             widget.command_aliases(),
             vec![
+                "wdg".to_owned(),
+                "wg".to_owned(),
                 "widget".to_owned(),
                 "widgets".to_owned(),
                 "widgets.example.io".to_owned()

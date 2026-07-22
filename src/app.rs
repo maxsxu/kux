@@ -3618,7 +3618,8 @@ mod tests {
             "widgets",
             true,
             crate::model::ResourceOperations::all(),
-        );
+        )
+        .with_short_names(["wdg"]);
         let mut resources: Vec<_> = ResourceKind::ALL
             .into_iter()
             .map(ResourceDescriptor::from)
@@ -3634,7 +3635,7 @@ mod tests {
         );
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
-        let command = type_input(&mut app, ':', "widgets.example.io prod");
+        let command = type_input(&mut app, ':', "wdg prod");
         assert_eq!(
             command,
             AppCommand::Request(ViewState {

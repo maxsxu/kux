@@ -1,9 +1,15 @@
 use std::{cmp::Ordering, sync::Arc};
 
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{
+    APIResource as KubernetesApiResource, APIResourceList,
+};
 use kube::{
     Client,
-    core::ApiResource,
-    discovery::{ApiCapabilities, Discovery, Scope, verbs},
+    core::{
+        ApiResource, Version,
+        discovery::v2::{APIGroupDiscovery, APIResourceDiscovery},
+    },
+    discovery::{ApiCapabilities, Scope, verbs},
 };
 
 use crate::model::{ResourceDescriptor, ResourceOperations};
@@ -18,24 +24,160 @@ use crate::model::{ResourceDescriptor, ResourceOperations};
 ///
 /// Returns an error when both aggregated and legacy discovery fail.
 pub async fn discover_resources(client: Client) -> Result<Vec<ResourceDescriptor>, String> {
-    let discovery = match Discovery::new(client.clone()).run_aggregated().await {
-        Ok(discovery) => discovery,
-        Err(aggregated_error) => Discovery::new(client).run().await.map_err(|legacy_error| {
+    let mut resources = match discover_aggregated(&client).await {
+        Ok(resources) => resources,
+        Err(aggregated_error) => discover_legacy(&client).await.map_err(|legacy_error| {
             format!(
                 "Kubernetes API discovery failed (aggregated: {aggregated_error}; legacy: \
-                 {legacy_error})"
+                     {legacy_error})"
             )
         })?,
     };
-
-    let mut resources = discovery
-        .groups_alphabetical()
-        .into_iter()
-        .flat_map(kube::discovery::ApiGroup::resources_by_stability)
-        .filter_map(|(resource, capabilities)| descriptor(resource, &capabilities))
-        .collect();
     sort_and_dedup(&mut resources);
     Ok(resources)
+}
+
+async fn discover_legacy(client: &Client) -> Result<Vec<ResourceDescriptor>, kube::Error> {
+    let (groups, core) =
+        tokio::try_join!(client.list_api_groups(), client.list_core_api_versions())?;
+    let mut resources = Vec::new();
+    for group in groups.groups {
+        for version in group.versions {
+            let list = client
+                .list_api_group_resources(&version.group_version)
+                .await?;
+            resources.extend(descriptors_from_legacy_list(list));
+        }
+    }
+    for version in core.versions {
+        let list = client.list_core_api_resources(&version).await?;
+        resources.extend(descriptors_from_legacy_list(list));
+    }
+    retain_most_stable_versions(&mut resources);
+    Ok(resources)
+}
+
+fn descriptors_from_legacy_list(list: APIResourceList) -> Vec<ResourceDescriptor> {
+    let group_version = list.group_version;
+    list.resources
+        .into_iter()
+        .filter(|resource| !resource.name.contains('/'))
+        .filter_map(|resource| descriptor_from_legacy_resource(&group_version, resource))
+        .collect()
+}
+
+fn descriptor_from_legacy_resource(
+    group_version: &str,
+    resource: KubernetesApiResource,
+) -> Option<ResourceDescriptor> {
+    let (list_group, list_version) = group_version
+        .rsplit_once('/')
+        .map_or(("", group_version), |(group, version)| (group, version));
+    let group = resource.group.as_deref().unwrap_or(list_group);
+    let version = resource.version.as_deref().unwrap_or(list_version);
+    let api_version = if group.is_empty() {
+        version.to_owned()
+    } else {
+        format!("{group}/{version}")
+    };
+    let short_names = resource.short_names.clone().unwrap_or_default();
+    descriptor(
+        ApiResource {
+            group: group.to_owned(),
+            version: version.to_owned(),
+            api_version,
+            kind: resource.kind,
+            plural: resource.name,
+        },
+        &ApiCapabilities {
+            scope: if resource.namespaced {
+                Scope::Namespaced
+            } else {
+                Scope::Cluster
+            },
+            subresources: Vec::new(),
+            operations: resource.verbs,
+        },
+    )
+    .map(|descriptor| descriptor.with_short_names(short_names))
+}
+
+async fn discover_aggregated(client: &Client) -> Result<Vec<ResourceDescriptor>, kube::Error> {
+    let (groups, core) = tokio::try_join!(
+        client.list_api_groups_aggregated(),
+        client.list_core_api_versions_aggregated()
+    )?;
+    let mut resources: Vec<_> = groups
+        .items
+        .into_iter()
+        .chain(core.items)
+        .flat_map(descriptors_from_aggregated_group)
+        .collect();
+    retain_most_stable_versions(&mut resources);
+    Ok(resources)
+}
+
+fn descriptors_from_aggregated_group(group: APIGroupDiscovery) -> Vec<ResourceDescriptor> {
+    let group_name = group
+        .metadata
+        .and_then(|metadata| metadata.name)
+        .unwrap_or_default();
+    let mut descriptors = Vec::new();
+    for version in group.versions {
+        let version_name = version.version.unwrap_or_default();
+        descriptors.extend(version.resources.into_iter().filter_map(|resource| {
+            descriptor_from_aggregated_resource(&group_name, &version_name, resource)
+        }));
+    }
+    descriptors
+}
+
+fn descriptor_from_aggregated_resource(
+    group: &str,
+    version: &str,
+    resource: APIResourceDiscovery,
+) -> Option<ResourceDescriptor> {
+    if !resource.verbs.iter().any(|verb| verb == verbs::LIST) {
+        return None;
+    }
+    let plural = resource.resource?;
+    let kind = resource.response_kind?.kind?;
+    let api_version = if group.is_empty() {
+        version.to_owned()
+    } else {
+        format!("{group}/{version}")
+    };
+    let operations = ResourceOperations::new(
+        resource.verbs.iter().any(|verb| verb == verbs::WATCH),
+        resource.verbs.iter().any(|verb| verb == verbs::GET),
+        resource.verbs.iter().any(|verb| verb == verbs::DELETE),
+    );
+    Some(
+        ResourceDescriptor::new(
+            group,
+            version,
+            api_version,
+            kind,
+            plural,
+            resource.scope.as_deref() == Some("Namespaced"),
+            operations,
+        )
+        .with_short_names(resource.short_names),
+    )
+}
+
+fn retain_most_stable_versions(resources: &mut Vec<ResourceDescriptor>) {
+    resources.sort_unstable_by(|left, right| {
+        left.group
+            .cmp(&right.group)
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| {
+                Version::parse(&right.version)
+                    .priority()
+                    .cmp(&Version::parse(&left.version).priority())
+            })
+    });
+    resources.dedup_by(|left, right| left.group == right.group && left.kind == right.kind);
 }
 
 fn descriptor(resource: ApiResource, capabilities: &ApiCapabilities) -> Option<ResourceDescriptor> {
@@ -111,6 +253,67 @@ mod tests {
             subresources: Vec::new(),
             operations: operations.iter().map(ToString::to_string).collect(),
         }
+    }
+
+    #[test]
+    fn aggregated_discovery_preserves_crd_short_names() {
+        let resource = descriptor_from_aggregated_resource(
+            "config.streamnative.io",
+            "v1alpha1",
+            kube::core::discovery::v2::APIResourceDiscovery {
+                resource: Some("cloudenvironmentbackendconfigs".to_owned()),
+                response_kind: Some(kube::core::discovery::v2::GroupVersionKind {
+                    group: Some("config.streamnative.io".to_owned()),
+                    version: Some("v1alpha1".to_owned()),
+                    kind: Some("CloudEnvironmentBackendConfig".to_owned()),
+                }),
+                scope: Some("Namespaced".to_owned()),
+                verbs: vec![
+                    verbs::GET.to_owned(),
+                    verbs::LIST.to_owned(),
+                    verbs::WATCH.to_owned(),
+                ],
+                short_names: vec!["cebc".to_owned()],
+                ..Default::default()
+            },
+        )
+        .expect("listable CRD");
+
+        assert_eq!(resource.short_names.as_ref(), [Arc::<str>::from("cebc")]);
+        assert!(
+            resource
+                .command_aliases()
+                .iter()
+                .any(|alias| alias == "cebc")
+        );
+    }
+
+    #[test]
+    fn legacy_discovery_preserves_crd_short_names() {
+        let resource = descriptor_from_legacy_resource(
+            "config.streamnative.io/v1alpha1",
+            k8s_openapi::apimachinery::pkg::apis::meta::v1::APIResource {
+                kind: "CloudEnvironmentBackendConfig".to_owned(),
+                name: "cloudenvironmentbackendconfigs".to_owned(),
+                namespaced: true,
+                short_names: Some(vec!["cebc".to_owned()]),
+                verbs: vec![
+                    verbs::GET.to_owned(),
+                    verbs::LIST.to_owned(),
+                    verbs::WATCH.to_owned(),
+                ],
+                ..Default::default()
+            },
+        )
+        .expect("listable CRD");
+
+        assert_eq!(resource.short_names.as_ref(), [Arc::<str>::from("cebc")]);
+        assert!(
+            resource
+                .command_aliases()
+                .iter()
+                .any(|alias| alias == "cebc")
+        );
     }
 
     #[test]
@@ -190,6 +393,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn retains_the_most_stable_version_of_each_discovered_kind() {
+        let caps = capabilities(Scope::Namespaced, &[verbs::GET, verbs::LIST, verbs::WATCH]);
+        let mut resources = vec![
+            descriptor(
+                api_resource("example.io", "v3alpha1", "Widget", "widgets"),
+                &caps,
+            )
+            .unwrap(),
+            descriptor(
+                api_resource("example.io", "v2beta1", "Widget", "widgets"),
+                &caps,
+            )
+            .unwrap(),
+            descriptor(api_resource("example.io", "v1", "Widget", "widgets"), &caps).unwrap(),
+        ];
+
+        retain_most_stable_versions(&mut resources);
+
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].version.as_ref(), "v1");
+    }
+
     #[tokio::test]
     #[ignore = "requires access to a Kubernetes cluster"]
     async fn live_cluster_discovers_core_crd_and_aggregated_resources() {
@@ -208,5 +434,10 @@ mod tests {
                 && resource.group.as_ref() != "metrics.k8s.io"
                 && resource.known_kind().is_none()
         }));
+        assert!(
+            resources
+                .iter()
+                .any(|resource| !resource.short_names.is_empty())
+        );
     }
 }

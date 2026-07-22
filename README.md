@@ -55,7 +55,8 @@ cargo run --release -- -n production --resource pods
 
 ## The operator workflow, without leaving the keyboard
 
-Command mode understands built-in aliases and everything discovered from the API server:
+Command mode understands built-in aliases, server-provided CRD short names, and everything
+discovered from the API server:
 
 ```text
 :pod                       Pods in the current namespace
