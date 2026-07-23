@@ -611,6 +611,7 @@ struct ViewColumn {
     label: String,
     field: Option<SortField>,
     table_index: Option<usize>,
+    table_age: bool,
     width: Constraint,
     visible_from: u16,
 }
@@ -625,6 +626,7 @@ fn view_column(
         label: label.to_owned(),
         field: Some(field),
         table_index: None,
+        table_age: false,
         width,
         visible_from,
     }
@@ -635,6 +637,7 @@ fn columns_for_view(app: &App, width: u16) -> Vec<ViewColumn> {
         label: String::new(),
         field: None,
         table_index: None,
+        table_age: false,
         width: Constraint::Length(2),
         visible_from: 0,
     }];
@@ -674,6 +677,11 @@ fn columns_for_view(app: &App, width: u16) -> Vec<ViewColumn> {
 }
 
 fn server_table_columns(app: &App, namespace_already_shown: bool) -> Vec<ViewColumn> {
+    let has_age = app
+        .snapshot
+        .table_columns
+        .iter()
+        .any(|column| column.name.eq_ignore_ascii_case("age"));
     app.snapshot
         .table_columns
         .iter()
@@ -683,26 +691,40 @@ fn server_table_columns(app: &App, namespace_already_shown: bool) -> Vec<ViewCol
             !namespace_already_shown || !column.name.eq_ignore_ascii_case("namespace")
         })
         .map(|(index, column)| {
+            let table_age = !has_age && is_created_at_column(&column.name);
             let field = match column.name.to_ascii_lowercase().as_str() {
                 "name" => Some(SortField::Name),
                 "status" => Some(SortField::Status),
                 "ready" => Some(SortField::Ready),
                 "age" => Some(SortField::Age),
+                _ if table_age => Some(SortField::Age),
                 _ => None,
             };
-            let label = column.name.to_ascii_uppercase();
+            let label = if table_age {
+                "AGE".to_owned()
+            } else {
+                column.name.to_ascii_uppercase()
+            };
             let content_width = app
                 .snapshot
                 .rows
                 .iter()
                 .take(200)
                 .filter_map(|row| row.table_cells.get(index))
-                .map(|cell| cell.text.chars().count())
+                .map(|cell| {
+                    if table_age {
+                        8
+                    } else {
+                        cell.text.chars().count()
+                    }
+                })
                 .max()
                 .unwrap_or(0)
                 .max(label.chars().count());
             let width = if column.name.eq_ignore_ascii_case("name") {
                 Constraint::Fill(5)
+            } else if table_age {
+                Constraint::Length(8)
             } else {
                 Constraint::Length(u16::try_from(content_width.clamp(3, 40)).unwrap_or(40))
             };
@@ -710,11 +732,19 @@ fn server_table_columns(app: &App, namespace_already_shown: bool) -> Vec<ViewCol
                 label,
                 field,
                 table_index: Some(index),
+                table_age,
                 width,
                 visible_from: 0,
             }
         })
         .collect()
+}
+
+fn is_created_at_column(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "created at" | "created-at" | "creation timestamp"
+    )
 }
 
 fn api_service_columns() -> Vec<ViewColumn> {
@@ -847,7 +877,8 @@ fn generic_columns(wide: bool) -> Vec<ViewColumn> {
 }
 
 fn draw_resources(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
-    let viewport_height = usize::from(area.height.saturating_sub(3));
+    let show_header = !matches!(app.snapshot.state, SourceState::Loading);
+    let viewport_height = usize::from(area.height.saturating_sub(if show_header { 3 } else { 2 }));
     app.set_viewport_height(viewport_height);
     let columns = columns_for_view(app, area.width);
 
@@ -865,14 +896,7 @@ fn draw_resources(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         Row::new(cells).style(style)
     });
 
-    let header_cells = columns.iter().map(|column| {
-        column.field.map_or_else(
-            || Cell::from(column.label.clone()).style(Style::default().fg(CYAN).bold()),
-            |field| column_header(app, &column.label, field),
-        )
-    });
     let widths: Vec<_> = columns.iter().map(|column| column.width).collect();
-    let header = Row::new(header_cells).bottom_margin(1);
     let filter = if app.input_mode == InputMode::Filter && !app.input.is_empty() {
         &app.input
     } else {
@@ -910,12 +934,22 @@ fn draw_resources(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .title_alignment(Alignment::Center),
         app,
     );
-    let table = Table::new(rows, widths)
-        .header(header)
-        .column_spacing(1)
-        .block(block);
+    let mut table = Table::new(rows, widths).column_spacing(1).block(block);
+    if show_header {
+        let header_cells = columns.iter().map(|column| {
+            column.field.map_or_else(
+                || Cell::from(column.label.clone()).style(Style::default().fg(CYAN).bold()),
+                |field| column_header(app, &column.label, field),
+            )
+        });
+        table = table.header(Row::new(header_cells).bottom_margin(1));
+    }
     frame.render_widget(table, area);
-    update_column_hitboxes(app, area, &hitbox_widths, &columns);
+    if show_header {
+        update_column_hitboxes(app, area, &hitbox_widths, &columns);
+    } else {
+        app.set_column_hitboxes(Vec::new());
+    }
 
     if app.filtered.is_empty() {
         let message = match &app.snapshot.state {
@@ -942,7 +976,7 @@ fn resource_cell(
     now_unix: i64,
 ) -> Cell<'static> {
     if let Some(index) = column.table_index {
-        return Cell::from(table_column_value(row, index));
+        return Cell::from(table_column_value(row, index, column.table_age, now_unix));
     }
     let Some(field) = column.field else {
         return Cell::from(if marked { "●" } else { "" });
@@ -1087,7 +1121,15 @@ fn column_value(row: &crate::model::ResourceRow, field: SortField, now_unix: i64
     }
 }
 
-fn table_column_value(row: &crate::model::ResourceRow, index: usize) -> String {
+fn table_column_value(
+    row: &crate::model::ResourceRow,
+    index: usize,
+    as_age: bool,
+    now_unix: i64,
+) -> String {
+    if as_age {
+        return format_age(row.age_seconds(now_unix));
+    }
     row.table_cells
         .get(index)
         .map_or_else(String::new, |cell| cell.text.to_string())
@@ -2887,9 +2929,111 @@ mod tests {
             ["NAMESPACE", "NAME", "PHASE", "ENDPOINT", "AGE"]
         );
         assert_eq!(
-            table_column_value(app.snapshot.rows[0].as_ref(), 3),
+            table_column_value(app.snapshot.rows[0].as_ref(), 3, false, app.now_unix),
             "1970-01-01T01:00:00Z"
         );
+    }
+
+    #[test]
+    fn created_at_becomes_a_live_sortable_age_when_age_is_absent() {
+        let mut app = App::new(
+            "demo",
+            Some("default".to_owned()),
+            ResourceKind::Pods,
+            false,
+            vec!["demo".to_owned()],
+        );
+        let kind = ResourceDescriptor::new(
+            "cloud.example.io",
+            "v1",
+            "cloud.example.io/v1",
+            "Environment",
+            "environments",
+            true,
+            ResourceOperations::all(),
+        );
+        app.kind = kind.clone();
+        app.now_unix = 10_800;
+        let row =
+            ResourceRow::new("default", "example", "-", "-", "-", 3_600).with_table_cells(vec![
+                TableCell {
+                    text: Arc::from("example"),
+                    timestamp_unix: None,
+                },
+                TableCell {
+                    text: Arc::from("1970-01-01T01:00:00Z"),
+                    timestamp_unix: Some(3_600),
+                },
+            ]);
+        app.apply_snapshot(ResourceSnapshot {
+            generation: app.generation,
+            kind,
+            rows: Arc::new(vec![Arc::new(row)]),
+            table_columns: vec![
+                TableColumn {
+                    name: Arc::from("Name"),
+                    format: Arc::from("name"),
+                    priority: 0,
+                },
+                TableColumn {
+                    name: Arc::from("Created At"),
+                    format: Arc::from(""),
+                    priority: 0,
+                },
+            ]
+            .into(),
+            state: SourceState::Ready,
+            revision: 1,
+            emitted_at: Instant::now(),
+        });
+
+        let columns = columns_for_view(&app, 120);
+        let age = columns
+            .iter()
+            .find(|column| column.table_index == Some(1))
+            .expect("age column");
+        assert_eq!(age.label, "AGE");
+        assert_eq!(age.field, Some(SortField::Age));
+        assert!(age.table_age);
+        assert_eq!(
+            table_column_value(app.snapshot.rows[0].as_ref(), 1, true, app.now_unix),
+            "2h"
+        );
+    }
+
+    #[test]
+    fn loading_a_new_resource_hides_temporary_column_headers() {
+        let mut app = App::new(
+            "demo",
+            None,
+            ResourceKind::Pods,
+            false,
+            vec!["demo".to_owned()],
+        );
+        let kind = ResourceDescriptor::new(
+            "cloud.example.io",
+            "v1",
+            "cloud.example.io/v1",
+            "Environment",
+            "environments",
+            true,
+            ResourceOperations::all(),
+        );
+        app.kind = kind.clone();
+        app.apply_snapshot(ResourceSnapshot::loading(app.generation, kind));
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).expect("loading terminal");
+        terminal
+            .draw(|frame| draw_resources(frame, &mut app, frame.area()))
+            .expect("draw loading resource");
+        let rendered = rendered_lines(&terminal, 120).join("\n");
+        assert!(rendered.contains("Waiting for resources"));
+        assert!(!rendered.contains("NAMESPACE"));
+        assert!(!rendered.contains("NAME"));
+        assert!(!rendered.contains("STATUS"));
+        assert!(!rendered.contains("READY"));
+        assert!(!rendered.contains("AGE"));
     }
 
     #[test]

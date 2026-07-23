@@ -2040,7 +2040,11 @@ fn server_table_row(row: ServerTableRow, columns: &[TableColumn]) -> ResourceRow
 
 fn table_cell(value: &serde_json::Value, column: Option<&TableColumn>) -> TableCell {
     let timestamp_unix = column
-        .filter(|column| column.format.as_ref() == "date")
+        .filter(|column| {
+            column.format.as_ref() == "date"
+                || column.name.eq_ignore_ascii_case("created at")
+                || column.name.eq_ignore_ascii_case("creation timestamp")
+        })
         .and_then(|_| serde_json::from_value::<Time>(value.clone()).ok())
         .map(|time| time.0.as_second());
     let text = match value {
@@ -3364,6 +3368,19 @@ mod tests {
                 .text
                 .as_ref(),
             "[one two]"
+        );
+        let created_at = TableColumn {
+            name: Arc::from("Created At"),
+            format: Arc::from(""),
+            priority: 0,
+        };
+        assert_eq!(
+            table_cell(
+                &serde_json::json!("1970-01-01T01:00:00Z"),
+                Some(&created_at)
+            )
+            .timestamp_unix,
+            Some(3_600)
         );
     }
 
