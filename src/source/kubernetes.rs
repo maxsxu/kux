@@ -7,20 +7,25 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures::StreamExt;
+use http::{
+    Request as HttpRequest,
+    header::{ACCEPT, HeaderValue},
+};
 use k8s_openapi::api::{
     apps::v1::{DaemonSet, Deployment, StatefulSet},
     core::v1::{ContainerStatus, Namespace, Node, Pod, Service},
     rbac::v1::{ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, Subject},
 };
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::{
     Api, Client, Config, Resource, ResourceExt,
-    api::{DeleteParams, ListParams, LogParams},
+    api::{DeleteParams, ListParams, LogParams, WatchParams},
     config::KubeConfigOptions,
-    core::{ApiResource, DynamicObject, GroupVersionKind},
+    core::{ApiResource, DynamicObject, GroupVersionKind, Request, WatchEvent},
     runtime::{WatchStreamExt, watcher},
 };
 use rustc_hash::FxHashMap;
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, de::DeserializeOwned};
 use tokio::{
     process::Command,
     sync::{mpsc, watch},
@@ -30,7 +35,8 @@ use crate::{
     app::{ActionIntent, ContainerTarget, ContentKind, ResourceTarget},
     model::{
         ContainerData, NamespaceInfo, NodeData, PodData, PolicyData, ResourceData,
-        ResourceDescriptor, ResourceKind, ResourceRow, ResourceSnapshot, SourceState,
+        ResourceDescriptor, ResourceKind, ResourceRow, ResourceSnapshot, SourceState, TableCell,
+        TableColumn,
     },
 };
 
@@ -201,10 +207,12 @@ async fn run_watch(
         }
         None => {
             let api = dynamic_api(client.clone(), &request.kind, request.namespace.as_deref());
-            if request.kind.operations.watchable() {
+            if request.kind.is_api_service() && request.kind.operations.watchable() {
                 watch_api(api, client, settings, request, snapshots, dynamic_row).await;
+            } else if request.kind.operations.watchable() {
+                watch_table_api(api, client, settings, request, snapshots).await;
             } else {
-                poll_dynamic_api(api, settings, request, snapshots).await;
+                poll_table_api(api, client, settings, request, snapshots).await;
             }
         }
     }
@@ -1568,8 +1576,226 @@ async fn watch_api<K, F>(
     }
 }
 
-async fn poll_dynamic_api(
+const TABLE_ACCEPT: &str = "application/json;as=Table;v=v1;g=meta.k8s.io,\
+                           application/json;as=Table;v=v1beta1;g=meta.k8s.io,\
+                           application/json";
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerTableMetadata {
+    resource_version: Option<String>,
+    #[serde(rename = "continue")]
+    continue_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerTableColumn {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    name: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    format: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    priority: i32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ServerTableRow {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    cells: Vec<serde_json::Value>,
+    object: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerTable {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    metadata: ServerTableMetadata,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    column_definitions: Vec<ServerTableColumn>,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    rows: Vec<ServerTableRow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DynamicObjectList {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    metadata: ServerTableMetadata,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    items: Vec<DynamicObject>,
+}
+
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Option::<T>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+
+struct TableListing {
+    columns: Arc<[TableColumn]>,
+    rows: FxHashMap<Arc<str>, Arc<ResourceRow>>,
+    resource_version: String,
+}
+
+async fn watch_table_api(
     api: Api<DynamicObject>,
+    client: Client,
+    settings: KubernetesSettings,
+    request: WatchRequest,
+    snapshots: watch::Sender<ResourceSnapshot>,
+) {
+    let mut revision = 0_u64;
+    let mut retry_delay = Duration::from_secs(1);
+    loop {
+        match list_table_pages(&api, &client, request.field_selector.as_deref()).await {
+            Ok(mut listing) => {
+                revision = revision.wrapping_add(1);
+                publish_table(
+                    &snapshots,
+                    &request,
+                    &listing.rows,
+                    Arc::clone(&listing.columns),
+                    SourceState::Ready,
+                    revision,
+                );
+                retry_delay = Duration::from_secs(1);
+                match stream_table_watch(
+                    &api,
+                    &client,
+                    &settings,
+                    &request,
+                    &snapshots,
+                    &mut listing,
+                    &mut revision,
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(error) => {
+                        revision = revision.wrapping_add(1);
+                        publish_table(
+                            &snapshots,
+                            &request,
+                            &listing.rows,
+                            Arc::clone(&listing.columns),
+                            SourceState::Error(Arc::from(error)),
+                            revision,
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                revision = revision.wrapping_add(1);
+                publish_table(
+                    &snapshots,
+                    &request,
+                    &FxHashMap::default(),
+                    Arc::from([]),
+                    SourceState::Error(Arc::from(error)),
+                    revision,
+                );
+            }
+        }
+        tokio::time::sleep(retry_delay).await;
+        retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
+    }
+}
+
+async fn stream_table_watch(
+    api: &Api<DynamicObject>,
+    client: &Client,
+    settings: &KubernetesSettings,
+    request: &WatchRequest,
+    snapshots: &watch::Sender<ResourceSnapshot>,
+    listing: &mut TableListing,
+    revision: &mut u64,
+) -> Result<(), String> {
+    let mut params = WatchParams {
+        bookmarks: false,
+        ..WatchParams::default()
+    };
+    if let Some(selector) = &request.field_selector {
+        params = params.fields(selector);
+    }
+    let raw = Request::new(api.resource_url())
+        .watch(&params, &listing.resource_version)
+        .map_err(|error| format!("Unable to build Kubernetes Table watch: {error}"))?;
+    let raw = table_request(raw)?;
+    let stream = client
+        .request_events::<serde_json::Value>(raw)
+        .await
+        .map_err(|error| format!("Unable to start Kubernetes Table watch: {error}"))?;
+    tokio::pin!(stream);
+
+    let mut dirty = false;
+    let mut ticker = tokio::time::interval(settings.publish_interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            event = stream.next() => {
+                match event {
+                    Some(Ok(WatchEvent::Added(value) | WatchEvent::Modified(value))) => {
+                        let update = decode_table_watch_object(value, &listing.columns)?;
+                        if update
+                            .rows
+                            .first()
+                            .is_some_and(|row| row.table_cells.is_empty())
+                        {
+                            listing.columns = Arc::from([]);
+                        } else if !update.columns.is_empty() {
+                            listing.columns = update.columns;
+                        }
+                        if !update.resource_version.is_empty() {
+                            listing.resource_version = update.resource_version;
+                        }
+                        for row in update.rows {
+                            listing.rows.insert(Arc::clone(&row.key), row);
+                        }
+                        dirty = true;
+                    }
+                    Some(Ok(WatchEvent::Deleted(value))) => {
+                        let update = decode_table_watch_object(value, &listing.columns)?;
+                        if !update.resource_version.is_empty() {
+                            listing.resource_version = update.resource_version;
+                        }
+                        for row in update.rows {
+                            listing.rows.remove(&row.key);
+                        }
+                        dirty = true;
+                    }
+                    Some(Ok(WatchEvent::Bookmark(bookmark))) => {
+                        listing.resource_version = bookmark.metadata.resource_version;
+                    }
+                    Some(Ok(WatchEvent::Error(error))) => {
+                        return Err(error.to_string());
+                    }
+                    Some(Err(error)) => {
+                        return Err(error.to_string());
+                    }
+                    None => return Ok(()),
+                }
+            }
+            _ = ticker.tick(), if dirty => {
+                *revision = revision.wrapping_add(1);
+                publish_table(
+                    snapshots,
+                    request,
+                    &listing.rows,
+                    Arc::clone(&listing.columns),
+                    SourceState::Ready,
+                    *revision,
+                );
+                dirty = false;
+            }
+        }
+    }
+}
+
+async fn poll_table_api(
+    api: Api<DynamicObject>,
+    client: Client,
     settings: KubernetesSettings,
     request: WatchRequest,
     snapshots: watch::Sender<ResourceSnapshot>,
@@ -1580,23 +1806,26 @@ async fn poll_dynamic_api(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
-        match list_dynamic_pages(&api, request.field_selector.as_deref()).await {
-            Ok(objects) => {
-                let rows: FxHashMap<Arc<str>, Arc<ResourceRow>> = objects
-                    .iter()
-                    .map(dynamic_row)
-                    .map(|row| (Arc::clone(&row.key), Arc::new(row)))
-                    .collect();
+        match list_table_pages(&api, &client, request.field_selector.as_deref()).await {
+            Ok(listing) => {
                 revision = revision.wrapping_add(1);
-                publish(&snapshots, &request, &rows, SourceState::Ready, revision);
+                publish_table(
+                    &snapshots,
+                    &request,
+                    &listing.rows,
+                    listing.columns,
+                    SourceState::Ready,
+                    revision,
+                );
             }
             Err(error) => {
                 revision = revision.wrapping_add(1);
-                publish(
+                publish_table(
                     &snapshots,
                     &request,
                     &FxHashMap::default(),
-                    SourceState::Error(Arc::from(error.to_string())),
+                    Arc::from([]),
+                    SourceState::Error(Arc::from(error)),
                     revision,
                 );
             }
@@ -1604,11 +1833,14 @@ async fn poll_dynamic_api(
     }
 }
 
-async fn list_dynamic_pages(
+async fn list_table_pages(
     api: &Api<DynamicObject>,
+    client: &Client,
     field_selector: Option<&str>,
-) -> Result<Vec<DynamicObject>, kube::Error> {
-    let mut objects = Vec::new();
+) -> Result<TableListing, String> {
+    let mut columns: Arc<[TableColumn]> = Arc::from([]);
+    let mut rows = FxHashMap::default();
+    let mut resource_version = String::new();
     let mut continue_token: Option<String> = None;
     loop {
         let mut params = ListParams::default().limit(500);
@@ -1618,13 +1850,233 @@ async fn list_dynamic_pages(
         if let Some(token) = &continue_token {
             params = params.continue_token(token);
         }
-        let page = api.list(&params).await?;
-        continue_token.clone_from(&page.metadata.continue_);
-        objects.extend(page.items);
+        let raw = Request::new(api.resource_url())
+            .list(&params)
+            .map_err(|error| format!("Unable to build Kubernetes Table request: {error}"))?;
+        let raw = table_request(raw)?;
+        let value = client
+            .request::<serde_json::Value>(raw)
+            .await
+            .map_err(|error| format!("Unable to list Kubernetes Table rows: {error}"))?;
+        let page = decode_table_list(value)?;
+        if columns.is_empty() && !page.columns.is_empty() {
+            columns = Arc::clone(&page.columns);
+        }
+        if !page.resource_version.is_empty() {
+            resource_version = page.resource_version;
+        }
+        for row in page.rows {
+            rows.insert(Arc::clone(&row.key), row);
+        }
+        continue_token = page.continue_token;
         if continue_token.as_deref().is_none_or(str::is_empty) {
-            return Ok(objects);
+            return Ok(TableListing {
+                columns,
+                rows,
+                resource_version,
+            });
         }
     }
+}
+
+fn table_request(mut request: HttpRequest<Vec<u8>>) -> Result<HttpRequest<Vec<u8>>, String> {
+    request
+        .headers_mut()
+        .insert(ACCEPT, HeaderValue::from_static(TABLE_ACCEPT));
+    let separator = if request.uri().query().is_some() {
+        if request.uri().to_string().ends_with('?') {
+            ""
+        } else {
+            "&"
+        }
+    } else {
+        "?"
+    };
+    let uri = format!("{}{separator}includeObject=Object", request.uri())
+        .parse()
+        .map_err(|error| format!("Unable to add Kubernetes Table options: {error}"))?;
+    *request.uri_mut() = uri;
+    Ok(request)
+}
+
+struct DecodedTablePage {
+    columns: Arc<[TableColumn]>,
+    rows: Vec<Arc<ResourceRow>>,
+    resource_version: String,
+    continue_token: Option<String>,
+}
+
+fn decode_table_list(value: serde_json::Value) -> Result<DecodedTablePage, String> {
+    if value.get("kind").and_then(serde_json::Value::as_str) == Some("Table") {
+        let table: ServerTable = serde_json::from_value(value)
+            .map_err(|error| format!("Unable to decode Kubernetes Table: {error}"))?;
+        return Ok(decode_server_table(table, &[]));
+    }
+    let list: DynamicObjectList = serde_json::from_value(value)
+        .map_err(|error| format!("Unable to decode Kubernetes resource list: {error}"))?;
+    Ok(DecodedTablePage {
+        columns: Arc::from([]),
+        rows: list.items.iter().map(dynamic_row).map(Arc::new).collect(),
+        resource_version: list.metadata.resource_version.unwrap_or_default(),
+        continue_token: list.metadata.continue_token,
+    })
+}
+
+fn decode_table_watch_object(
+    value: serde_json::Value,
+    previous_columns: &[TableColumn],
+) -> Result<DecodedTablePage, String> {
+    if value.get("kind").and_then(serde_json::Value::as_str) == Some("Table") {
+        let table: ServerTable = serde_json::from_value(value)
+            .map_err(|error| format!("Unable to decode Kubernetes Table event: {error}"))?;
+        return Ok(decode_server_table(table, previous_columns));
+    }
+    let object: DynamicObject = serde_json::from_value(value)
+        .map_err(|error| format!("Unable to decode Kubernetes watch object: {error}"))?;
+    let resource_version = object.resource_version().unwrap_or_default();
+    let row = dynamic_row(&object);
+    Ok(DecodedTablePage {
+        columns: Arc::from([]),
+        rows: vec![Arc::new(row)],
+        resource_version,
+        continue_token: None,
+    })
+}
+
+fn decode_server_table(table: ServerTable, previous_columns: &[TableColumn]) -> DecodedTablePage {
+    let resource_version = table
+        .metadata
+        .resource_version
+        .clone()
+        .or_else(|| {
+            table.rows.iter().find_map(|row| {
+                row.object
+                    .as_ref()?
+                    .pointer("/metadata/resourceVersion")?
+                    .as_str()
+                    .map(str::to_owned)
+            })
+        })
+        .unwrap_or_default();
+    let columns: Arc<[TableColumn]> = if table.column_definitions.is_empty() {
+        Arc::from(previous_columns)
+    } else {
+        table
+            .column_definitions
+            .iter()
+            .map(|column| TableColumn {
+                name: Arc::from(column.name.as_str()),
+                format: Arc::from(column.format.as_str()),
+                priority: column.priority,
+            })
+            .collect::<Vec<_>>()
+            .into()
+    };
+    let rows = table
+        .rows
+        .into_iter()
+        .map(|row| Arc::new(server_table_row(row, &columns)))
+        .collect();
+    DecodedTablePage {
+        columns,
+        rows,
+        resource_version,
+        continue_token: table.metadata.continue_token,
+    }
+}
+
+fn server_table_row(row: ServerTableRow, columns: &[TableColumn]) -> ResourceRow {
+    let object = row
+        .object
+        .and_then(|object| serde_json::from_value::<DynamicObject>(object).ok());
+    let cells: Vec<TableCell> = row
+        .cells
+        .iter()
+        .enumerate()
+        .map(|(index, value)| table_cell(value, columns.get(index)))
+        .collect();
+    let column_text = |name: &str| {
+        columns
+            .iter()
+            .position(|column| column.name.eq_ignore_ascii_case(name))
+            .and_then(|index| cells.get(index))
+            .map(|cell| cell.text.to_string())
+    };
+    let namespace = object
+        .as_ref()
+        .and_then(ResourceExt::namespace)
+        .or_else(|| column_text("namespace"))
+        .unwrap_or_else(|| "-".to_owned());
+    let name = object
+        .as_ref()
+        .map(ResourceExt::name_any)
+        .filter(|name| !name.is_empty())
+        .or_else(|| column_text("name"))
+        .unwrap_or_else(|| "<unknown>".to_owned());
+    let status = column_text("status").unwrap_or_else(|| "-".to_owned());
+    let ready = column_text("ready").unwrap_or_else(|| "-".to_owned());
+    let details = column_text("details").unwrap_or_else(|| "-".to_owned());
+    let created_unix = object
+        .as_ref()
+        .and_then(|object| object.meta().creation_timestamp.as_ref())
+        .map(|time| time.0.as_second())
+        .or_else(|| cells.iter().find_map(|cell| cell.timestamp_unix))
+        .unwrap_or(0);
+    let labels = object
+        .as_ref()
+        .and_then(|object| object.meta().labels.as_ref())
+        .map(|labels| {
+            labels
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    ResourceRow::new(namespace, name, status, ready, details, created_unix)
+        .with_labels(labels)
+        .with_table_cells(cells)
+}
+
+fn table_cell(value: &serde_json::Value, column: Option<&TableColumn>) -> TableCell {
+    let timestamp_unix = column
+        .filter(|column| column.format.as_ref() == "date")
+        .and_then(|_| serde_json::from_value::<Time>(value.clone()).ok())
+        .map(|time| time.0.as_second());
+    let text = match value {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(value) => kubectl_table_string(value),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(table_scalar_text)
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+        serde_json::Value::Object(_) => serde_json::to_string(value).unwrap_or_default(),
+    };
+    TableCell {
+        text: Arc::from(text),
+        timestamp_unix,
+    }
+}
+
+fn table_scalar_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "<nil>".to_owned(),
+        serde_json::Value::String(value) => kubectl_table_string(value),
+        _ => value.to_string(),
+    }
+}
+
+fn kubectl_table_string(value: &str) -> String {
+    value.find(['\u{c}', '\n', '\r']).map_or_else(
+        || value.to_owned(),
+        |breakpoint| format!("{}...", &value[..breakpoint]),
+    )
 }
 
 fn publish(
@@ -1647,6 +2099,35 @@ fn publish(
         generation: request.generation,
         kind: request.kind.clone(),
         rows: Arc::new(compact),
+        table_columns: Arc::from([]),
+        state,
+        revision,
+        emitted_at: Instant::now(),
+    });
+}
+
+fn publish_table(
+    snapshots: &watch::Sender<ResourceSnapshot>,
+    request: &WatchRequest,
+    rows: &FxHashMap<Arc<str>, Arc<ResourceRow>>,
+    table_columns: Arc<[TableColumn]>,
+    state: SourceState,
+    revision: u64,
+) {
+    if snapshots.is_closed() {
+        return;
+    }
+    let mut compact: Vec<_> = rows.values().cloned().collect();
+    compact.sort_unstable_by(|left, right| {
+        left.namespace
+            .cmp(&right.namespace)
+            .then(left.name.cmp(&right.name))
+    });
+    let _ = snapshots.send(ResourceSnapshot {
+        generation: request.generation,
+        kind: request.kind.clone(),
+        rows: Arc::new(compact),
+        table_columns,
         state,
         revision,
         emitted_at: Instant::now(),
@@ -2761,9 +3242,134 @@ mod tests {
         assert_eq!(yaml_title(&node), "YAML(worker-0)");
     }
 
+    #[test]
+    fn requests_kubectl_table_representation_with_embedded_objects() {
+        let request = Request::new("/apis/example.io/v1/widgets")
+            .list(&ListParams::default().limit(500))
+            .expect("list request");
+        let request = table_request(request).expect("table request");
+
+        assert_eq!(
+            request.headers().get(ACCEPT).expect("accept header"),
+            TABLE_ACCEPT
+        );
+        let query = request.uri().query().expect("query");
+        assert!(query.contains("limit=500"));
+        assert!(query.contains("includeObject=Object"));
+    }
+
+    #[test]
+    fn decodes_server_printer_columns_cells_and_dates() {
+        let page = decode_table_list(serde_json::json!({
+            "apiVersion": "meta.k8s.io/v1",
+            "kind": "Table",
+            "metadata": {"resourceVersion": "42"},
+            "columnDefinitions": [
+                {"name": "Name", "type": "string", "format": "name", "priority": 0},
+                {
+                    "name": "Region",
+                    "type": "string",
+                    "format": null,
+                    "priority": null
+                },
+                {"name": "Endpoint", "type": "string", "priority": 1},
+                {"name": "Age", "type": "string", "format": "date", "priority": 0}
+            ],
+            "rows": [{
+                "cells": [
+                    "example",
+                    "us-west-1",
+                    "https://example.invalid",
+                    "1970-01-01T01:00:00Z"
+                ],
+                "object": {
+                    "apiVersion": "example.io/v1",
+                    "kind": "Widget",
+                    "metadata": {
+                        "name": "example",
+                        "namespace": "demo",
+                        "resourceVersion": "42",
+                        "creationTimestamp": "1970-01-01T01:00:00Z"
+                    }
+                }
+            }]
+        }))
+        .expect("table");
+
+        assert_eq!(page.resource_version, "42");
+        assert_eq!(page.columns.len(), 4);
+        assert_eq!(page.columns[1].format.as_ref(), "");
+        assert_eq!(page.columns[1].priority, 0);
+        assert_eq!(page.columns[2].name.as_ref(), "Endpoint");
+        assert_eq!(page.columns[2].priority, 1);
+        assert_eq!(page.rows[0].namespace.as_ref(), "demo");
+        assert_eq!(page.rows[0].name.as_ref(), "example");
+        assert_eq!(page.rows[0].table_cells[1].text.as_ref(), "us-west-1");
+        assert_eq!(page.rows[0].table_cells[3].timestamp_unix, Some(3_600));
+    }
+
+    #[test]
+    fn table_watch_events_reuse_initial_column_definitions() {
+        let columns = vec![
+            TableColumn {
+                name: Arc::from("Name"),
+                format: Arc::from("name"),
+                priority: 0,
+            },
+            TableColumn {
+                name: Arc::from("Phase"),
+                format: Arc::from(""),
+                priority: 0,
+            },
+        ];
+        let event = decode_table_watch_object(
+            serde_json::json!({
+                "apiVersion": "meta.k8s.io/v1",
+                "kind": "Table",
+                "metadata": {},
+                "rows": [{
+                    "cells": ["example", "Ready"],
+                    "object": {
+                        "apiVersion": "example.io/v1",
+                        "kind": "Widget",
+                        "metadata": {
+                            "name": "example",
+                            "namespace": "demo",
+                            "resourceVersion": "43"
+                        }
+                    }
+                }]
+            }),
+            &columns,
+        )
+        .expect("watch table");
+
+        assert_eq!(event.columns.as_ref(), columns);
+        assert_eq!(event.resource_version, "43");
+        assert_eq!(event.rows[0].name.as_ref(), "example");
+        assert_eq!(event.rows[0].table_cells[1].text.as_ref(), "Ready");
+    }
+
+    #[test]
+    fn formats_table_cells_like_kubectl() {
+        assert_eq!(table_cell(&serde_json::Value::Null, None).text.as_ref(), "");
+        assert_eq!(
+            table_cell(&serde_json::json!("first\nsecond"), None)
+                .text
+                .as_ref(),
+            "first..."
+        );
+        assert_eq!(
+            table_cell(&serde_json::json!(["one", "two"]), None)
+                .text
+                .as_ref(),
+            "[one two]"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "requires access to a Kubernetes cluster"]
-    async fn live_dynamic_api_lists_secret_crd_and_aggregated_resources() {
+    async fn live_dynamic_api_uses_server_tables_for_native_crd_and_aggregated_resources() {
         let client = Client::try_default().await.expect("Kubernetes client");
         let resources = discover_resources(client.clone())
             .await
@@ -2777,11 +3383,15 @@ mod tests {
                 .iter()
                 .find(|resource| resource.qualified_name() == qualified_name)
                 .unwrap_or_else(|| panic!("missing {qualified_name}"));
-            let objects = dynamic_api(client.clone(), resource, None)
-                .list(&ListParams::default().limit(1))
+            let api = dynamic_api(client.clone(), resource, None);
+            let listing = list_table_pages(&api, &client, None)
                 .await
-                .unwrap_or_else(|error| panic!("list {qualified_name}: {error}"));
-            assert!(!objects.items.is_empty(), "no {qualified_name} objects");
+                .unwrap_or_else(|error| panic!("table list {qualified_name}: {error}"));
+            assert!(
+                !listing.columns.is_empty(),
+                "no Table columns for {qualified_name}"
+            );
+            assert!(!listing.rows.is_empty(), "no {qualified_name} rows");
         }
     }
 }

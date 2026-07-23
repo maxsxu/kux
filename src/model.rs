@@ -371,6 +371,20 @@ pub struct ResourceRow {
     pub created_unix: i64,
     pub search: Arc<str>,
     pub data: ResourceData,
+    pub table_cells: Arc<[TableCell]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableColumn {
+    pub name: Arc<str>,
+    pub format: Arc<str>,
+    pub priority: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableCell {
+    pub text: Arc<str>,
+    pub timestamp_unix: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -456,6 +470,7 @@ impl ResourceRow {
             created_unix,
             search: Arc::from(search),
             data: ResourceData::Generic,
+            table_cells: Arc::from([]),
         }
     }
 
@@ -500,6 +515,20 @@ impl ResourceRow {
             .join(",");
         self.search = Arc::from(format!("{}\n{verbs}", self.search).to_lowercase());
         self.data = ResourceData::Policy(data);
+        self
+    }
+
+    #[must_use]
+    pub fn with_table_cells(mut self, cells: Vec<TableCell>) -> Self {
+        if !cells.is_empty() {
+            let cell_text = cells
+                .iter()
+                .map(|cell| cell.text.as_ref())
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.search = Arc::from(format!("{}\n{cell_text}", self.search).to_lowercase());
+        }
+        self.table_cells = cells.into();
         self
     }
 
@@ -618,6 +647,7 @@ pub struct ResourceSnapshot {
     pub generation: u64,
     pub kind: ResourceDescriptor,
     pub rows: Arc<Vec<Arc<ResourceRow>>>,
+    pub table_columns: Arc<[TableColumn]>,
     pub state: SourceState,
     pub revision: u64,
     pub emitted_at: Instant,
@@ -630,6 +660,7 @@ impl ResourceSnapshot {
             generation,
             kind: kind.into(),
             rows: Arc::new(Vec::new()),
+            table_columns: Arc::from([]),
             state: SourceState::Loading,
             revision: 0,
             emitted_at: Instant::now(),

@@ -54,6 +54,7 @@ pub async fn run_manager(
                             generation,
                             kind,
                             rows: Arc::new(rows),
+                            table_columns: Arc::from([]),
                             state: SourceState::Ready,
                             revision: 1,
                             emitted_at: Instant::now(),

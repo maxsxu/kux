@@ -606,23 +606,25 @@ fn header_hint_cell(hint: &HeaderHint, key_width: usize) -> Cell<'static> {
     ]))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ViewColumn {
-    label: &'static str,
+    label: String,
     field: Option<SortField>,
+    table_index: Option<usize>,
     width: Constraint,
     visible_from: u16,
 }
 
-const fn view_column(
+fn view_column(
     label: &'static str,
     field: SortField,
     width: Constraint,
     visible_from: u16,
 ) -> ViewColumn {
     ViewColumn {
-        label,
+        label: label.to_owned(),
         field: Some(field),
+        table_index: None,
         width,
         visible_from,
     }
@@ -630,16 +632,17 @@ const fn view_column(
 
 fn columns_for_view(app: &App, width: u16) -> Vec<ViewColumn> {
     let mut columns = vec![ViewColumn {
-        label: "",
+        label: String::new(),
         field: None,
+        table_index: None,
         width: Constraint::Length(2),
         visible_from: 0,
     }];
-    if app.is_resource_view()
+    let show_namespace = app.is_resource_view()
         && app.kind.is_namespaced()
         && (app.namespace.is_none() || app.ui.wide())
-        && width >= 64
-    {
+        && width >= 64;
+    if show_namespace {
         columns.push(view_column(
             "NAMESPACE",
             SortField::Namespace,
@@ -653,6 +656,8 @@ fn columns_for_view(app: &App, width: u16) -> Vec<ViewColumn> {
         container_columns()
     } else if app.kind.is_api_service() {
         api_service_columns()
+    } else if !app.snapshot.table_columns.is_empty() {
+        server_table_columns(app, show_namespace)
     } else {
         match app.kind.known_kind() {
             Some(ResourceKind::Pods) => pod_columns(),
@@ -666,6 +671,50 @@ fn columns_for_view(app: &App, width: u16) -> Vec<ViewColumn> {
             .filter(|column| width >= column.visible_from),
     );
     columns
+}
+
+fn server_table_columns(app: &App, namespace_already_shown: bool) -> Vec<ViewColumn> {
+    app.snapshot
+        .table_columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| app.ui.wide() || column.priority == 0)
+        .filter(|(_, column)| {
+            !namespace_already_shown || !column.name.eq_ignore_ascii_case("namespace")
+        })
+        .map(|(index, column)| {
+            let field = match column.name.to_ascii_lowercase().as_str() {
+                "name" => Some(SortField::Name),
+                "status" => Some(SortField::Status),
+                "ready" => Some(SortField::Ready),
+                "age" => Some(SortField::Age),
+                _ => None,
+            };
+            let label = column.name.to_ascii_uppercase();
+            let content_width = app
+                .snapshot
+                .rows
+                .iter()
+                .take(200)
+                .filter_map(|row| row.table_cells.get(index))
+                .map(|cell| cell.text.chars().count())
+                .max()
+                .unwrap_or(0)
+                .max(label.chars().count());
+            let width = if column.name.eq_ignore_ascii_case("name") {
+                Constraint::Fill(5)
+            } else {
+                Constraint::Length(u16::try_from(content_width.clamp(3, 40)).unwrap_or(40))
+            };
+            ViewColumn {
+                label,
+                field,
+                table_index: Some(index),
+                width,
+                visible_from: 0,
+            }
+        })
+        .collect()
 }
 
 fn api_service_columns() -> Vec<ViewColumn> {
@@ -810,30 +859,16 @@ fn draw_resources(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         } else {
             status_style(item.status.as_ref())
         };
-        let cells = columns.iter().map(|column| {
-            column.field.map_or_else(
-                || Cell::from(if marked { "●" } else { "" }),
-                |field| {
-                    let cell = Cell::from(column_value(item, field, app.now_unix));
-                    if !selected && is_policy_verb(field) {
-                        cell.style(if policy_verb_allowed(item, field) {
-                            Style::default().fg(GREEN)
-                        } else {
-                            Style::default().fg(ORANGE)
-                        })
-                    } else {
-                        cell
-                    }
-                },
-            )
-        });
+        let cells = columns
+            .iter()
+            .map(|column| resource_cell(column, item, selected, marked, app.now_unix));
         Row::new(cells).style(style)
     });
 
     let header_cells = columns.iter().map(|column| {
         column.field.map_or_else(
-            || Cell::from(""),
-            |field| column_header(app, column.label, field),
+            || Cell::from(column.label.clone()).style(Style::default().fg(CYAN).bold()),
+            |field| column_header(app, &column.label, field),
         )
     });
     let widths: Vec<_> = columns.iter().map(|column| column.width).collect();
@@ -896,6 +931,31 @@ fn draw_resources(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 .style(Style::default().fg(MUTED)),
             centered_rect(70, 3, area),
         );
+    }
+}
+
+fn resource_cell(
+    column: &ViewColumn,
+    row: &crate::model::ResourceRow,
+    selected: bool,
+    marked: bool,
+    now_unix: i64,
+) -> Cell<'static> {
+    if let Some(index) = column.table_index {
+        return Cell::from(table_column_value(row, index));
+    }
+    let Some(field) = column.field else {
+        return Cell::from(if marked { "●" } else { "" });
+    };
+    let cell = Cell::from(column_value(row, field, now_unix));
+    if !selected && is_policy_verb(field) {
+        cell.style(if policy_verb_allowed(row, field) {
+            Style::default().fg(GREEN)
+        } else {
+            Style::default().fg(ORANGE)
+        })
+    } else {
+        cell
     }
 }
 
@@ -1025,6 +1085,12 @@ fn column_value(row: &crate::model::ResourceRow, field: SortField, now_unix: i64
             }
         }
     }
+}
+
+fn table_column_value(row: &crate::model::ResourceRow, index: usize) -> String {
+    row.table_cells
+        .get(index)
+        .map_or_else(String::new, |cell| cell.text.to_string())
 }
 
 fn policy_verb_allowed(row: &crate::model::ResourceRow, field: SortField) -> bool {
@@ -1791,7 +1857,7 @@ mod tests {
         kubeconfig::ContextInfo,
         model::{
             NamespaceInfo, NodeData, PodData, PolicyData, ResourceDescriptor, ResourceOperations,
-            ResourceRow, ResourceSnapshot,
+            ResourceRow, ResourceSnapshot, TableCell, TableColumn,
         },
     };
 
@@ -1832,6 +1898,7 @@ mod tests {
                 "0",
                 app.now_unix - 60,
             ))]),
+            table_columns: Arc::from([]),
             state: SourceState::Ready,
             revision: 1,
             emitted_at: Instant::now(),
@@ -2039,6 +2106,7 @@ mod tests {
                     app.now_unix - 3_600,
                 )),
             ]),
+            table_columns: Arc::from([]),
             state: SourceState::Ready,
             revision: 1,
             emitted_at: Instant::now(),
@@ -2080,6 +2148,7 @@ mod tests {
                 ResourceRow::new("default", "api-0", "Running", "1/1", "0", app.now_unix - 60)
                     .with_labels("app=api"),
             )]),
+            table_columns: Arc::from([]),
             state: SourceState::Ready,
             revision: 1,
             emitted_at: Instant::now(),
@@ -2635,6 +2704,7 @@ mod tests {
             generation: 1,
             kind: ResourceKind::Pods.into(),
             rows: Arc::new(vec![Arc::new(pod)]),
+            table_columns: Arc::from([]),
             state: SourceState::Ready,
             revision: 1,
             emitted_at: Instant::now(),
@@ -2675,6 +2745,7 @@ mod tests {
             generation: 1,
             kind: ResourceKind::Nodes.into(),
             rows: Arc::new(vec![Arc::new(node)]),
+            table_columns: Arc::from([]),
             state: SourceState::Ready,
             revision: 1,
             emitted_at: Instant::now(),
@@ -2729,6 +2800,95 @@ mod tests {
             columns_for_view(&app, 160)
                 .iter()
                 .any(|column| column.label == "NAMESPACE")
+        );
+    }
+
+    #[test]
+    fn server_table_columns_follow_kubectl_normal_and_wide_priorities() {
+        let mut app = App::new(
+            "demo",
+            Some("default".to_owned()),
+            ResourceKind::Pods,
+            false,
+            vec!["demo".to_owned()],
+        );
+        let kind = ResourceDescriptor::new(
+            "example.io",
+            "v1",
+            "example.io/v1",
+            "Widget",
+            "widgets",
+            true,
+            ResourceOperations::all(),
+        );
+        app.kind = kind.clone();
+        let row =
+            ResourceRow::new("default", "example", "-", "-", "-", 3_600).with_table_cells(vec![
+                TableCell {
+                    text: Arc::from("example"),
+                    timestamp_unix: None,
+                },
+                TableCell {
+                    text: Arc::from("Ready"),
+                    timestamp_unix: None,
+                },
+                TableCell {
+                    text: Arc::from("10.0.0.1"),
+                    timestamp_unix: None,
+                },
+                TableCell {
+                    text: Arc::from("1970-01-01T01:00:00Z"),
+                    timestamp_unix: Some(3_600),
+                },
+            ]);
+        app.apply_snapshot(ResourceSnapshot {
+            generation: app.generation,
+            kind,
+            rows: Arc::new(vec![Arc::new(row)]),
+            table_columns: vec![
+                TableColumn {
+                    name: Arc::from("Name"),
+                    format: Arc::from("name"),
+                    priority: 0,
+                },
+                TableColumn {
+                    name: Arc::from("Phase"),
+                    format: Arc::from(""),
+                    priority: 0,
+                },
+                TableColumn {
+                    name: Arc::from("Endpoint"),
+                    format: Arc::from(""),
+                    priority: 1,
+                },
+                TableColumn {
+                    name: Arc::from("Age"),
+                    format: Arc::from("date"),
+                    priority: 0,
+                },
+            ]
+            .into(),
+            state: SourceState::Ready,
+            revision: 1,
+            emitted_at: Instant::now(),
+        });
+
+        let labels = |app: &App| {
+            columns_for_view(app, 160)
+                .into_iter()
+                .filter(|column| !column.label.is_empty())
+                .map(|column| column.label)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(labels(&app), ["NAME", "PHASE", "AGE"]);
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(
+            labels(&app),
+            ["NAMESPACE", "NAME", "PHASE", "ENDPOINT", "AGE"]
+        );
+        assert_eq!(
+            table_column_value(app.snapshot.rows[0].as_ref(), 3),
+            "1970-01-01T01:00:00Z"
         );
     }
 
@@ -2812,6 +2972,7 @@ mod tests {
             rows: Arc::new(vec![Arc::new(ResourceRow::new(
                 "-", "v1.", "True", "Local", "", 0,
             ))]),
+            table_columns: Arc::from([]),
             state: SourceState::Ready,
             revision: 1,
             emitted_at: Instant::now(),
@@ -2872,6 +3033,7 @@ mod tests {
                     verbs: vec![Arc::from("get"), Arc::from("list"), Arc::from("watch")],
                 }),
             )]),
+            table_columns: Arc::from([]),
             state: SourceState::Ready,
             revision: 1,
             emitted_at: Instant::now(),
@@ -2973,6 +3135,7 @@ mod tests {
             rows: Arc::new(vec![Arc::new(ResourceRow::new(
                 "default", "api-0", "Running", "1/1", "0", 0,
             ))]),
+            table_columns: Arc::from([]),
             state: SourceState::Ready,
             revision: 1,
             emitted_at: Instant::now(),
