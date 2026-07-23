@@ -1193,6 +1193,14 @@ impl App {
             return AppCommand::None;
         }
         match key.code {
+            KeyCode::Char('c') => visible
+                .iter()
+                .copied()
+                .find(|index| *index == self.overlay_selected)
+                .and_then(|index| self.context_options.get(index))
+                .map_or(AppCommand::None, |context| {
+                    AppCommand::Copy(context.name.clone())
+                }),
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 let Some(index) = visible
                     .iter()
@@ -3098,6 +3106,23 @@ mod tests {
             AppCommand::Action(ActionIntent::DeleteContext {
                 name: "dev".to_owned()
             })
+        );
+        assert_eq!(app.overlay, Overlay::Contexts);
+    }
+
+    #[test]
+    fn context_chooser_c_copies_the_selected_context_name() {
+        let mut app = app_with_contexts(false);
+        app.overlay = Overlay::Contexts;
+        app.overlay_selected = app
+            .context_options
+            .iter()
+            .position(|item| item.name == "dev")
+            .expect("dev context");
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            AppCommand::Copy("dev".to_owned())
         );
         assert_eq!(app.overlay, Overlay::Contexts);
     }

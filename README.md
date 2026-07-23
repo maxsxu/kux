@@ -160,8 +160,8 @@ Press `?` for the categorized keymap in the body. The full compatibility surface
 ## Safety and requirements
 
 - The header shows Context, its referenced Cluster and User, and the server Version. `:ctx` shows
-  Name/Cluster/User/Namespace; `:ns` shows Name/Status/Age, and `y` opens the selected Namespace
-  YAML.
+  Name/Cluster/User/Namespace and supports `c` to copy the selected context name; `:ns` shows
+  Name/Status/Age, and `y` opens the selected Namespace YAML.
 - Kux uses the active kubeconfig context and default namespace unless overridden.
 - Start with `--read-only` to disable resource and context deletion, kill, edit, restart, and future
   mutation paths.

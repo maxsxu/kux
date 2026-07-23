@@ -23,6 +23,8 @@ const SELECTED: Color = Color::Rgb(68, 71, 90);
 const HEADER_MENU_ROWS: usize = 6;
 const HEADER_LANE_SPACING: u16 = 2;
 const HEADER_COLUMN_SPACING: u16 = 2;
+const HEADER_INFO_LABEL_WIDTH: usize = 7;
+const HELP_TWO_COLUMN_MIN_WIDTH: u16 = 120;
 const LOGO_ROWS: [&str; 5] = [
     " _  __ _   _ __  __",
     "| |/ /| | | |\\ \\/ /",
@@ -61,6 +63,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let header_layout =
         (app.ui.header() && !fullscreen_content).then(|| header_layout(app, area.width));
     let header_height = header_layout.as_ref().map_or(0, |layout| layout.height);
+    let body_gap_height = u16::from(header_layout.is_some());
     let input_height = match app.input_mode {
         InputMode::Browse => 0,
         InputMode::Command | InputMode::Filter => 3,
@@ -70,6 +73,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         .constraints([
             Constraint::Length(header_height),
             Constraint::Length(input_height),
+            Constraint::Length(body_gap_height),
             Constraint::Min(5),
         ])
         .split(area);
@@ -80,14 +84,15 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if app.input_mode != InputMode::Browse {
         draw_input_view(frame, app, chunks[1]);
     }
+    let body_area = chunks[3];
     match app.overlay {
-        Overlay::Aliases => draw_aliases(frame, app, chunks[2]),
-        Overlay::Namespaces => draw_namespaces(frame, app, chunks[2]),
-        Overlay::Contexts => draw_contexts(frame, app, chunks[2]),
-        Overlay::Help => draw_help(frame, app, chunks[2]),
-        Overlay::Content => draw_content(frame, app, chunks[2]),
-        Overlay::Details => draw_details(frame, app, chunks[2]),
-        _ => draw_resources(frame, app, chunks[2]),
+        Overlay::Aliases => draw_aliases(frame, app, body_area),
+        Overlay::Namespaces => draw_namespaces(frame, app, body_area),
+        Overlay::Contexts => draw_contexts(frame, app, body_area),
+        Overlay::Help => draw_help(frame, app, body_area),
+        Overlay::Content => draw_content(frame, app, body_area),
+        Overlay::Details => draw_details(frame, app, body_area),
+        _ => draw_resources(frame, app, body_area),
     }
 
     match app.overlay {
@@ -245,10 +250,15 @@ fn cluster_info_entries(app: &App) -> [(&'static str, &str); 4] {
     ]
 }
 
+fn cluster_info_label(label: &str) -> String {
+    let padding = HEADER_INFO_LABEL_WIDTH.saturating_sub(Line::raw(label).width());
+    format!("{label}:{} ", " ".repeat(padding))
+}
+
 fn cluster_info_width(app: &App) -> u16 {
     cluster_info_entries(app)
         .iter()
-        .map(|(label, value)| Line::raw(format!("{label:>10}: {value}")).width())
+        .map(|(label, value)| Line::raw(format!("{}{value}", cluster_info_label(label))).width())
         .max()
         .and_then(|width| u16::try_from(width).ok())
         .unwrap_or(0)
@@ -260,7 +270,7 @@ fn cluster_info_rows(app: &App, width: u16) -> Vec<Line<'static>> {
         .flat_map(|(label, value)| {
             wrap_styled_segments(
                 [
-                    (format!("{label:>10}: "), Style::default().fg(MUTED)),
+                    (cluster_info_label(label), Style::default().fg(MUTED)),
                     (value.to_owned(), Style::default().fg(CYAN)),
                 ],
                 width,
@@ -492,6 +502,7 @@ fn action_hints(app: &App) -> Vec<HeaderHint> {
         Overlay::Contexts => {
             hints.extend([
                 action_hint("enter", "Switch"),
+                action_hint("c", "Copy Name"),
                 action_hint("j/k", "Move"),
                 action_hint("esc", "Back"),
             ]);
@@ -766,8 +777,8 @@ fn node_columns() -> Vec<ViewColumn> {
 fn generic_columns(wide: bool) -> Vec<ViewColumn> {
     let mut columns = vec![
         view_column("NAME", SortField::Name, Constraint::Fill(5), 0),
-        view_column("STATUS", SortField::Status, Constraint::Fill(2), 0),
-        view_column("READY", SortField::Ready, Constraint::Length(9), 46),
+        view_column("STATUS", SortField::Status, Constraint::Length(20), 0),
+        view_column("READY", SortField::Ready, Constraint::Length(7), 46),
     ];
     if wide {
         columns.push(view_column(
@@ -1126,73 +1137,76 @@ fn prompt_line(
     Line::from(spans)
 }
 
-fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    const CATEGORIES: &[(&str, &[(&str, &str)])] = &[
-        (
-            "NAVIGATION",
-            &[
-                ("j", "Down"),
-                ("k", "Up"),
-                ("h", "Left / Back"),
-                ("l", "Right / Open"),
-                ("g / Home", "Go to top"),
-                ("Shift-G / End", "Go to bottom"),
-                ("Ctrl-B / PgUp", "Page up"),
-                ("Ctrl-F / PgDn", "Page down"),
-                ("[", "History back"),
-                ("-", "History back"),
-                ("]", "History forward"),
-            ],
-        ),
-        (
-            "GENERAL",
-            &[
-                ("?", "Help"),
-                ("Ctrl-A", "Resource aliases"),
-                (":", "Command mode"),
-                ("/", "Filter mode"),
-                ("Esc", "Back / clear filter"),
-                ("Ctrl-R", "Refresh view"),
-                ("Ctrl-C", "Quit"),
-                ("0…9", "Recent namespaces"),
-            ],
-        ),
-        (
-            "RESOURCES",
-            &[
-                ("Enter", "Open selected resource"),
-                ("Space", "Mark resource"),
-                ("Ctrl-Space", "Mark range"),
-                ("Ctrl-\\", "Clear marks"),
-                ("c / n", "Copy name / namespace"),
-                ("y / d / e", "YAML / describe / edit"),
-                ("l / p", "Logs / previous logs"),
-            ],
-        ),
-        (
-            "DISPLAY",
-            &[
-                ("Ctrl-E", "Toggle header"),
-                ("Ctrl-L", "Toggle logo"),
-                ("Ctrl-W", "Toggle wide columns"),
-                ("Shift-← / Shift-→", "Select column"),
-                ("Shift-O", "Sort selected column"),
-                ("Shift-N / A", "Sort name / age"),
-                ("Shift-P / S", "Sort namespace / status"),
-                ("Mouse", "Click header to sort"),
-            ],
-        ),
-        (
-            "MUTATION",
-            &[
-                ("Ctrl-D", "Delete with confirmation"),
-                ("Ctrl-K", "Kill immediately"),
-                ("Ctrl-Z", "Toggle faults"),
-            ],
-        ),
-    ];
+type HelpCategory = (&'static str, &'static [(&'static str, &'static str)]);
+
+const HELP_CATEGORIES: &[HelpCategory] = &[
+    (
+        "NAVIGATION",
+        &[
+            ("j", "Down"),
+            ("k", "Up"),
+            ("h", "Left / Back"),
+            ("l", "Right / Open"),
+            ("g / Home", "Go to top"),
+            ("Shift-G / End", "Go to bottom"),
+            ("Ctrl-B / PgUp", "Page up"),
+            ("Ctrl-F / PgDn", "Page down"),
+            ("[", "History back"),
+            ("-", "History back"),
+            ("]", "History forward"),
+        ],
+    ),
+    (
+        "GENERAL",
+        &[
+            ("?", "Help"),
+            ("Ctrl-A", "Resource aliases"),
+            (":", "Command mode"),
+            ("/", "Filter mode"),
+            ("Esc", "Back / clear filter"),
+            ("Ctrl-R", "Refresh view"),
+            ("Ctrl-C", "Quit"),
+            ("0…9", "Recent namespaces"),
+        ],
+    ),
+    (
+        "RESOURCES",
+        &[
+            ("Enter", "Open selected resource"),
+            ("Space", "Mark resource"),
+            ("Ctrl-Space", "Mark range"),
+            ("Ctrl-\\", "Clear marks"),
+            ("c / n", "Copy name / namespace"),
+            ("y / d / e", "YAML / describe / edit"),
+            ("l / p", "Logs / previous logs"),
+        ],
+    ),
+    (
+        "DISPLAY",
+        &[
+            ("Ctrl-E", "Toggle header"),
+            ("Ctrl-L", "Toggle logo"),
+            ("Ctrl-W", "Toggle wide columns"),
+            ("Shift-← / Shift-→", "Select column"),
+            ("Shift-O", "Sort selected column"),
+            ("Shift-N / A", "Sort name / age"),
+            ("Shift-P / S", "Sort namespace / status"),
+            ("Mouse", "Click header to sort"),
+        ],
+    ),
+    (
+        "MUTATION",
+        &[
+            ("Ctrl-D", "Delete with confirmation"),
+            ("Ctrl-K", "Kill immediately"),
+            ("Ctrl-Z", "Toggle faults"),
+        ],
+    ),
+];
+
+fn help_category_lines(categories: &[HelpCategory]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    for (category_index, (category, entries)) in CATEGORIES.iter().enumerate() {
+    for (category_index, (category, entries)) in categories.iter().enumerate() {
         if category_index > 0 {
             lines.push(Line::raw(""));
         }
@@ -1210,13 +1224,38 @@ fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
             ]));
         }
     }
+    lines
+}
+
+fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let title = format!(" Help · {} ", app.kind.label());
+    let block = notice_block(popup_block(&title).title_alignment(Alignment::Center), app);
+    if area.width >= HELP_TWO_COLUMN_MIN_WIDTH {
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let columns = Layout::horizontal([
+            Constraint::Percentage(50),
+            Constraint::Length(2),
+            Constraint::Percentage(50),
+        ])
+        .split(inner);
+        frame.render_widget(
+            Paragraph::new(help_category_lines(&HELP_CATEGORIES[..2]))
+                .scroll((app.content_scroll, app.content_horizontal_scroll)),
+            columns[0],
+        );
+        frame.render_widget(
+            Paragraph::new(help_category_lines(&HELP_CATEGORIES[2..]))
+                .scroll((app.content_scroll, app.content_horizontal_scroll)),
+            columns[2],
+        );
+        return;
+    }
+
+    let lines = help_category_lines(HELP_CATEGORIES);
     frame.render_widget(
         Paragraph::new(lines)
-            .block(notice_block(
-                popup_block(&format!(" Help · {} ", app.kind.label()))
-                    .title_alignment(Alignment::Center),
-                app,
-            ))
+            .block(block)
             .scroll((app.content_scroll, app.content_horizontal_scroll)),
         area,
     );
@@ -1889,7 +1928,7 @@ mod tests {
 
         assert!(rendered.contains("Context: gke_sncloud-test_us-west1-long-context"));
         assert!(rendered.contains("Cluster: gke_sncloud-test-us-west1"));
-        assert!(rendered.contains("User: max@example.com"));
+        assert!(rendered.contains("User:    max@example.com"));
         assert!(!rendered.contains("Namespace:"));
         assert!(rendered.contains("<0> all"));
         assert!(!rendered.contains("Kill"));
@@ -1937,17 +1976,92 @@ mod tests {
         terminal
             .draw(|frame| draw(frame, &mut app))
             .expect("draw without logo");
-        let rendered = rendered_lines(&terminal, 180).join("\n");
+        let lines = rendered_lines(&terminal, 180);
+        let rendered = lines.join("\n");
         assert!(!rendered.contains(LOGO_ROWS[0]));
         assert!(rendered.contains(app.context.as_str()));
+        assert!(lines[0].starts_with("Context:"));
+        let layout = header_layout(&app, 180);
+        let body_row = lines
+            .iter()
+            .position(|line| line.contains("pods(sn-system)[0]"))
+            .expect("resource title");
+        assert_eq!(body_row, usize::from(layout.height) + 1);
 
         app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
         terminal
             .draw(|frame| draw(frame, &mut app))
             .expect("draw without header");
-        let rendered = rendered_lines(&terminal, 180).join("\n");
+        let lines = rendered_lines(&terminal, 180);
+        let rendered = lines.join("\n");
         assert!(!rendered.contains("Context:"));
         assert!(!rendered.contains("Command"));
+        assert!(lines[0].contains("pods(sn-system)[0]"));
+    }
+
+    #[test]
+    fn generic_resource_status_and_ready_columns_use_bounded_widths() {
+        let kind = ResourceDescriptor::new(
+            "config.streamnative.io",
+            "v1alpha1",
+            "config.streamnative.io/v1alpha1",
+            "CloudEnvironment",
+            "cloudenvironments",
+            true,
+            ResourceOperations::all(),
+        );
+        let mut app = App::new(
+            "demo",
+            None,
+            ResourceKind::Pods,
+            false,
+            vec!["demo".to_owned()],
+        );
+        app.kind = kind.clone();
+        app.apply_snapshot(ResourceSnapshot {
+            generation: app.generation,
+            kind,
+            rows: Arc::new(vec![
+                Arc::new(ResourceRow::new(
+                    "o-for6u",
+                    "aws-usw1-dev-obc99",
+                    "KubernetesReady",
+                    "-",
+                    "-",
+                    app.now_unix - 3_600,
+                )),
+                Arc::new(ResourceRow::new(
+                    "o-for6u",
+                    "aws-usw1-production-m2v3f",
+                    "ConnectivityReady",
+                    "-",
+                    "-",
+                    app.now_unix - 3_600,
+                )),
+            ]),
+            state: SourceState::Ready,
+            revision: 1,
+            emitted_at: Instant::now(),
+        });
+
+        let columns = columns_for_view(&app, 200);
+        let widths = columns
+            .iter()
+            .map(|column| column.width)
+            .collect::<Vec<_>>();
+        let resolved = Layout::horizontal(widths)
+            .spacing(1)
+            .split(Rect::new(0, 0, 198, 1));
+        let width_for = |field| {
+            columns
+                .iter()
+                .position(|column| column.field == Some(field))
+                .map(|index| resolved[index].width)
+                .expect("column exists")
+        };
+
+        assert_eq!(width_for(SortField::Status), 20);
+        assert_eq!(width_for(SortField::Ready), 7);
     }
 
     #[test]
@@ -2242,31 +2356,43 @@ mod tests {
     #[test]
     fn help_renders_categorized_in_the_body_while_delete_remains_a_popup() {
         let mut app = app_with_rendered_pod();
-        let backend = TestBackend::new(100, 40);
+        let backend = TestBackend::new(160, 40);
         let mut terminal = Terminal::new(backend).expect("modal terminal");
 
         app.overlay = Overlay::Help;
         terminal
             .draw(|frame| draw(frame, &mut app))
             .expect("draw help body");
-        let help_lines = rendered_lines(&terminal, 100);
+        let help_lines = rendered_lines(&terminal, 160);
         let help = help_lines
             .into_iter()
             .find(|line| line.contains("Help · Pods"))
             .expect("help title");
         assert!(help.starts_with('╭'));
-        let rendered = rendered_lines(&terminal, 100).join("\n");
+        let help_lines = rendered_lines(&terminal, 160);
+        let rendered = help_lines.join("\n");
         assert!(rendered.contains("NAVIGATION"));
         assert!(rendered.contains("GENERAL"));
+        assert!(rendered.contains("RESOURCES"));
         assert!(rendered.contains("<j>"));
         assert!(rendered.contains("Down"));
+        let first_category_row = help_lines
+            .iter()
+            .find(|line| line.contains("NAVIGATION"))
+            .expect("first help category row");
+        assert!(first_category_row.contains("RESOURCES"));
+        assert!(
+            first_category_row
+                .find("RESOURCES")
+                .is_some_and(|column| column > 80)
+        );
 
         app.overlay = Overlay::None;
         app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
         terminal
             .draw(|frame| draw(frame, &mut app))
             .expect("draw delete popup");
-        let confirm = rendered_lines(&terminal, 100)
+        let confirm = rendered_lines(&terminal, 160)
             .into_iter()
             .find(|line| line.contains("Confirm Delete"))
             .expect("confirmation title");
@@ -2282,6 +2408,18 @@ mod tests {
             action_hints(&app)
                 .iter()
                 .any(|hint| hint.key == "y" && hint.label == "YAML")
+        );
+    }
+
+    #[test]
+    fn context_body_advertises_copy_for_the_selected_context() {
+        let mut app = app_with_rendered_pod();
+        app.overlay = Overlay::Contexts;
+
+        assert!(
+            action_hints(&app)
+                .iter()
+                .any(|hint| hint.key == "c" && hint.label == "Copy Name")
         );
     }
 

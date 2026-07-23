@@ -19,7 +19,7 @@ K9s key and reports that its backend is pending, and **planned** is not yet expo
 | Command/filter in in-place views | `:`, `/` | Implemented for resource, resource chooser, namespace chooser, context, details, YAML, describe, logs, container, and policy bodies |
 | Restore previous/clear filter input | `Tab`, `Ctrl-U` | Implemented with muted history hint |
 | Cancel mode | `Esc` | Implemented |
-| Context chooser/direct context | `:ctx`, `:ctx name` | Implemented; body columns are Name/Cluster/User/Namespace, switching rebuilds the client, and `Ctrl-D` confirms deletion of inactive persisted contexts |
+| Context chooser/direct context | `:ctx`, `:ctx name` | Implemented; body columns are Name/Cluster/User/Namespace, `c` copies the selected name, switching rebuilds the client, and `Ctrl-D` confirms deletion of inactive persisted contexts |
 | Namespace chooser/direct namespace | `:ns`, `:ns name` | Implemented; body columns are Name/Status/Age, `y` opens the selected Namespace YAML, and direct selection switches immediately |
 | Recent namespace shortcuts | `0`…`9` | Implemented; `0` is always all namespaces and `1`…`9` are named recents |
 | K9s-style header menu | automatic | Implemented as a lossless responsive header: cluster information is measured and wrapped first, the upright logo is shown only when it fits, and only complete namespace/action hotkey columns are admitted in priority order |
