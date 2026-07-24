@@ -20,6 +20,8 @@ const ORANGE: Color = Color::Rgb(255, 184, 108);
 const PINK: Color = Color::Rgb(255, 121, 198);
 const MUTED: Color = Color::Rgb(98, 114, 164);
 const SELECTED: Color = Color::Rgb(68, 71, 90);
+const ROW_ALT: Color = Color::Rgb(44, 47, 62);
+const BODY_BORDER: Color = Color::Rgb(82, 104, 158);
 const HEADER_MENU_ROWS: usize = 6;
 const HEADER_LANE_SPACING: u16 = 2;
 const HEADER_COLUMN_SPACING: u16 = 2;
@@ -885,11 +887,7 @@ fn draw_resources(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let rows = app.visible_rows().map(|(position, item)| {
         let selected = position == app.selected;
         let marked = app.marks.contains(&item.key);
-        let style = if selected {
-            Style::default().fg(Color::White).bg(SELECTED).bold()
-        } else {
-            status_style(item.status.as_ref())
-        };
+        let style = resource_row_style(position, selected);
         let cells = columns
             .iter()
             .map(|column| resource_cell(column, item, selected, marked, app.now_unix));
@@ -929,7 +927,7 @@ fn draw_resources(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(MUTED))
+            .border_style(Style::default().fg(BODY_BORDER))
             .title(Span::styled(title, Style::default().fg(CYAN).bold()))
             .title_alignment(Alignment::Center),
         app,
@@ -975,21 +973,94 @@ fn resource_cell(
     marked: bool,
     now_unix: i64,
 ) -> Cell<'static> {
-    if let Some(index) = column.table_index {
-        return Cell::from(table_column_value(row, index, column.table_age, now_unix));
-    }
-    let Some(field) = column.field else {
-        return Cell::from(if marked { "●" } else { "" });
+    let value = if let Some(index) = column.table_index {
+        table_column_value(row, index, column.table_age, now_unix)
+    } else if let Some(field) = column.field {
+        column_value(row, field, now_unix)
+    } else {
+        return Cell::from(if marked { "●" } else { "" }).style(if selected || !marked {
+            Style::default()
+        } else {
+            Style::default().fg(PINK).bold()
+        });
     };
-    let cell = Cell::from(column_value(row, field, now_unix));
-    if !selected && is_policy_verb(field) {
+
+    let cell = Cell::from(value.clone());
+    let Some(field) = column.field else {
+        return cell;
+    };
+    if selected {
+        cell
+    } else if is_policy_verb(field) {
         cell.style(if policy_verb_allowed(row, field) {
             Style::default().fg(GREEN)
         } else {
             Style::default().fg(ORANGE)
         })
     } else {
-        cell
+        cell.style(resource_value_style(field, row, &value, now_unix))
+    }
+}
+
+fn resource_row_style(position: usize, selected: bool) -> Style {
+    if selected {
+        return Style::default().fg(Color::White).bg(SELECTED).bold();
+    }
+    if position % 2 == 1 {
+        Style::default().bg(ROW_ALT)
+    } else {
+        Style::default()
+    }
+}
+
+fn resource_value_style(
+    field: SortField,
+    row: &crate::model::ResourceRow,
+    value: &str,
+    now_unix: i64,
+) -> Style {
+    match field {
+        SortField::Namespace | SortField::Node => Style::default().fg(PURPLE),
+        SortField::Name => Style::default().fg(CYAN),
+        SortField::Status => status_style(value).bold(),
+        SortField::Ready | SortField::Binding => readiness_style(value),
+        SortField::Age => Style::default().fg(age_color(row.age_seconds(now_unix))),
+        SortField::Version | SortField::Details => Style::default().fg(MUTED),
+        _ => Style::default(),
+    }
+}
+
+fn readiness_style(value: &str) -> Style {
+    let normalized = value.trim().to_ascii_lowercase();
+    let is_ready_fraction = normalized
+        .split_once('/')
+        .and_then(|(ready, total)| Some((ready.parse::<u64>().ok()?, total.parse::<u64>().ok()?)))
+        .is_some_and(|(ready, total)| total > 0 && ready == total);
+    let color = if normalized.is_empty() || normalized == "-" {
+        MUTED
+    } else if matches!(normalized.as_str(), "true" | "ready" | "running" | "active")
+        || is_ready_fraction
+    {
+        GREEN
+    } else {
+        ORANGE
+    };
+    Style::default().fg(color)
+}
+
+const fn age_color(age_seconds: u64) -> Color {
+    const HOUR: u64 = 60 * 60;
+    const DAY: u64 = 24 * HOUR;
+    if age_seconds < HOUR {
+        GREEN
+    } else if age_seconds < DAY {
+        CYAN
+    } else if age_seconds < 7 * DAY {
+        PURPLE
+    } else if age_seconds < 30 * DAY {
+        YELLOW
+    } else {
+        MUTED
     }
 }
 
@@ -1860,14 +1931,32 @@ fn notice_block<'a>(block: Block<'a>, app: &App) -> Block<'a> {
 }
 
 fn status_style(status: &str) -> Style {
-    match status {
-        "Running" | "Ready" | "Succeeded" | "True" => Style::default().fg(GREEN),
-        "Pending" | "Progressing" | "Unknown" => Style::default().fg(YELLOW),
-        "Failed" | "CrashLoopBackOff" | "NotReady" => Style::default().fg(RED),
-        "Terminating" => Style::default().fg(MUTED),
-        status if status.starts_with("False") => Style::default().fg(RED),
-        _ => Style::default(),
-    }
+    let normalized = status.trim().to_ascii_lowercase();
+    let color = if normalized == "terminating" {
+        MUTED
+    } else if normalized == "false"
+        || normalized.starts_with("false ")
+        || normalized.contains("failed")
+        || normalized.contains("error")
+        || normalized.contains("crashloop")
+        || normalized.contains("notready")
+    {
+        RED
+    } else if matches!(
+        normalized.as_str(),
+        "pending" | "progressing" | "unknown" | "scheduled"
+    ) {
+        YELLOW
+    } else if matches!(
+        normalized.as_str(),
+        "running" | "ready" | "succeeded" | "true" | "active" | "available" | "bound"
+    ) || normalized.ends_with("ready")
+    {
+        GREEN
+    } else {
+        return Style::default();
+    };
+    Style::default().fg(color)
 }
 
 fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
@@ -3333,6 +3422,32 @@ mod tests {
                 .iter()
                 .all(|cell| { !cell.modifier.contains(ratatui::style::Modifier::UNDERLINED) })
         );
+    }
+
+    #[test]
+    fn resource_rows_use_subtle_banding_without_overriding_selection() {
+        assert_eq!(resource_row_style(0, false).bg, None);
+        assert_eq!(resource_row_style(1, false).bg, Some(ROW_ALT));
+        assert_eq!(
+            resource_row_style(1, true).bg,
+            Some(SELECTED),
+            "selection remains the strongest row treatment"
+        );
+    }
+
+    #[test]
+    fn body_colors_express_resource_semantics() {
+        assert_eq!(readiness_style("3/3").fg, Some(GREEN));
+        assert_eq!(readiness_style("2/3").fg, Some(ORANGE));
+        assert_eq!(readiness_style("-").fg, Some(MUTED));
+        assert_eq!(status_style("KubernetesReady").fg, Some(GREEN));
+        assert_eq!(status_style("NotReady").fg, Some(RED));
+        assert_eq!(status_style("Scheduled").fg, Some(YELLOW));
+        assert_eq!(age_color(30 * 60), GREEN);
+        assert_eq!(age_color(12 * 60 * 60), CYAN);
+        assert_eq!(age_color(2 * 24 * 60 * 60), PURPLE);
+        assert_eq!(age_color(14 * 24 * 60 * 60), YELLOW);
+        assert_eq!(age_color(60 * 24 * 60 * 60), MUTED);
     }
 
     #[test]
