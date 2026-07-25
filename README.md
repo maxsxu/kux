@@ -150,7 +150,7 @@ The header always shows the actions available in the current view. These are the
 | `Space`, `Ctrl-Space`, `Ctrl-\` | Mark one, mark a range, clear marks |
 | Left-click a column | Sort; click again to reverse |
 | `Ctrl-R` | Restart the active watch |
-| `Ctrl-D` | Delete the selected resource or inactive kubeconfig context with confirmation |
+| `Ctrl-D` | Delete all marked resources, the current resource when none are marked, or an inactive context—with confirmation |
 | `Ctrl-L`, `Ctrl-E`, `Ctrl-W` | Toggle logo, header, and wide columns |
 | `:q`, `Ctrl-C` | Quit |
 
@@ -165,8 +165,8 @@ Press `?` for the categorized keymap in the body. The full compatibility surface
 - Kux uses the active kubeconfig context and default namespace unless overridden.
 - Start with `--read-only` to disable resource and context deletion, kill, edit, restart, and future
   mutation paths.
-- `Ctrl-D` uses a guarded confirmation and refuses the active context; `Ctrl-K` intentionally
-  requests zero-grace resource deletion.
+- `Ctrl-D` uses a guarded confirmation, batches all marked resources, and refuses the active
+  context; `Ctrl-K` intentionally requests zero-grace deletion of the current resource.
 - `kubectl` is required for describe views, interactive resource editing, and kubeconfig context
   deletion.
 - The Metrics API is optional; Pod and Node usage columns remain unavailable when it is absent.

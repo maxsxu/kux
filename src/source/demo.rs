@@ -76,12 +76,7 @@ pub async fn run_manager(
 
 fn demo_action(action: ActionIntent) -> ActionResult {
     match action {
-        ActionIntent::Delete { target, immediate } => ActionResult::Notice(format!(
-            "Demo: would {} {}/{}",
-            if immediate { "kill" } else { "delete" },
-            target.namespace.as_deref().unwrap_or("cluster"),
-            target.name
-        )),
+        ActionIntent::Delete { targets, immediate } => demo_delete(&targets, immediate),
         ActionIntent::DeleteContext { name } => ActionResult::Error(format!(
             "Context deletion is unavailable in demo mode: {name}"
         )),
@@ -173,6 +168,23 @@ fn demo_action(action: ActionIntent) -> ActionResult {
             }
         }
     }
+}
+
+fn demo_delete(targets: &[ResourceTarget], immediate: bool) -> ActionResult {
+    let action = if immediate { "kill" } else { "delete" };
+    let notice = if let [target] = targets {
+        format!(
+            "Demo: would {action} {}/{}",
+            target.namespace.as_deref().unwrap_or("cluster"),
+            target.name
+        )
+    } else {
+        format!(
+            "Demo: would {action} all {} selected resources",
+            targets.len()
+        )
+    };
+    ActionResult::Notice(notice)
 }
 
 fn demo_content(target: &ResourceTarget, content: ContentKind) -> ActionResult {
@@ -374,6 +386,28 @@ mod tests {
             row.pod_data()
                 .is_some_and(|data| data.node.as_ref() == "node-0000007")
         }));
+    }
+
+    #[test]
+    fn demo_delete_reports_the_full_selected_batch() {
+        let target = crate::app::ResourceTarget {
+            kind: ResourceDescriptor::from(ResourceKind::Pods),
+            namespace: Some("team-007".to_owned()),
+            name: "po-0000007".to_owned(),
+        };
+        assert_eq!(
+            demo_action(ActionIntent::Delete {
+                targets: vec![
+                    target.clone(),
+                    crate::app::ResourceTarget {
+                        name: "po-0000008".to_owned(),
+                        ..target
+                    },
+                ],
+                immediate: false,
+            }),
+            ActionResult::Notice("Demo: would delete all 2 selected resources".to_owned())
+        );
     }
 
     #[test]

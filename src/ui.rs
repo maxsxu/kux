@@ -574,7 +574,12 @@ fn resource_action_hints(app: &App) -> Vec<HeaderHint> {
     }
     if !app.read_only {
         hints.push(action_hint("e", "Edit"));
-        hints.push(action_hint("ctrl-d", "Delete"));
+        let delete_label = if app.marks.is_empty() {
+            "Delete".to_owned()
+        } else {
+            format!("Delete ({})", app.marks.len())
+        };
+        hints.push(action_hint("ctrl-d", &delete_label));
         hints.push(action_hint("ctrl-k", "Kill"));
     }
     hints
@@ -1376,7 +1381,7 @@ const HELP_CATEGORIES: &[HelpCategory] = &[
     (
         "MUTATION",
         &[
-            ("Ctrl-D", "Delete with confirmation"),
+            ("Ctrl-D", "Delete marked / current"),
             ("Ctrl-K", "Kill immediately"),
             ("Ctrl-Z", "Toggle faults"),
         ],
@@ -1861,8 +1866,15 @@ fn describe_value_style(value: &str) -> Style {
 
 fn draw_delete_confirmation(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let prompt = match app.pending_delete.as_ref() {
-        Some(PendingDelete::Resource(target)) => {
+        Some(PendingDelete::Resources(targets)) if targets.len() == 1 => {
+            let target = &targets[0];
             format!("Delete {} {}?", target.kind.label(), target.name)
+        }
+        Some(PendingDelete::Resources(targets)) => {
+            let resource = targets
+                .first()
+                .map_or("resources", |target| target.kind.plural_name());
+            format!("Delete all {} selected {resource}?", targets.len())
         }
         Some(PendingDelete::Context { name }) => format!("Delete context {name}?"),
         None => "Delete resource?".to_owned(),
@@ -2600,6 +2612,32 @@ mod tests {
     }
 
     #[test]
+    fn delete_confirmation_identifies_the_full_marked_batch() {
+        let mut app = app_with_rendered_pod();
+        let target = crate::app::ResourceTarget {
+            kind: ResourceKind::Pods.into(),
+            namespace: Some("default".to_owned()),
+            name: "api-0".to_owned(),
+        };
+        app.pending_delete = Some(PendingDelete::Resources(vec![
+            target.clone(),
+            crate::app::ResourceTarget {
+                name: "api-1".to_owned(),
+                ..target
+            },
+        ]));
+        app.overlay = Overlay::ConfirmDelete;
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("batch delete terminal");
+
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw batch delete confirmation");
+        let rendered = rendered_lines(&terminal, 120).join("\n");
+        assert!(rendered.contains("Delete all 2 selected pods?"));
+    }
+
+    #[test]
     fn namespace_body_advertises_yaml_for_selected_resources() {
         let mut app = app_with_rendered_pod();
         app.overlay = Overlay::Namespaces;
@@ -2608,6 +2646,18 @@ mod tests {
             action_hints(&app)
                 .iter()
                 .any(|hint| hint.key == "y" && hint.label == "YAML")
+        );
+    }
+
+    #[test]
+    fn resource_header_reports_the_marked_delete_count() {
+        let mut app = app_with_rendered_pod();
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+
+        assert!(
+            action_hints(&app)
+                .iter()
+                .any(|hint| hint.key == "ctrl-d" && hint.label == "Delete (1)")
         );
     }
 

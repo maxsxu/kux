@@ -177,7 +177,7 @@ pub struct ContainerTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionIntent {
     Delete {
-        target: ResourceTarget,
+        targets: Vec<ResourceTarget>,
         immediate: bool,
     },
     DeleteContext {
@@ -211,7 +211,7 @@ pub enum AppCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingDelete {
-    Resource(ResourceTarget),
+    Resources(Vec<ResourceTarget>),
     Context { name: String },
 }
 
@@ -1250,10 +1250,12 @@ impl App {
                 self.pending_delete
                     .take()
                     .map_or(AppCommand::None, |target| match target {
-                        PendingDelete::Resource(target) => {
+                        PendingDelete::Resources(targets) => {
                             self.overlay = Overlay::None;
+                            self.marks.clear();
+                            self.mark_anchor = None;
                             AppCommand::Action(ActionIntent::Delete {
-                                target,
+                                targets,
                                 immediate: false,
                             })
                         }
@@ -2063,6 +2065,28 @@ impl App {
         })
     }
 
+    fn selected_or_marked_targets(&self) -> Vec<ResourceTarget> {
+        if !self.is_resource_view() {
+            return Vec::new();
+        }
+        let marked = self
+            .snapshot
+            .rows
+            .iter()
+            .filter(|row| self.marks.contains(&row.key))
+            .map(|row| ResourceTarget {
+                kind: self.kind.clone(),
+                namespace: (row.namespace.as_ref() != "-").then(|| row.namespace.to_string()),
+                name: row.name.to_string(),
+            })
+            .collect::<Vec<_>>();
+        if marked.is_empty() {
+            self.selected_target().into_iter().collect()
+        } else {
+            marked
+        }
+    }
+
     fn open_selected(&mut self) -> AppCommand {
         if self.is_container_view() {
             return self.container_log_action(false);
@@ -2211,10 +2235,11 @@ impl App {
         if self.read_only {
             return self.unsupported("Delete is disabled in read-only mode");
         }
-        let Some(target) = self.selected_target() else {
+        let targets = self.selected_or_marked_targets();
+        if targets.is_empty() {
             return AppCommand::None;
-        };
-        self.pending_delete = Some(PendingDelete::Resource(target));
+        }
+        self.pending_delete = Some(PendingDelete::Resources(targets));
         self.confirm_armed = false;
         self.overlay = Overlay::ConfirmDelete;
         AppCommand::None
@@ -2251,7 +2276,7 @@ impl App {
         }
         self.selected_target().map_or(AppCommand::None, |target| {
             AppCommand::Action(ActionIntent::Delete {
-                target,
+                targets: vec![target],
                 immediate: true,
             })
         })
@@ -3273,15 +3298,48 @@ mod tests {
             assert_eq!(
                 command,
                 AppCommand::Action(ActionIntent::Delete {
-                    target: ResourceTarget {
+                    targets: vec![ResourceTarget {
                         kind,
                         namespace: expected_namespace,
                         name: "selected".to_owned(),
-                    },
+                    }],
                     immediate: false,
                 })
             );
         }
+    }
+
+    #[test]
+    fn ctrl_d_deletes_every_marked_resource_after_one_confirmation() {
+        let mut app = app_with_rows();
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+
+        app.handle_key(control_d());
+        let Some(PendingDelete::Resources(targets)) = app.pending_delete.as_ref() else {
+            panic!("marked resources should be pending deletion");
+        };
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.name.as_str())
+                .collect::<Vec<_>>(),
+            ["api-0", "worker-0"]
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let command = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let AppCommand::Action(ActionIntent::Delete {
+            targets,
+            immediate: false,
+        }) = command
+        else {
+            panic!("confirmed batch delete should produce one delete action");
+        };
+        assert_eq!(targets.len(), 2);
+        assert!(app.marks.is_empty());
+        assert_eq!(app.overlay, Overlay::None);
     }
 
     #[test]

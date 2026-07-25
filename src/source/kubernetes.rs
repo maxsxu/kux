@@ -259,15 +259,8 @@ fn dynamic_api(
 
 async fn handle_action(client: Client, context: &str, action: ActionIntent) -> ActionResult {
     let result = match action {
-        ActionIntent::Delete { target, immediate } => {
-            delete_resource(client, &target, immediate).await.map(|()| {
-                ActionResult::Notice(format!(
-                    "{} {}/{}",
-                    if immediate { "Killed" } else { "Deleted" },
-                    target.namespace.as_deref().unwrap_or("cluster"),
-                    target.name
-                ))
-            })
+        ActionIntent::Delete { targets, immediate } => {
+            delete_resources(client, targets, immediate).await
         }
         ActionIntent::DeleteContext { name } => delete_context(context, &name).await,
         ActionIntent::Content { target, content } => {
@@ -282,6 +275,81 @@ async fn handle_action(client: Client, context: &str, action: ActionIntent) -> A
         }
     };
     result.unwrap_or_else(ActionResult::Error)
+}
+
+async fn delete_resources(
+    client: Client,
+    targets: Vec<ResourceTarget>,
+    immediate: bool,
+) -> Result<ActionResult, String> {
+    let Some(first) = targets.first() else {
+        return Err("No resources selected for deletion".to_owned());
+    };
+    let total = targets.len();
+    let resource = first.kind.plural_name().to_owned();
+    let first_identity = resource_identity(first);
+    let tasks = targets.into_iter().map(|target| {
+        let client = client.clone();
+        async move {
+            let identity = resource_identity(&target);
+            (identity, delete_resource(client, &target, immediate).await)
+        }
+    });
+    let results = futures::stream::iter(tasks)
+        .buffer_unordered(16)
+        .collect::<Vec<_>>()
+        .await;
+    let mut failures = results
+        .into_iter()
+        .filter_map(|(identity, result)| result.err().map(|error| (identity, error)))
+        .collect::<Vec<_>>();
+    failures.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    deletion_result(immediate, &resource, &first_identity, total, &failures)
+}
+
+fn deletion_result(
+    immediate: bool,
+    resource: &str,
+    first_identity: &str,
+    total: usize,
+    failures: &[(String, String)],
+) -> Result<ActionResult, String> {
+    let past_tense = if immediate { "Killed" } else { "Deleted" };
+    let action = if immediate { "kill" } else { "delete" };
+    if failures.is_empty() {
+        return Ok(ActionResult::Notice(if total == 1 {
+            format!("{past_tense} {first_identity}")
+        } else {
+            format!("{past_tense} all {total} {resource}")
+        }));
+    }
+
+    let succeeded = total.saturating_sub(failures.len());
+    let mut details = failures
+        .iter()
+        .take(3)
+        .map(|(identity, error)| format!("{identity}: {error}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    if failures.len() > 3 {
+        let _ = write!(details, "; and {} more", failures.len() - 3);
+    }
+    Err(if succeeded == 0 {
+        format!("Failed to {action} all {total} {resource}: {details}")
+    } else {
+        format!(
+            "{past_tense} {succeeded} of {total} {resource}; failed to {action} {}: {details}",
+            failures.len()
+        )
+    })
+}
+
+fn resource_identity(target: &ResourceTarget) -> String {
+    format!(
+        "{}/{}",
+        target.namespace.as_deref().unwrap_or("cluster"),
+        target.name
+    )
 }
 
 async fn delete_resource(
@@ -2714,6 +2782,24 @@ mod tests {
         assert_eq!(
             ensure_deletable(&target).expect_err("delete must be refused"),
             "widgets.example.io does not advertise delete support"
+        );
+    }
+
+    #[test]
+    fn summarizes_complete_and_partial_batch_deletes() {
+        assert_eq!(
+            deletion_result(false, "pods", "prod/api-0", 2, &[]),
+            Ok(ActionResult::Notice("Deleted all 2 pods".to_owned()))
+        );
+        assert_eq!(
+            deletion_result(
+                false,
+                "pods",
+                "prod/api-0",
+                3,
+                &[("prod/api-1".to_owned(), "forbidden".to_owned())],
+            ),
+            Err("Deleted 2 of 3 pods; failed to delete 1: prod/api-1: forbidden".to_owned())
         );
     }
 

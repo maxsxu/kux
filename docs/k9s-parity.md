@@ -57,7 +57,7 @@ K9s key and reports that its backend is pending, and **planned** is not yet expo
 | Copy YAML/toggle managed fields | `c`, `m` in YAML | Implemented; copy uses the visible variant |
 | Copy decoded Secret data | `c` in Secret data view | Implemented; copies the data-only body |
 | Wrap/timestamps/fullscreen | `w`, `t`, `f` in content view | Implemented UI toggles |
-| Delete resource or inactive context with Tab + Enter confirmation | `Ctrl-D` | Implemented; active/synthetic contexts and resources without delete capability remain protected |
+| Delete marked resources, current resource, or inactive context with Tab + Enter confirmation | `Ctrl-D` | Implemented; all marked resources are deleted as one bounded batch, while active/synthetic contexts and resources without delete capability remain protected |
 | Kill without confirmation | `Ctrl-K` | Implemented with zero grace period |
 | Pod shell/attach | `s`, `a` | Interaction; backend pending |
 | Edit any Kubernetes resource | `e` | Implemented through interactive `kubectl edit` with the active context and selected resource namespace; unavailable in read-only mode |
