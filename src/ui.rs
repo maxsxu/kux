@@ -910,21 +910,20 @@ fn draw_resources(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     } else {
         format!(" /{filter}")
     };
+    let visible_count = app.filtered.len();
     let title = match &app.list_mode {
         ListMode::Resources => format!(
             " {}({})[{}]{} ",
             app.kind.plural_name(),
             app.namespace_display(),
-            app.snapshot.rows.len(),
+            visible_count,
             filter_suffix
         ),
-        ListMode::Containers { namespace, pod } => format!(
-            " containers({namespace}/{pod})[{}]{} ",
-            app.snapshot.rows.len(),
-            filter_suffix
-        ),
+        ListMode::Containers { namespace, pod } => {
+            format!(" containers({namespace}/{pod})[{visible_count}]{filter_suffix} ")
+        }
         ListMode::Policy { title } => {
-            format!(" {title}[{}]{} ", app.snapshot.rows.len(), filter_suffix)
+            format!(" {title}[{visible_count}]{filter_suffix} ")
         }
     };
     let hitbox_widths = widths.clone();
@@ -2852,6 +2851,71 @@ mod tests {
             .position(|line| line.contains("pods(default)[0] /api"))
             .expect("resource title with filter");
         assert!(prompt_row < title_row);
+    }
+
+    #[test]
+    fn resource_title_count_tracks_live_and_accepted_filter_results() {
+        let mut app = App::new(
+            "demo",
+            None,
+            ResourceKind::Pods,
+            false,
+            vec!["demo".to_owned()],
+        );
+        app.apply_snapshot(ResourceSnapshot {
+            generation: app.generation,
+            kind: ResourceKind::Pods.into(),
+            rows: Arc::new(vec![
+                Arc::new(ResourceRow::new(
+                    "default",
+                    "api-0",
+                    "Running",
+                    "1/1",
+                    "0",
+                    app.now_unix - 60,
+                )),
+                Arc::new(ResourceRow::new(
+                    "default",
+                    "worker-0",
+                    "Running",
+                    "1/1",
+                    "0",
+                    app.now_unix - 60,
+                )),
+                Arc::new(ResourceRow::new(
+                    "default",
+                    "database-0",
+                    "Running",
+                    "1/1",
+                    "0",
+                    app.now_unix - 60,
+                )),
+            ]),
+            table_columns: Arc::from([]),
+            state: SourceState::Ready,
+            revision: 1,
+            emitted_at: Instant::now(),
+        });
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("filter count terminal");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for character in "api".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw live filter count");
+        let rendered = rendered_lines(&terminal, 100).join("\n");
+        assert!(rendered.contains("pods(all)[1] /api"));
+        assert!(!rendered.contains("pods(all)[3] /api"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw accepted filter count");
+        let rendered = rendered_lines(&terminal, 100).join("\n");
+        assert!(rendered.contains("pods(all)[1] /api"));
     }
 
     #[test]
