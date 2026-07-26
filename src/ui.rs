@@ -1411,11 +1411,14 @@ fn help_category_lines(categories: &[HelpCategory]) -> Vec<Line<'static>> {
     lines
 }
 
-fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_help(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let title = format!(" Help · {} ", app.kind.label());
     let block = notice_block(popup_block(&title).title_alignment(Alignment::Center), app);
     if area.width >= HELP_TWO_COLUMN_MIN_WIDTH {
         let inner = block.inner(area);
+        let left = help_category_lines(&HELP_CATEGORIES[..2]);
+        let right = help_category_lines(&HELP_CATEGORIES[2..]);
+        app.set_content_scroll_extent(left.len().max(right.len()), inner.height);
         frame.render_widget(block, area);
         let columns = Layout::horizontal([
             Constraint::Percentage(50),
@@ -1424,19 +1427,19 @@ fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ])
         .split(inner);
         frame.render_widget(
-            Paragraph::new(help_category_lines(&HELP_CATEGORIES[..2]))
-                .scroll((app.content_scroll, app.content_horizontal_scroll)),
+            Paragraph::new(left).scroll((app.content_scroll, app.content_horizontal_scroll)),
             columns[0],
         );
         frame.render_widget(
-            Paragraph::new(help_category_lines(&HELP_CATEGORIES[2..]))
-                .scroll((app.content_scroll, app.content_horizontal_scroll)),
+            Paragraph::new(right).scroll((app.content_scroll, app.content_horizontal_scroll)),
             columns[2],
         );
         return;
     }
 
     let lines = help_category_lines(HELP_CATEGORIES);
+    let inner_height = block.inner(area).height;
+    app.set_content_scroll_extent(lines.len(), inner_height);
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
@@ -1710,7 +1713,7 @@ fn draw_contexts(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     );
 }
 
-fn draw_details(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_details(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let Some(row) = app.details_row.as_ref() else {
         return;
     };
@@ -1734,18 +1737,18 @@ fn draw_details(frame: &mut Frame<'_>, app: &App, area: Rect) {
         format!(" /{}", app.body_filter())
     };
     let title = format!(" details({}/{}){filter} ", row.namespace, row.name);
+    let block = notice_block(popup_block(&title).title_alignment(Alignment::Center), app);
+    let inner_height = block.inner(area).height;
+    app.set_content_scroll_extent(lines.len(), inner_height);
     frame.render_widget(
         Paragraph::new(lines)
-            .block(notice_block(
-                popup_block(&title).title_alignment(Alignment::Center),
-                app,
-            ))
+            .block(block)
             .scroll((app.content_scroll, app.content_horizontal_scroll)),
         area,
     );
 }
 
-fn draw_content(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_content(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let body = app.active_content_body();
     let filtered = body
         .lines()
@@ -1766,18 +1769,31 @@ fn draw_content(frame: &mut Frame<'_>, app: &App, area: Rect) {
         format!(" /{}", app.body_filter())
     };
     let title = format!(" {}{filter} ", app.content_title);
+    let block = notice_block(popup_block(&title).title_alignment(Alignment::Center), app);
+    let inner = block.inner(area);
+    let wrap = app.ui.wrap();
+    let content_height = paragraph_content_height(&lines, inner.width, wrap);
+    app.set_content_scroll_extent(content_height, inner.height);
     let paragraph = Paragraph::new(lines)
-        .block(notice_block(
-            popup_block(&title).title_alignment(Alignment::Center),
-            app,
-        ))
+        .block(block)
         .scroll((app.content_scroll, app.content_horizontal_scroll));
-    let paragraph = if app.ui.wrap() {
+    let paragraph = if wrap {
         paragraph.wrap(Wrap { trim: false })
     } else {
         paragraph
     };
     frame.render_widget(paragraph, area);
+}
+
+fn paragraph_content_height(lines: &[Line<'_>], width: u16, wrap: bool) -> usize {
+    if !wrap {
+        return lines.len();
+    }
+    let width = usize::from(width.max(1));
+    lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(width))
+        .sum()
 }
 
 fn highlight_yaml(body: &str) -> Vec<Line<'static>> {
@@ -1913,10 +1929,10 @@ fn draw_delete_confirmation(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
-fn detail_line<'a>(label: &'a str, value: &'a str) -> Line<'a> {
+fn detail_line(label: &str, value: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("  {label:<12}"), Style::default().fg(MUTED)),
-        Span::raw(value),
+        Span::raw(value.to_owned()),
     ])
 }
 
@@ -3401,6 +3417,43 @@ mod tests {
         assert!(rendered.contains("╭ Filter"));
         assert!(rendered.contains("/▏"));
         assert!(rendered.contains("YAML(default/api-0)"));
+    }
+
+    #[test]
+    fn shift_g_reaches_the_last_line_in_yaml_view() {
+        let mut app = App::new(
+            "demo",
+            Some("default".to_owned()),
+            ResourceKind::Pods,
+            false,
+            vec!["demo".to_owned()],
+        );
+        let yaml = (0..100)
+            .map(|index| format!("key{index:03}: value"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.show_content(
+            "YAML(default/api-0)",
+            yaml,
+            None,
+            None,
+            None,
+            ContentKind::Yaml,
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        let backend = TestBackend::new(80, 14);
+        let mut terminal = Terminal::new(backend).expect("YAML terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw YAML top");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT));
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw YAML bottom");
+        let rendered = rendered_lines(&terminal, 80).join("\n");
+        assert!(app.content_scroll > 0);
+        assert!(rendered.contains("key099: value"));
     }
 
     #[test]

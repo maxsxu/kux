@@ -399,6 +399,7 @@ pub struct App {
     pub confirm_armed: bool,
     pub pending_delete: Option<PendingDelete>,
     pub read_only: bool,
+    content_max_scroll: u16,
     saved_resource_list: Option<SavedResourceList>,
     pending_containers: Option<ResourceTarget>,
     pending_policy: Option<ResourceTarget>,
@@ -490,6 +491,7 @@ impl App {
             confirm_armed: false,
             pending_delete: None,
             read_only,
+            content_max_scroll: 0,
             saved_resource_list: None,
             pending_containers: None,
             pending_policy: None,
@@ -688,6 +690,8 @@ impl App {
                 KeyCode::Char(number) if number.is_ascii_digit() => {
                     return self.switch_recent_namespace(number);
                 }
+                KeyCode::Char('[' | '-') => return self.navigate_history(-1),
+                KeyCode::Char(']') => return self.navigate_history(1),
                 _ => {}
             }
         }
@@ -765,8 +769,6 @@ impl App {
             KeyCode::Char(':') => self.start_input(InputMode::Command),
             KeyCode::Char('/') => self.start_input(InputMode::Filter),
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => self.escape_view(),
-            KeyCode::Char('[' | '-') => self.navigate_history(-1),
-            KeyCode::Char(']') => self.navigate_history(1),
             KeyCode::Enter | KeyCode::Right => self.open_selected(),
             KeyCode::Down | KeyCode::Char('j') => {
                 self.move_selection_down(1);
@@ -1370,16 +1372,25 @@ impl App {
     fn handle_body_navigation(&mut self, key: &KeyEvent) -> bool {
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => {
-                self.content_scroll = self.content_scroll.saturating_add(1);
+                self.content_scroll = self
+                    .content_scroll
+                    .saturating_add(1)
+                    .min(self.content_max_scroll);
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.content_scroll = self.content_scroll.saturating_sub(1);
             }
             KeyCode::PageDown => {
-                self.content_scroll = self.content_scroll.saturating_add(20);
+                self.content_scroll = self
+                    .content_scroll
+                    .saturating_add(20)
+                    .min(self.content_max_scroll);
             }
             KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.content_scroll = self.content_scroll.saturating_add(20);
+                self.content_scroll = self
+                    .content_scroll
+                    .saturating_add(20)
+                    .min(self.content_max_scroll);
             }
             KeyCode::PageUp => {
                 self.content_scroll = self.content_scroll.saturating_sub(20);
@@ -1389,6 +1400,9 @@ impl App {
             }
             KeyCode::Home | KeyCode::Char('g') => {
                 self.content_scroll = 0;
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                self.content_scroll = self.content_max_scroll;
             }
             KeyCode::Left | KeyCode::Char('h') => {
                 self.content_horizontal_scroll = self.content_horizontal_scroll.saturating_sub(1);
@@ -1404,6 +1418,17 @@ impl App {
     fn reset_body_scroll(&mut self) {
         self.content_scroll = 0;
         self.content_horizontal_scroll = 0;
+        self.content_max_scroll = 0;
+    }
+
+    pub(crate) fn set_content_scroll_extent(
+        &mut self,
+        content_height: usize,
+        viewport_height: u16,
+    ) {
+        let max_scroll = content_height.saturating_sub(usize::from(viewport_height));
+        self.content_max_scroll = u16::try_from(max_scroll).unwrap_or(u16::MAX);
+        self.content_scroll = self.content_scroll.min(self.content_max_scroll);
     }
 
     fn close_overlay_on(&mut self, key: KeyEvent) -> AppCommand {
@@ -2817,6 +2842,24 @@ mod tests {
             list.selected_row().map(|row| row.name.as_ref()),
             Some("api-0")
         );
+        for (key, expected) in [
+            (
+                KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT),
+                "worker-0",
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+                "api-0",
+            ),
+            (KeyEvent::new(KeyCode::End, KeyModifiers::NONE), "worker-0"),
+            (KeyEvent::new(KeyCode::Home, KeyModifiers::NONE), "api-0"),
+        ] {
+            list.handle_key(key);
+            assert_eq!(
+                list.selected_row().map(|row| row.name.as_ref()),
+                Some(expected)
+            );
+        }
         list.query = "api".to_owned();
         list.rebuild_filter(None);
         list.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
@@ -2852,6 +2895,19 @@ mod tests {
 
         let mut chooser = app_with_rows();
         chooser.open_aliases();
+        let visible = chooser.visible_resource_indices();
+        chooser.viewport_height = 1;
+        chooser.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT));
+        assert_eq!(
+            chooser.overlay_selected,
+            *visible.last().expect("last alias")
+        );
+        chooser.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(chooser.overlay_selected, visible[0]);
+        chooser.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert_eq!(chooser.overlay_selected, visible[1]);
+        chooser.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert_eq!(chooser.overlay_selected, visible[0]);
         assert!(matches!(
             chooser.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)),
             AppCommand::Request(_)
@@ -2865,16 +2921,37 @@ mod tests {
     #[test]
     fn vim_navigation_scrolls_every_text_body() {
         fn exercise(app: &mut App, label: &str) {
+            app.set_content_scroll_extent(65, 20);
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            assert_eq!(app.content_scroll, 1, "{label} handles Down");
+            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+            assert_eq!(app.content_scroll, 0, "{label} handles Up");
             app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
             assert_eq!(app.content_scroll, 1, "{label} scrolls down");
             app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
             assert_eq!(app.content_scroll, 0, "{label} scrolls up");
+            app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+            assert_eq!(app.content_scroll, 20, "{label} handles PageDown");
+            app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+            assert_eq!(app.content_scroll, 0, "{label} handles PageUp");
             app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
             assert_eq!(app.content_scroll, 20, "{label} moves one page down");
             app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
             assert_eq!(app.content_scroll, 0, "{label} moves one page up");
+            app.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT));
+            assert_eq!(app.content_scroll, 45, "{label} goes to the bottom");
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            assert_eq!(app.content_scroll, 45, "{label} stays at the bottom");
             app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
             assert_eq!(app.content_scroll, 0, "{label} goes to the top");
+            app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+            assert_eq!(app.content_scroll, 45, "{label} handles End");
+            app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+            assert_eq!(app.content_scroll, 0, "{label} handles Home");
+            app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+            assert_eq!(app.content_horizontal_scroll, 1, "{label} handles Right");
+            app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+            assert_eq!(app.content_horizontal_scroll, 0, "{label} handles Left");
             app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
             assert_eq!(app.content_horizontal_scroll, 1, "{label} scrolls right");
             app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
@@ -2900,6 +2977,45 @@ mod tests {
         details.details_row = details.selected_row().cloned();
         details.overlay = Overlay::Details;
         exercise(&mut details, "details");
+    }
+
+    #[test]
+    fn history_navigation_is_available_from_every_body_view() {
+        for overlay in [
+            Overlay::Aliases,
+            Overlay::Namespaces,
+            Overlay::Contexts,
+            Overlay::Help,
+            Overlay::Content,
+            Overlay::Details,
+        ] {
+            let mut app = app_with_rows();
+            app.request_view(
+                ViewState {
+                    context: "demo".to_owned(),
+                    kind: ResourceKind::Services.into(),
+                    namespace: None,
+                    field_selector: None,
+                },
+                true,
+            );
+            app.overlay = overlay;
+
+            assert!(matches!(
+                app.handle_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE)),
+                AppCommand::Request(ViewState { kind, .. })
+                    if kind.known_kind() == Some(ResourceKind::Pods)
+            ));
+            assert_eq!(app.overlay, Overlay::None);
+
+            app.overlay = overlay;
+            assert!(matches!(
+                app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE)),
+                AppCommand::Request(ViewState { kind, .. })
+                    if kind.known_kind() == Some(ResourceKind::Services)
+            ));
+            assert_eq!(app.overlay, Overlay::None);
+        }
     }
 
     #[test]
