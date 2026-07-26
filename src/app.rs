@@ -1553,14 +1553,15 @@ impl App {
                 } else {
                     None
                 };
+                let mut requested_filter = None;
                 if let Some(argument) = parts.next() {
                     if let Some(filter) = argument.strip_prefix('/') {
-                        filter.clone_into(&mut self.query);
+                        requested_filter = Some(filter.to_owned());
                     } else {
                         namespace = (argument != "all").then(|| argument.to_owned());
                     }
                 }
-                self.request_view(
+                let command = self.request_view(
                     ViewState {
                         context: self.context.clone(),
                         kind,
@@ -1568,7 +1569,12 @@ impl App {
                         field_selector: None,
                     },
                     true,
-                )
+                );
+                if let Some(filter) = requested_filter {
+                    self.query = filter;
+                    self.filter_error = None;
+                }
+                command
             }
         }
     }
@@ -1583,6 +1589,7 @@ impl App {
     }
 
     fn request_view(&mut self, view: ViewState, push_history: bool) -> AppCommand {
+        let resource_kind_changed = self.kind != view.kind;
         if push_history && self.current_view() != view {
             self.history.truncate(self.history_cursor + 1);
             self.history.push(view.clone());
@@ -1621,6 +1628,10 @@ impl App {
         self.pending_policy = None;
         self.details_row = None;
         self.body_query.clear();
+        if resource_kind_changed {
+            self.query.clear();
+            self.filter_error = None;
+        }
         self.filtered.clear();
         self.selected = 0;
         self.offset = 0;
@@ -3128,6 +3139,48 @@ mod tests {
                 field_selector: None,
             })
         );
+    }
+
+    #[test]
+    fn resource_command_clears_stale_filter_and_accepts_an_explicit_replacement() {
+        let mut app = app_with_rows();
+        type_input(&mut app, '/', "api");
+
+        type_input(&mut app, ':', "ns prod");
+        assert_eq!(app.query, "api", "namespace changes retain the filter");
+
+        assert!(matches!(
+            type_input(&mut app, ':', "svc"),
+            AppCommand::Request(ViewState { kind, .. })
+                if kind.known_kind() == Some(ResourceKind::Services)
+        ));
+        assert!(app.query.is_empty());
+
+        assert!(matches!(
+            type_input(&mut app, ':', "pods /worker"),
+            AppCommand::Request(ViewState { kind, .. })
+                if kind.known_kind() == Some(ResourceKind::Pods)
+        ));
+        assert_eq!(app.query, "worker");
+    }
+
+    #[test]
+    fn resource_chooser_clears_the_previous_resource_filter() {
+        let mut app = app_with_rows();
+        type_input(&mut app, '/', "api");
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        app.overlay_selected = app
+            .resource_options
+            .iter()
+            .position(|resource| resource.known_kind() == Some(ResourceKind::Services))
+            .expect("services resource option");
+
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppCommand::Request(ViewState { kind, .. })
+                if kind.known_kind() == Some(ResourceKind::Services)
+        ));
+        assert!(app.query.is_empty());
     }
 
     #[test]
