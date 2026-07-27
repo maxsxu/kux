@@ -7,7 +7,12 @@ use ratatui::{
 };
 
 use crate::{
-    app::{App, ColumnHitbox, ContentKind, InputMode, ListMode, Overlay, PendingDelete, SortField},
+    app::{
+        App, ColumnHitbox, ContentKind, DRAIN_CANCEL_FIELD, DRAIN_DELETE_EMPTYDIR_DATA_FIELD,
+        DRAIN_DISABLE_EVICTION_FIELD, DRAIN_FORCE_FIELD, DRAIN_GRACE_PERIOD_FIELD,
+        DRAIN_IGNORE_DAEMON_SETS_FIELD, DRAIN_OK_FIELD, DRAIN_TIMEOUT_FIELD, DrainDialog,
+        InputMode, ListMode, Overlay, PendingDelete, SortField,
+    },
     model::{ResourceKind, SourceState, format_age},
 };
 
@@ -1896,6 +1901,10 @@ fn describe_value_style(value: &str) -> Style {
 }
 
 fn draw_delete_confirmation(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    if let Some(PendingDelete::DrainNode(dialog)) = app.pending_delete.as_ref() {
+        draw_drain_confirmation(frame, app, dialog, area);
+        return;
+    }
     let (title, prompt) = match app.pending_delete.as_ref() {
         Some(PendingDelete::Resources(targets)) if targets.len() == 1 => {
             let target = &targets[0];
@@ -1916,10 +1925,7 @@ fn draw_delete_confirmation(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Some(PendingDelete::Context { name }) => {
             (" Confirm Delete ", format!("Delete context {name}?"))
         }
-        Some(PendingDelete::DrainNode { name }) => (
-            " Confirm Drain ",
-            format!("Drain Node {name}? Managed pods will be evicted."),
-        ),
+        Some(PendingDelete::DrainNode(_)) => unreachable!("drain dialog handled above"),
         None => (" Confirm Delete ", "Delete resource?".to_owned()),
     };
     let buttons = if app.confirm_armed {
@@ -1936,12 +1942,7 @@ fn draw_delete_confirmation(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Span::styled(" [ OK ] ", Style::default().fg(MUTED)),
         ])
     };
-    let popup_width = if matches!(app.pending_delete, Some(PendingDelete::DrainNode { .. })) {
-        76
-    } else {
-        60
-    };
-    let popup = centered_rect(popup_width, 9, area);
+    let popup = centered_rect(60, 9, area);
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(vec![
@@ -1959,6 +1960,105 @@ fn draw_delete_confirmation(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .block(popup_block(title).border_style(Style::default().fg(RED))),
         popup,
     );
+}
+
+fn draw_drain_confirmation(frame: &mut Frame<'_>, app: &App, dialog: &DrainDialog, area: Rect) {
+    let option = |field, label: &str, value: &str| {
+        drain_option_line(label, value, app.overlay_selected == field)
+    };
+    let cancel_style = drain_button_style(app.overlay_selected == DRAIN_CANCEL_FIELD);
+    let ok_style = drain_button_style(app.overlay_selected == DRAIN_OK_FIELD);
+    let popup = centered_rect(76, 18, area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("Drain {}?", dialog.name),
+                Style::default().fg(Color::White).bold(),
+            ))
+            .centered(),
+            Line::from(""),
+            option(
+                DRAIN_GRACE_PERIOD_FIELD,
+                "GracePeriod:",
+                &dialog.grace_period,
+            ),
+            option(DRAIN_TIMEOUT_FIELD, "Timeout:", &dialog.timeout),
+            option(
+                DRAIN_IGNORE_DAEMON_SETS_FIELD,
+                "Ignore DaemonSets:",
+                drain_checkbox(
+                    dialog
+                        .flags
+                        .contains(crate::app::NodeDrainFlags::IGNORE_DAEMON_SETS),
+                ),
+            ),
+            option(
+                DRAIN_DELETE_EMPTYDIR_DATA_FIELD,
+                "Delete EmptyDir Data:",
+                drain_checkbox(
+                    dialog
+                        .flags
+                        .contains(crate::app::NodeDrainFlags::DELETE_EMPTYDIR_DATA),
+                ),
+            ),
+            option(
+                DRAIN_FORCE_FIELD,
+                "Force:",
+                drain_checkbox(dialog.flags.contains(crate::app::NodeDrainFlags::FORCE)),
+            ),
+            option(
+                DRAIN_DISABLE_EVICTION_FIELD,
+                "Disable Eviction:",
+                drain_checkbox(
+                    dialog
+                        .flags
+                        .contains(crate::app::NodeDrainFlags::DISABLE_EVICTION),
+                ),
+            ),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Cancel  ", cancel_style),
+                Span::raw("        "),
+                Span::styled("   OK   ", ok_style),
+            ])
+            .centered(),
+            Line::from(""),
+            Line::from(Span::styled(
+                "↑/↓ fields · type values · Space toggles · Enter selects · Esc cancels",
+                Style::default().fg(MUTED),
+            ))
+            .centered(),
+        ])
+        .block(popup_block(" <Drain> ").border_style(Style::default().fg(BODY_BORDER))),
+        popup,
+    );
+}
+
+fn drain_option_line(label: &str, value: &str, selected: bool) -> Line<'static> {
+    let value_style = if selected {
+        Style::default().fg(Color::White).bg(SELECTED).bold()
+    } else {
+        Style::default().fg(CYAN)
+    };
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(format!("{label:<24}"), Style::default().fg(PINK).bold()),
+        Span::styled(format!(" {value} "), value_style),
+    ])
+}
+
+fn drain_checkbox(enabled: bool) -> &'static str {
+    if enabled { "[x]" } else { "[ ]" }
+}
+
+fn drain_button_style(selected: bool) -> Style {
+    if selected {
+        Style::default().fg(Color::White).bg(SELECTED).bold()
+    } else {
+        Style::default().fg(MUTED)
+    }
 }
 
 fn detail_line(label: &str, value: &str) -> Line<'static> {
@@ -2005,7 +2105,8 @@ fn status_style(status: &str) -> Style {
     } else if matches!(
         normalized.as_str(),
         "pending" | "progressing" | "unknown" | "scheduled" | "unschedulable"
-    ) {
+    ) || normalized.contains("schedulingdisabled")
+    {
         YELLOW
     } else if matches!(
         normalized.as_str(),
@@ -2688,9 +2789,9 @@ mod tests {
     #[test]
     fn node_drain_confirmation_explains_the_mutation() {
         let mut app = app_with_rendered_pod();
-        app.pending_delete = Some(PendingDelete::DrainNode {
-            name: "worker-0".to_owned(),
-        });
+        app.pending_delete = Some(PendingDelete::DrainNode(DrainDialog::new(
+            "worker-0".to_owned(),
+        )));
         app.overlay = Overlay::ConfirmDelete;
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).expect("node drain terminal");
@@ -2699,8 +2800,16 @@ mod tests {
             .draw(|frame| draw(frame, &mut app))
             .expect("draw node drain confirmation");
         let rendered = rendered_lines(&terminal, 120).join("\n");
-        assert!(rendered.contains("Confirm Drain"));
-        assert!(rendered.contains("Drain Node worker-0? Managed pods will be evicted."));
+        assert!(rendered.contains("<Drain>"));
+        assert!(rendered.contains("Drain worker-0?"));
+        assert!(rendered.contains("GracePeriod:"));
+        assert!(rendered.contains("-1"));
+        assert!(rendered.contains("Timeout:"));
+        assert!(rendered.contains("5s"));
+        assert!(rendered.contains("Ignore DaemonSets:"));
+        assert!(rendered.contains("Delete EmptyDir Data:"));
+        assert!(rendered.contains("Force:"));
+        assert!(rendered.contains("Disable Eviction:"));
     }
 
     #[test]
@@ -3697,6 +3806,8 @@ mod tests {
         assert_eq!(readiness_style("-").fg, Some(MUTED));
         assert_eq!(status_style("KubernetesReady").fg, Some(GREEN));
         assert_eq!(status_style("NotReady").fg, Some(RED));
+        assert_eq!(status_style("NotReady,SchedulingDisabled").fg, Some(RED));
+        assert_eq!(status_style("Ready,SchedulingDisabled").fg, Some(YELLOW));
         assert_eq!(status_style("Scheduled").fg, Some(YELLOW));
         assert_eq!(age_color(30 * 60), GREEN);
         assert_eq!(age_color(12 * 60 * 60), CYAN);

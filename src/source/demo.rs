@@ -78,7 +78,7 @@ fn demo_action(action: ActionIntent) -> ActionResult {
         ActionIntent::DeleteContext { name } => ActionResult::Error(format!(
             "Context deletion is unavailable in demo mode: {name}"
         )),
-        ActionIntent::DrainNode { name } => {
+        ActionIntent::DrainNode { name, .. } => {
             ActionResult::Notice(format!("Drained demo node {name}"))
         }
         ActionIntent::Content { target, content } => demo_content(&target, content),
@@ -269,7 +269,9 @@ fn build_rows(item_count: usize, request: &WatchRequest) -> Vec<Arc<ResourceRow>
         };
         let (status, ready) = if known_kind == Some(ResourceKind::Nodes) {
             if index % 101 == 0 {
-                ("NotReady", "worker")
+                ("NotReady,SchedulingDisabled", "worker")
+            } else if index % 17 == 0 {
+                ("Ready,SchedulingDisabled", "worker")
             } else {
                 ("Ready", "worker")
             }

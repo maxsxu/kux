@@ -19,7 +19,10 @@ use k8s_openapi::api::{
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, Time};
 use kube::{
     Api, Client, Config, Resource, ResourceExt,
-    api::{DeleteParams, EvictParams, ListParams, LogParams, Patch, PatchParams, WatchParams},
+    api::{
+        DeleteParams, EvictParams, ListParams, LogParams, Patch, PatchParams, Preconditions,
+        WatchParams,
+    },
     config::KubeConfigOptions,
     core::{ApiResource, DynamicObject, GroupVersionKind, Request, WatchEvent},
     runtime::{WatchStreamExt, watcher},
@@ -32,7 +35,10 @@ use tokio::{
 };
 
 use crate::{
-    app::{ActionIntent, ContainerTarget, ContentKind, ResourceTarget},
+    app::{
+        ActionIntent, ContainerTarget, ContentKind, NodeDrainFlags, NodeDrainOptions,
+        ResourceTarget,
+    },
     model::{
         ChildResourceData, ContainerData, NamespaceInfo, NodeData, OwnerReferenceData, PodData,
         PolicyData, ResourceData, ResourceDescriptor, ResourceKind, ResourceOperations,
@@ -277,7 +283,7 @@ async fn handle_action(client: Client, context: &str, action: ActionIntent) -> A
         ActionIntent::AuthorizationPolicy { target } => {
             load_authorization_policy(client, target).await
         }
-        ActionIntent::DrainNode { name } => drain_node(client, &name).await,
+        ActionIntent::DrainNode { name, options } => drain_node(client, &name, options).await,
     };
     result.unwrap_or_else(ActionResult::Error)
 }
@@ -316,16 +322,36 @@ async fn delete_resources(
 struct DrainPod {
     namespace: String,
     name: String,
+    uid: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PodDrainDisposition {
-    Evict(DrainPod),
+    Remove(DrainPod),
     Ignore,
     Block(String),
 }
 
-async fn drain_node(client: Client, node_name: &str) -> Result<ActionResult, String> {
+async fn drain_node(
+    client: Client,
+    node_name: &str,
+    options: NodeDrainOptions,
+) -> Result<ActionResult, String> {
+    let timeout = options.timeout;
+    match tokio::time::timeout(timeout, drain_node_with_options(client, node_name, options)).await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "Drain of node {node_name} timed out after {}; the node may be cordoned and pods may still be terminating or blocked by a PodDisruptionBudget",
+            format_duration(timeout)
+        )),
+    }
+}
+
+async fn drain_node_with_options(
+    client: Client,
+    node_name: &str,
+    options: NodeDrainOptions,
+) -> Result<ActionResult, String> {
     let pods = Api::<Pod>::all(client.clone())
         .list(&ListParams::default().fields(&format!("spec.nodeName={node_name}")))
         .await
@@ -334,8 +360,8 @@ async fn drain_node(client: Client, node_name: &str) -> Result<ActionResult, Str
     let mut ignored = 0_usize;
     let mut blockers = Vec::new();
     for pod in &pods.items {
-        match pod_drain_disposition(pod) {
-            PodDrainDisposition::Evict(target) => evictable.push(target),
+        match pod_drain_disposition(pod, &options) {
+            PodDrainDisposition::Remove(target) => evictable.push(target),
             PodDrainDisposition::Ignore => ignored += 1,
             PodDrainDisposition::Block(identity) => blockers.push(identity),
         }
@@ -343,7 +369,7 @@ async fn drain_node(client: Client, node_name: &str) -> Result<ActionResult, Str
     if !blockers.is_empty() {
         blockers.sort_unstable();
         return Err(format!(
-            "Cannot drain node {node_name}: unmanaged pods would not be recreated: {}",
+            "Cannot drain node {node_name}: {}",
             summarize_identities(&blockers)
         ));
     }
@@ -358,17 +384,12 @@ async fn drain_node(client: Client, node_name: &str) -> Result<ActionResult, Str
         .map_err(|error| format!("Unable to cordon node {node_name}: {error}"))?;
 
     let total = evictable.len();
-    let tasks = evictable.into_iter().map(|target| {
+    let tasks = evictable.iter().cloned().map(|target| {
         let client = client.clone();
+        let options = options.clone();
         async move {
             let identity = format!("{}/{}", target.namespace, target.name);
-            let api = Api::<Pod>::namespaced(client, &target.namespace);
-            let result = api.evict(&target.name, &EvictParams::default()).await;
-            let result = match result {
-                Ok(_) => Ok(()),
-                Err(kube::Error::Api(status)) if status.code == 404 => Ok(()),
-                Err(error) => Err(error.to_string()),
-            };
+            let result = remove_drain_pod(client, &target, &options).await;
             (identity, result)
         }
     });
@@ -380,10 +401,85 @@ async fn drain_node(client: Client, node_name: &str) -> Result<ActionResult, Str
         .collect::<Vec<_>>()
         .await;
     failures.sort_unstable();
-    drain_result(node_name, total, ignored, &failures)
+    if !failures.is_empty() {
+        return drain_result(node_name, total, ignored, &failures);
+    }
+    wait_for_drain_targets(&client, node_name, &evictable).await?;
+    drain_result(node_name, total, ignored, &[])
 }
 
-fn pod_drain_disposition(pod: &Pod) -> PodDrainDisposition {
+async fn remove_drain_pod(
+    client: Client,
+    target: &DrainPod,
+    options: &NodeDrainOptions,
+) -> Result<(), String> {
+    let api = Api::<Pod>::namespaced(client, &target.namespace);
+    let delete_params = drain_delete_params(target, options);
+    if options.flags.contains(NodeDrainFlags::DISABLE_EVICTION) {
+        return match api.delete(&target.name, &delete_params).await {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(status)) if status.code == 404 => Ok(()),
+            Err(error) => Err(error.to_string()),
+        };
+    }
+    let eviction_params = EvictParams {
+        delete_options: Some(delete_params),
+        ..EvictParams::default()
+    };
+    loop {
+        match api.evict(&target.name, &eviction_params).await {
+            Ok(_) => return Ok(()),
+            Err(kube::Error::Api(status)) if status.code == 404 => return Ok(()),
+            Err(kube::Error::Api(status)) if status.code == 429 => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
+fn drain_delete_params(target: &DrainPod, options: &NodeDrainOptions) -> DeleteParams {
+    DeleteParams {
+        grace_period_seconds: options.grace_period_seconds,
+        preconditions: target.uid.as_ref().map(|uid| Preconditions {
+            uid: Some(uid.clone()),
+            ..Preconditions::default()
+        }),
+        ..DeleteParams::default()
+    }
+}
+
+async fn wait_for_drain_targets(
+    client: &Client,
+    node_name: &str,
+    targets: &[DrainPod],
+) -> Result<(), String> {
+    let targets = targets
+        .iter()
+        .map(|target| (target.namespace.clone(), target.name.clone()))
+        .collect::<BTreeSet<_>>();
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let pods = Api::<Pod>::all(client.clone());
+    loop {
+        let assigned = pods
+            .list(&ListParams::default().fields(&format!("spec.nodeName={node_name}")))
+            .await
+            .map_err(|error| format!("Unable to verify drain of node {node_name}: {error}"))?;
+        let remaining = assigned.items.iter().any(|pod| {
+            pod.namespace()
+                .map(|namespace| (namespace, pod.name_any()))
+                .is_some_and(|identity| targets.contains(&identity))
+        });
+        if !remaining {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+fn pod_drain_disposition(pod: &Pod, options: &NodeDrainOptions) -> PodDrainDisposition {
     let identity = format!(
         "{}/{}",
         pod.namespace().as_deref().unwrap_or("<unknown>"),
@@ -404,22 +500,39 @@ fn pod_drain_disposition(pod: &Pod) -> PodDrainDisposition {
         .as_ref()
         .and_then(|owners| owners.iter().find(|owner| owner.controller == Some(true)));
     if controller.is_some_and(|owner| owner.kind == "DaemonSet") {
-        return PodDrainDisposition::Ignore;
+        return if options.flags.contains(NodeDrainFlags::IGNORE_DAEMON_SETS) {
+            PodDrainDisposition::Ignore
+        } else {
+            PodDrainDisposition::Block(format!(
+                "{identity} is managed by a DaemonSet; enable Ignore DaemonSets"
+            ))
+        };
+    }
+    let uses_emptydir = pod
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.volumes.as_ref())
+        .is_some_and(|volumes| volumes.iter().any(|volume| volume.empty_dir.is_some()));
+    if uses_emptydir && !options.flags.contains(NodeDrainFlags::DELETE_EMPTYDIR_DATA) {
+        return PodDrainDisposition::Block(format!(
+            "{identity} uses emptyDir; enable Delete EmptyDir Data"
+        ));
     }
     let terminal = pod
         .status
         .as_ref()
         .and_then(|status| status.phase.as_deref())
         .is_some_and(|phase| matches!(phase, "Succeeded" | "Failed"));
-    if controller.is_none() && !terminal {
-        return PodDrainDisposition::Block(identity);
+    if controller.is_none() && !terminal && !options.flags.contains(NodeDrainFlags::FORCE) {
+        return PodDrainDisposition::Block(format!("{identity} is unmanaged; enable Force"));
     }
     let Some(namespace) = pod.namespace() else {
         return PodDrainDisposition::Block(identity);
     };
-    PodDrainDisposition::Evict(DrainPod {
+    PodDrainDisposition::Remove(DrainPod {
         namespace,
         name: pod.name_any(),
+        uid: pod.meta().uid.clone(),
     })
 }
 
@@ -432,7 +545,7 @@ fn drain_result(
     if !failures.is_empty() {
         let accepted = total.saturating_sub(failures.len());
         return Err(format!(
-            "Node {node_name} was cordoned; eviction accepted for {accepted} of {total} pods; failed: {}",
+            "Node {node_name} was cordoned; removal started for {accepted} of {total} pods; failed: {}",
             summarize_identities(failures)
         ));
     }
@@ -442,8 +555,16 @@ fn drain_result(
         format!("; skipped {ignored} DaemonSet, static, or terminating pods")
     };
     Ok(ActionResult::Notice(format!(
-        "Drained node {node_name}: cordoned and eviction accepted for {total} pods{ignored_suffix}"
+        "Drained node {node_name}: cordoned and removed {total} pods{ignored_suffix}"
     )))
+}
+
+fn format_duration(duration: Duration) -> String {
+    if duration.subsec_millis() == 0 {
+        format!("{}s", duration.as_secs())
+    } else {
+        format!("{}ms", duration.as_millis())
+    }
 }
 
 fn summarize_identities(identities: &[String]) -> String {
@@ -2803,7 +2924,7 @@ fn dynamic_ready(value: &serde_json::Value) -> Option<String> {
 }
 
 fn node_row(node: &Node) -> ResourceRow {
-    let is_ready = node
+    let readiness = node
         .status
         .as_ref()
         .and_then(|status| status.conditions.as_ref())
@@ -2812,7 +2933,11 @@ fn node_row(node: &Node) -> ResourceRow {
                 .iter()
                 .find(|condition| condition.type_ == "Ready")
         })
-        .is_some_and(|condition| condition.status == "True");
+        .map_or("Unknown", |condition| match condition.status.as_str() {
+            "True" => "Ready",
+            "False" => "NotReady",
+            _ => "Unknown",
+        });
     let role = node
         .metadata
         .labels
@@ -2872,18 +2997,16 @@ fn node_row(node: &Node) -> ResourceRow {
         .as_ref()
         .and_then(|spec| spec.unschedulable)
         .unwrap_or(false);
+    let status = if unschedulable {
+        format!("{readiness},SchedulingDisabled")
+    } else {
+        readiness.to_owned()
+    };
     resource_row(
         node,
         "-".to_owned(),
         node.name_any(),
-        if unschedulable {
-            "Unschedulable"
-        } else if is_ready {
-            "Ready"
-        } else {
-            "NotReady"
-        }
-        .to_owned(),
+        status,
         role.to_owned(),
         version.clone(),
     )
@@ -3084,6 +3207,10 @@ mod tests {
 
     use super::*;
 
+    fn default_drain_options() -> NodeDrainOptions {
+        NodeDrainOptions::default()
+    }
+
     #[test]
     fn maps_namespace_status_and_creation_time() {
         let namespace = Namespace {
@@ -3108,8 +3235,8 @@ mod tests {
     }
 
     #[test]
-    fn node_status_reports_unschedulable_before_readiness() {
-        let node: Node = serde_json::from_value(serde_json::json!({
+    fn node_status_combines_readiness_and_scheduling_state() {
+        let mut node: Node = serde_json::from_value(serde_json::json!({
             "apiVersion": "v1",
             "kind": "Node",
             "metadata": { "name": "worker-0" },
@@ -3139,7 +3266,17 @@ mod tests {
         }))
         .expect("valid Node");
 
-        assert_eq!(node_row(&node).status.as_ref(), "Unschedulable");
+        assert_eq!(node_row(&node).status.as_ref(), "Ready,SchedulingDisabled");
+        node.status
+            .as_mut()
+            .and_then(|status| status.conditions.as_mut())
+            .and_then(|conditions| conditions.first_mut())
+            .expect("Ready condition")
+            .status = "False".to_owned();
+        assert_eq!(
+            node_row(&node).status.as_ref(),
+            "NotReady,SchedulingDisabled"
+        );
     }
 
     #[test]
@@ -3170,13 +3307,30 @@ mod tests {
         }))
         .expect("valid unmanaged Pod");
 
+        let options = default_drain_options();
         assert_eq!(
-            pod_drain_disposition(&daemon_set_pod),
+            pod_drain_disposition(&daemon_set_pod, &options),
+            PodDrainDisposition::Block(
+                "system/agent-1 is managed by a DaemonSet; enable Ignore DaemonSets".to_owned()
+            )
+        );
+        assert_eq!(
+            pod_drain_disposition(&unmanaged_pod, &options),
+            PodDrainDisposition::Block("default/debug is unmanaged; enable Force".to_owned())
+        );
+        let mut permissive = options;
+        permissive.flags = NodeDrainFlags::IGNORE_DAEMON_SETS | NodeDrainFlags::FORCE;
+        assert_eq!(
+            pod_drain_disposition(&daemon_set_pod, &permissive),
             PodDrainDisposition::Ignore
         );
         assert_eq!(
-            pod_drain_disposition(&unmanaged_pod),
-            PodDrainDisposition::Block("default/debug".to_owned())
+            pod_drain_disposition(&unmanaged_pod, &permissive),
+            PodDrainDisposition::Remove(DrainPod {
+                namespace: "default".to_owned(),
+                name: "debug".to_owned(),
+                uid: None,
+            })
         );
     }
 
@@ -3209,18 +3363,82 @@ mod tests {
         .expect("valid completed Pod");
 
         assert_eq!(
-            pod_drain_disposition(&managed_pod),
-            PodDrainDisposition::Evict(DrainPod {
+            pod_drain_disposition(&managed_pod, &default_drain_options()),
+            PodDrainDisposition::Remove(DrainPod {
                 namespace: "prod".to_owned(),
-                name: "api-7d9-x2".to_owned()
+                name: "api-7d9-x2".to_owned(),
+                uid: None,
             })
         );
         assert_eq!(
-            pod_drain_disposition(&completed_pod),
-            PodDrainDisposition::Evict(DrainPod {
+            pod_drain_disposition(&completed_pod, &default_drain_options()),
+            PodDrainDisposition::Remove(DrainPod {
                 namespace: "jobs".to_owned(),
-                name: "done".to_owned()
+                name: "done".to_owned(),
+                uid: None,
             })
+        );
+    }
+
+    #[test]
+    fn drain_plan_requires_explicit_emptydir_data_deletion() {
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "cache-0",
+                "namespace": "prod",
+                "uid": "cache-uid",
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "StatefulSet",
+                    "name": "cache",
+                    "uid": "stateful-set-uid",
+                    "controller": true
+                }]
+            },
+            "spec": {
+                "containers": [],
+                "volumes": [{ "name": "cache", "emptyDir": {} }]
+            }
+        }))
+        .expect("valid emptyDir Pod");
+        let mut options = default_drain_options();
+
+        assert_eq!(
+            pod_drain_disposition(&pod, &options),
+            PodDrainDisposition::Block(
+                "prod/cache-0 uses emptyDir; enable Delete EmptyDir Data".to_owned()
+            )
+        );
+        options.flags = NodeDrainFlags::DELETE_EMPTYDIR_DATA;
+        assert_eq!(
+            pod_drain_disposition(&pod, &options),
+            PodDrainDisposition::Remove(DrainPod {
+                namespace: "prod".to_owned(),
+                name: "cache-0".to_owned(),
+                uid: Some("cache-uid".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn drain_delete_parameters_include_grace_period_and_uid_precondition() {
+        let target = DrainPod {
+            namespace: "prod".to_owned(),
+            name: "api-0".to_owned(),
+            uid: Some("pod-uid".to_owned()),
+        };
+        let mut options = default_drain_options();
+        options.grace_period_seconds = Some(7);
+
+        let params = drain_delete_params(&target, &options);
+        assert_eq!(params.grace_period_seconds, Some(7));
+        assert_eq!(
+            params
+                .preconditions
+                .and_then(|preconditions| preconditions.uid),
+            Some("pod-uid".to_owned())
         );
     }
 
@@ -3233,7 +3451,7 @@ mod tests {
                 2,
                 &["prod/api-1: disruption budget".to_owned()]
             ),
-            Err("Node worker-0 was cordoned; eviction accepted for 2 of 3 pods; failed: prod/api-1: disruption budget".to_owned())
+            Err("Node worker-0 was cordoned; removal started for 2 of 3 pods; failed: prod/api-1: disruption budget".to_owned())
         );
     }
 

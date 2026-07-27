@@ -155,7 +155,7 @@ The header always shows the actions available in the current view. These are the
 | Left-click a column | Sort; click again to reverse |
 | `Ctrl-R` | Restart the active watch |
 | `Ctrl-D` | Delete all marked resources, the current resource when none are marked, or an inactive context—with confirmation |
-| `r` on Nodes | Confirm, cordon, and drain the selected node |
+| `r` on Nodes | Configure, confirm, cordon, and drain the selected node |
 | `Ctrl-L`, `Ctrl-E`, `Ctrl-W` | Toggle logo, header, and wide columns |
 | `:q`, `Ctrl-C` | Quit |
 
@@ -172,8 +172,12 @@ Press `?` for the categorized keymap in the body. The full compatibility surface
   mutation paths.
 - `Ctrl-D` uses a guarded confirmation, batches all marked resources, and refuses the active
   context; `Ctrl-K` intentionally requests zero-grace deletion of the current resource.
-- Node drain refuses unmanaged pods before changing the node, skips DaemonSet and static mirror
-  pods, cordons the node, and uses the eviction API so PodDisruptionBudgets remain enforced.
+- Node status combines readiness and scheduling state, for example `Ready` or
+  `NotReady,SchedulingDisabled`.
+- Node drain exposes grace period (`-1` keeps the Kubernetes default), timeout, Ignore DaemonSets,
+  Delete EmptyDir Data, Force, and Disable Eviction options. Static mirror pods are always skipped;
+  the default checks block DaemonSet, EmptyDir, and unmanaged pods before cordoning. Evictions honor
+  PodDisruptionBudgets unless Disable Eviction is selected.
 - `kubectl` is required for describe views, interactive resource editing, and kubeconfig context
   deletion.
 - The Metrics API is optional; Pod and Node usage columns remain unavailable when it is absent.

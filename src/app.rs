@@ -2,7 +2,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashSet},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -200,7 +200,137 @@ pub enum ActionIntent {
     },
     DrainNode {
         name: String,
+        options: NodeDrainOptions,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeDrainOptions {
+    pub grace_period_seconds: Option<u32>,
+    pub timeout: Duration,
+    pub flags: NodeDrainFlags,
+}
+
+impl Default for NodeDrainOptions {
+    fn default() -> Self {
+        Self {
+            grace_period_seconds: None,
+            timeout: Duration::from_secs(5),
+            flags: NodeDrainFlags::NONE,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NodeDrainFlags(u8);
+
+impl NodeDrainFlags {
+    pub const NONE: Self = Self(0);
+    pub const IGNORE_DAEMON_SETS: Self = Self(1 << 0);
+    pub const DELETE_EMPTYDIR_DATA: Self = Self(1 << 1);
+    pub const FORCE: Self = Self(1 << 2);
+    pub const DISABLE_EVICTION: Self = Self(1 << 3);
+    pub const ALL: Self = Self(
+        Self::IGNORE_DAEMON_SETS.0
+            | Self::DELETE_EMPTYDIR_DATA.0
+            | Self::FORCE.0
+            | Self::DISABLE_EVICTION.0,
+    );
+
+    #[must_use]
+    pub const fn contains(self, flag: Self) -> bool {
+        self.0 & flag.0 != 0
+    }
+
+    fn toggle(&mut self, flag: Self) {
+        self.0 ^= flag.0;
+    }
+}
+
+impl std::ops::BitOr for NodeDrainFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainDialog {
+    pub name: String,
+    pub grace_period: String,
+    pub timeout: String,
+    pub flags: NodeDrainFlags,
+}
+
+pub const DRAIN_GRACE_PERIOD_FIELD: usize = 0;
+pub const DRAIN_TIMEOUT_FIELD: usize = 1;
+pub const DRAIN_IGNORE_DAEMON_SETS_FIELD: usize = 2;
+pub const DRAIN_DELETE_EMPTYDIR_DATA_FIELD: usize = 3;
+pub const DRAIN_FORCE_FIELD: usize = 4;
+pub const DRAIN_DISABLE_EVICTION_FIELD: usize = 5;
+pub const DRAIN_CANCEL_FIELD: usize = 6;
+pub const DRAIN_OK_FIELD: usize = 7;
+const DRAIN_FIELD_COUNT: usize = 8;
+
+impl DrainDialog {
+    pub(crate) fn new(name: String) -> Self {
+        Self {
+            name,
+            grace_period: "-1".to_owned(),
+            timeout: "5s".to_owned(),
+            flags: NodeDrainFlags::NONE,
+        }
+    }
+
+    fn options(&self) -> Result<NodeDrainOptions, String> {
+        let grace_period = self
+            .grace_period
+            .parse::<i64>()
+            .map_err(|_| "GracePeriod must be -1 or a non-negative number of seconds".to_owned())?;
+        if grace_period < -1 || grace_period > i64::from(u32::MAX) {
+            return Err("GracePeriod must be -1 or a non-negative number of seconds".to_owned());
+        }
+        let grace_period_seconds = (grace_period >= 0)
+            .then(|| u32::try_from(grace_period).expect("validated grace period"));
+        let timeout = parse_drain_duration(&self.timeout)?;
+        Ok(NodeDrainOptions {
+            grace_period_seconds,
+            timeout,
+            flags: self.flags,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainValueEditState {
+    Pristine,
+    Editing,
+}
+
+fn parse_drain_duration(value: &str) -> Result<Duration, String> {
+    let value = value.trim();
+    let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
+        (number, 1_u64)
+    } else if let Some(number) = value.strip_suffix('s') {
+        (number, 1_000)
+    } else if let Some(number) = value.strip_suffix('m') {
+        (number, 60_000)
+    } else if let Some(number) = value.strip_suffix('h') {
+        (number, 3_600_000)
+    } else {
+        return Err("Timeout must use ms, s, m, or h, for example 5s".to_owned());
+    };
+    let amount = number
+        .parse::<u64>()
+        .map_err(|_| "Timeout must use ms, s, m, or h, for example 5s".to_owned())?;
+    let millis = amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| "Timeout is too large".to_owned())?;
+    if millis == 0 {
+        return Err("Timeout must be greater than zero".to_owned());
+    }
+    Ok(Duration::from_millis(millis))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,7 +347,7 @@ pub enum AppCommand {
 pub enum PendingDelete {
     Resources(Vec<ResourceTarget>),
     Context { name: String },
-    DrainNode { name: String },
+    DrainNode(DrainDialog),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -414,6 +544,7 @@ pub struct App {
     completion_seed: Option<String>,
     completion_index: usize,
     input_before_edit: String,
+    drain_value_edit_state: DrainValueEditState,
 }
 
 impl App {
@@ -508,6 +639,7 @@ impl App {
             completion_seed: None,
             completion_index: 0,
             input_before_edit: String::new(),
+            drain_value_edit_state: DrainValueEditState::Pristine,
         }
     }
 
@@ -1245,6 +1377,9 @@ impl App {
     }
 
     fn handle_confirm_overlay(&mut self, key: KeyEvent) -> AppCommand {
+        if matches!(self.pending_delete, Some(PendingDelete::DrainNode(_))) {
+            return self.handle_drain_confirmation(key);
+        }
         match key.code {
             KeyCode::Left | KeyCode::Char('h') => {
                 self.confirm_armed = false;
@@ -1276,10 +1411,7 @@ impl App {
                             self.overlay = Overlay::Contexts;
                             AppCommand::Action(ActionIntent::DeleteContext { name })
                         }
-                        PendingDelete::DrainNode { name } => {
-                            self.overlay = Overlay::None;
-                            AppCommand::Action(ActionIntent::DrainNode { name })
-                        }
+                        PendingDelete::DrainNode(_) => AppCommand::None,
                     })
             }
             KeyCode::Esc | KeyCode::Char('q' | '?') => {
@@ -1297,6 +1429,166 @@ impl App {
             }
             _ => AppCommand::None,
         }
+    }
+
+    fn handle_drain_confirmation(&mut self, key: KeyEvent) -> AppCommand {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q' | '?') => self.cancel_drain_confirmation(),
+            KeyCode::Tab | KeyCode::Down | KeyCode::Right => {
+                self.move_drain_field(1);
+                AppCommand::None
+            }
+            KeyCode::BackTab | KeyCode::Up | KeyCode::Left => {
+                self.move_drain_field(-1);
+                AppCommand::None
+            }
+            KeyCode::Backspace
+                if matches!(
+                    self.overlay_selected,
+                    DRAIN_GRACE_PERIOD_FIELD | DRAIN_TIMEOUT_FIELD
+                ) =>
+            {
+                let field = self.overlay_selected;
+                if let Some(dialog) = self.drain_dialog_mut() {
+                    if field == DRAIN_GRACE_PERIOD_FIELD {
+                        dialog.grace_period.pop();
+                    } else {
+                        dialog.timeout.pop();
+                    }
+                }
+                self.drain_value_edit_state = DrainValueEditState::Editing;
+                self.notice = None;
+                AppCommand::None
+            }
+            KeyCode::Char(' ') if self.toggle_selected_drain_option() => AppCommand::None,
+            KeyCode::Enter => self.activate_selected_drain_field(),
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && self.edit_selected_drain_value(character) =>
+            {
+                AppCommand::None
+            }
+            _ => AppCommand::None,
+        }
+    }
+
+    fn move_drain_field(&mut self, direction: isize) {
+        self.overlay_selected = if direction < 0 {
+            self.overlay_selected
+                .checked_sub(1)
+                .unwrap_or(DRAIN_FIELD_COUNT - 1)
+        } else {
+            (self.overlay_selected + 1) % DRAIN_FIELD_COUNT
+        };
+        self.confirm_armed = self.overlay_selected == DRAIN_OK_FIELD;
+        self.drain_value_edit_state = DrainValueEditState::Pristine;
+        self.notice = None;
+    }
+
+    fn drain_dialog_mut(&mut self) -> Option<&mut DrainDialog> {
+        match self.pending_delete.as_mut() {
+            Some(PendingDelete::DrainNode(dialog)) => Some(dialog),
+            _ => None,
+        }
+    }
+
+    fn edit_selected_drain_value(&mut self, character: char) -> bool {
+        let field = self.overlay_selected;
+        let accepted = match field {
+            DRAIN_GRACE_PERIOD_FIELD => character.is_ascii_digit() || character == '-',
+            DRAIN_TIMEOUT_FIELD => {
+                character.is_ascii_digit() || matches!(character, 'm' | 's' | 'h')
+            }
+            _ => false,
+        };
+        if !accepted {
+            return false;
+        }
+        let replace = self.drain_value_edit_state == DrainValueEditState::Pristine;
+        if let Some(dialog) = self.drain_dialog_mut() {
+            let value = if field == DRAIN_GRACE_PERIOD_FIELD {
+                &mut dialog.grace_period
+            } else {
+                &mut dialog.timeout
+            };
+            if replace {
+                value.clear();
+            }
+            value.push(character);
+        }
+        self.drain_value_edit_state = DrainValueEditState::Editing;
+        self.notice = None;
+        true
+    }
+
+    fn toggle_selected_drain_option(&mut self) -> bool {
+        let field = self.overlay_selected;
+        let Some(dialog) = self.drain_dialog_mut() else {
+            return false;
+        };
+        match field {
+            DRAIN_IGNORE_DAEMON_SETS_FIELD => {
+                dialog.flags.toggle(NodeDrainFlags::IGNORE_DAEMON_SETS);
+            }
+            DRAIN_DELETE_EMPTYDIR_DATA_FIELD => {
+                dialog.flags.toggle(NodeDrainFlags::DELETE_EMPTYDIR_DATA);
+            }
+            DRAIN_FORCE_FIELD => dialog.flags.toggle(NodeDrainFlags::FORCE),
+            DRAIN_DISABLE_EVICTION_FIELD => {
+                dialog.flags.toggle(NodeDrainFlags::DISABLE_EVICTION);
+            }
+            _ => return false,
+        }
+        self.notice = None;
+        true
+    }
+
+    fn activate_selected_drain_field(&mut self) -> AppCommand {
+        match self.overlay_selected {
+            DRAIN_GRACE_PERIOD_FIELD | DRAIN_TIMEOUT_FIELD => {
+                self.move_drain_field(1);
+                AppCommand::None
+            }
+            DRAIN_IGNORE_DAEMON_SETS_FIELD
+            | DRAIN_DELETE_EMPTYDIR_DATA_FIELD
+            | DRAIN_FORCE_FIELD
+            | DRAIN_DISABLE_EVICTION_FIELD => {
+                self.toggle_selected_drain_option();
+                AppCommand::None
+            }
+            DRAIN_CANCEL_FIELD => self.cancel_drain_confirmation(),
+            DRAIN_OK_FIELD => self.confirm_node_drain(),
+            _ => AppCommand::None,
+        }
+    }
+
+    fn cancel_drain_confirmation(&mut self) -> AppCommand {
+        self.pending_delete = None;
+        self.confirm_armed = false;
+        self.notice = None;
+        self.overlay = Overlay::None;
+        AppCommand::None
+    }
+
+    fn confirm_node_drain(&mut self) -> AppCommand {
+        let Some(PendingDelete::DrainNode(dialog)) = self.pending_delete.as_ref() else {
+            return AppCommand::None;
+        };
+        let options = match dialog.options() {
+            Ok(options) => options,
+            Err(error) => {
+                self.notice = Some(error);
+                return AppCommand::None;
+            }
+        };
+        let name = dialog.name.clone();
+        self.pending_delete = None;
+        self.confirm_armed = false;
+        self.notice = None;
+        self.overlay = Overlay::None;
+        AppCommand::Action(ActionIntent::DrainNode { name, options })
     }
 
     fn handle_content_overlay(&mut self, key: KeyEvent) -> AppCommand {
@@ -2412,8 +2704,10 @@ impl App {
         let Some(name) = self.selected_row().map(|row| row.name.to_string()) else {
             return AppCommand::None;
         };
-        self.pending_delete = Some(PendingDelete::DrainNode { name });
+        self.pending_delete = Some(PendingDelete::DrainNode(DrainDialog::new(name)));
         self.confirm_armed = false;
+        self.overlay_selected = DRAIN_GRACE_PERIOD_FIELD;
+        self.drain_value_edit_state = DrainValueEditState::Pristine;
         self.notice = None;
         self.overlay = Overlay::ConfirmDelete;
         AppCommand::None
@@ -3456,20 +3750,67 @@ mod tests {
         assert_eq!(app.overlay, Overlay::ConfirmDelete);
         assert_eq!(
             app.pending_delete,
-            Some(PendingDelete::DrainNode {
-                name: "worker-0".to_owned()
-            })
-        );
-        assert_eq!(
-            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            AppCommand::None
+            Some(PendingDelete::DrainNode(DrainDialog::new(
+                "worker-0".to_owned()
+            )))
         );
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        for _ in 0..5 {
+            app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        }
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             AppCommand::Action(ActionIntent::DrainNode {
-                name: "worker-0".to_owned()
+                name: "worker-0".to_owned(),
+                options: NodeDrainOptions {
+                    grace_period_seconds: None,
+                    timeout: Duration::from_secs(5),
+                    flags: NodeDrainFlags::IGNORE_DAEMON_SETS,
+                }
             })
+        );
+    }
+
+    #[test]
+    fn drain_dialog_edits_values_toggles_options_and_validates_timeout() {
+        let row = ResourceRow::new("-", "worker-0", "Ready", "worker", "v1.32.0", 0);
+        let mut app = app_with_descriptor(ResourceKind::Nodes.into(), None, row);
+        app.open_node_drain_confirmation();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        for character in "30s".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        for _ in 0..4 {
+            app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+            app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppCommand::Action(ActionIntent::DrainNode {
+                name: "worker-0".to_owned(),
+                options: NodeDrainOptions {
+                    grace_period_seconds: Some(0),
+                    timeout: Duration::from_secs(30),
+                    flags: NodeDrainFlags::ALL,
+                }
+            })
+        );
+
+        assert_eq!(
+            parse_drain_duration("250ms"),
+            Ok(Duration::from_millis(250))
+        );
+        assert_eq!(parse_drain_duration("2m"), Ok(Duration::from_secs(120)));
+        assert_eq!(
+            parse_drain_duration("0s"),
+            Err("Timeout must be greater than zero".to_owned())
         );
     }
 
