@@ -64,9 +64,9 @@ K9s key and reports that its backend is pending, and **planned** is not yet expo
 | Pod shell/attach | `s`, `a` | Interaction; backend pending |
 | Edit any Kubernetes resource | `e` | Implemented through interactive `kubectl edit` with the active context and selected resource namespace; unavailable in read-only mode |
 | Port-forward list/start | `f`, `Shift-F` | Interaction; backend pending |
-| Owner navigation | `Shift-J` | Interaction; backend pending |
+| Owner navigation | `Shift-J` | Implemented through controller owner references and a server-side name selector |
 | Service benchmark | `b` | Interaction; backend pending |
-| Cordon/uncordon and drain | `u`, `r` on Nodes | Interaction; backend pending |
+| Cordon/uncordon and drain | `u`, `r` on Nodes | Drain implemented with confirmation, preflight safety checks, cordon, and PDB-aware evictions; standalone cordon/uncordon pending |
 | Workload restart | `r` on Deployments/StatefulSets/DaemonSets | Interaction; backend pending |
 | Namespace use, UsedBy, CronJob trigger | `u`, `t` | Planned with those resource views |
 

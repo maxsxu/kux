@@ -10,8 +10,8 @@ use regex::RegexBuilder;
 
 use crate::kubeconfig::ContextInfo;
 use crate::model::{
-    NamespaceInfo, ResourceDescriptor, ResourceKind, ResourceOperations, ResourceRow,
-    ResourceSnapshot, SourceState, unix_now,
+    NamespaceInfo, OwnerReferenceData, ResourceDescriptor, ResourceKind, ResourceOperations,
+    ResourceRow, ResourceSnapshot, SourceState, unix_now,
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -198,6 +198,9 @@ pub enum ActionIntent {
     AuthorizationPolicy {
         target: ResourceTarget,
     },
+    DrainNode {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,6 +217,7 @@ pub enum AppCommand {
 pub enum PendingDelete {
     Resources(Vec<ResourceTarget>),
     Context { name: String },
+    DrainNode { name: String },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -864,7 +868,7 @@ impl App {
                 self.mutation_unavailable("Restart is not implemented yet")
             }
             KeyCode::Char('r') if known_kind == Some(ResourceKind::Nodes) => {
-                self.mutation_unavailable("Node drain is not implemented yet")
+                self.open_node_drain_confirmation()
             }
             KeyCode::Char(number) if number.is_ascii_digit() => {
                 self.switch_recent_namespace(number)
@@ -937,7 +941,7 @@ impl App {
                 return self.unsupported("Port forwarding is not implemented yet");
             }
             KeyCode::Char('J') => {
-                return self.unsupported("Owner navigation is not implemented yet");
+                return self.open_owner_resource();
             }
             _ => return AppCommand::None,
         }
@@ -1271,6 +1275,10 @@ impl App {
                         PendingDelete::Context { name } => {
                             self.overlay = Overlay::Contexts;
                             AppCommand::Action(ActionIntent::DeleteContext { name })
+                        }
+                        PendingDelete::DrainNode { name } => {
+                            self.overlay = Overlay::None;
+                            AppCommand::Action(ActionIntent::DrainNode { name })
                         }
                     })
             }
@@ -2226,6 +2234,46 @@ impl App {
         ))
     }
 
+    fn open_owner_resource(&mut self) -> AppCommand {
+        if !self.is_resource_view() {
+            return self.unsupported("Synthetic rows do not have Kubernetes owners");
+        }
+        let Some((namespace, owner)) = self.selected_row().and_then(|row| {
+            row.owner
+                .as_ref()
+                .map(|owner| (row.namespace.to_string(), owner.clone()))
+        }) else {
+            return self.unsupported("Selected resource has no owner");
+        };
+        let Some(kind) = self.owner_kind(&owner) else {
+            let message = format!(
+                "Owner kind {}/{} is not available in discovery",
+                owner.api_version, owner.kind
+            );
+            return self.unsupported(&message);
+        };
+        let namespace = (kind.is_namespaced() && namespace != "-").then_some(namespace);
+        self.request_view(
+            ViewState {
+                context: self.context.clone(),
+                kind,
+                namespace,
+                field_selector: Some(format!("metadata.name={}", owner.name)),
+                label_selector: None,
+            },
+            true,
+        )
+    }
+
+    fn owner_kind(&self, owner: &OwnerReferenceData) -> Option<ResourceDescriptor> {
+        self.resource_options
+            .iter()
+            .find(|resource| {
+                resource.api_version == owner.api_version && resource.kind == owner.kind
+            })
+            .cloned()
+    }
+
     fn container_log_action(&self, previous: bool) -> AppCommand {
         let ListMode::Containers { namespace, pod } = &self.list_mode else {
             return AppCommand::None;
@@ -2351,6 +2399,20 @@ impl App {
         self.pending_delete = Some(PendingDelete::Context {
             name: context.name.clone(),
         });
+        self.confirm_armed = false;
+        self.notice = None;
+        self.overlay = Overlay::ConfirmDelete;
+        AppCommand::None
+    }
+
+    fn open_node_drain_confirmation(&mut self) -> AppCommand {
+        if self.read_only {
+            return self.unsupported("Drain is disabled in read-only mode");
+        }
+        let Some(name) = self.selected_row().map(|row| row.name.to_string()) else {
+            return AppCommand::None;
+        };
+        self.pending_delete = Some(PendingDelete::DrainNode { name });
         self.confirm_armed = false;
         self.notice = None;
         self.overlay = Overlay::ConfirmDelete;
@@ -3268,6 +3330,45 @@ mod tests {
     }
 
     #[test]
+    fn shift_j_opens_the_controller_owner_by_name() {
+        let replica_set = descriptor("apps", "v1", "apps/v1", "ReplicaSet", "replicasets", true);
+        let row = ResourceRow::new("prod", "api-7d9-x2", "Running", "1/1", "0", 0)
+            .with_owner_reference_data(OwnerReferenceData {
+                api_version: Arc::from("apps/v1"),
+                kind: Arc::from("ReplicaSet"),
+                name: Arc::from("api-7d9"),
+            });
+        let mut app = app_with_descriptor(ResourceKind::Pods.into(), Some("prod"), row);
+        app.resource_options.push(replica_set.clone());
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT)),
+            AppCommand::Request(ViewState {
+                context: "demo".to_owned(),
+                kind: replica_set,
+                namespace: Some("prod".to_owned()),
+                field_selector: Some("metadata.name=api-7d9".to_owned()),
+                label_selector: None,
+            })
+        );
+        assert_eq!(app.field_selector.as_deref(), Some("metadata.name=api-7d9"));
+    }
+
+    #[test]
+    fn shift_j_reports_rows_without_an_owner() {
+        let mut app = app_with_rows();
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT)),
+            AppCommand::None
+        );
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Selected resource has no owner")
+        );
+    }
+
+    #[test]
     fn quit_command_matches_k9s() {
         let mut app = app_with_rows();
         assert_eq!(type_input(&mut app, ':', "q"), AppCommand::Quit);
@@ -3341,6 +3442,52 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn node_drain_requires_confirmation_and_targets_the_selected_node() {
+        let row = ResourceRow::new("-", "worker-0", "Ready", "worker", "v1.32.0", 0);
+        let mut app = app_with_descriptor(ResourceKind::Nodes.into(), None, row);
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+            AppCommand::None
+        );
+        assert_eq!(app.overlay, Overlay::ConfirmDelete);
+        assert_eq!(
+            app.pending_delete,
+            Some(PendingDelete::DrainNode {
+                name: "worker-0".to_owned()
+            })
+        );
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppCommand::None
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppCommand::Action(ActionIntent::DrainNode {
+                name: "worker-0".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn read_only_mode_blocks_node_drain() {
+        let row = ResourceRow::new("-", "worker-0", "Ready", "worker", "v1.32.0", 0);
+        let mut app = app_with_descriptor(ResourceKind::Nodes.into(), None, row);
+        app.read_only = true;
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+            AppCommand::None
+        );
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Drain is disabled in read-only mode")
+        );
     }
 
     #[test]

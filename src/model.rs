@@ -378,8 +378,17 @@ pub struct ResourceRow {
     pub labels: Arc<str>,
     pub created_unix: i64,
     pub search: Arc<str>,
+    pub owner: Option<OwnerReferenceData>,
     pub data: ResourceData,
     pub table_cells: Arc<[TableCell]>,
+}
+
+/// Compact controller-owner identity used for Shift+J navigation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerReferenceData {
+    pub api_version: Arc<str>,
+    pub kind: Arc<str>,
+    pub name: Arc<str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -484,6 +493,7 @@ impl ResourceRow {
             labels: Arc::from(""),
             created_unix,
             search: Arc::from(search),
+            owner: None,
             data: ResourceData::Generic,
             table_cells: Arc::from([]),
         }
@@ -507,6 +517,19 @@ impl ResourceRow {
     #[must_use]
     pub fn with_child_resource_data(mut self, data: ChildResourceData) -> Self {
         self.data = ResourceData::ChildResource(data);
+        self
+    }
+
+    #[must_use]
+    pub fn with_owner_reference_data(mut self, owner: OwnerReferenceData) -> Self {
+        self.search = Arc::from(
+            format!(
+                "{}\n{}\n{}\n{}",
+                self.search, owner.api_version, owner.kind, owner.name
+            )
+            .to_lowercase(),
+        );
+        self.owner = Some(owner);
         self
     }
 

@@ -574,11 +574,17 @@ fn resource_action_hints(app: &App) -> Vec<HeaderHint> {
         hints.push(action_hint("l", "Logs"));
         hints.push(action_hint("p", "Logs Previous"));
     }
+    if app.selected_row().is_some_and(|row| row.owner.is_some()) {
+        hints.push(action_hint("shift-j", "Owner"));
+    }
     if app.namespace.is_none() && app.kind.is_namespaced() {
         hints.push(action_hint("w", "Warp Namespace"));
     }
     if !app.read_only {
         hints.push(action_hint("e", "Edit"));
+        if app.kind.known_kind() == Some(ResourceKind::Nodes) {
+            hints.push(action_hint("r", "Drain"));
+        }
         let delete_label = if app.marks.is_empty() {
             "Delete".to_owned()
         } else {
@@ -1367,6 +1373,7 @@ const HELP_CATEGORIES: &[HelpCategory] = &[
             ("c / n", "Copy name / namespace"),
             ("y / d / e", "YAML / describe / edit"),
             ("l / p", "Logs / previous logs"),
+            ("Shift-J", "Open controller owner"),
         ],
     ),
     (
@@ -1387,6 +1394,7 @@ const HELP_CATEGORIES: &[HelpCategory] = &[
         &[
             ("Ctrl-D", "Delete marked / current"),
             ("Ctrl-K", "Kill immediately"),
+            ("r on Nodes", "Drain node with confirmation"),
             ("Ctrl-Z", "Toggle faults"),
         ],
     ),
@@ -1888,19 +1896,31 @@ fn describe_value_style(value: &str) -> Style {
 }
 
 fn draw_delete_confirmation(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let prompt = match app.pending_delete.as_ref() {
+    let (title, prompt) = match app.pending_delete.as_ref() {
         Some(PendingDelete::Resources(targets)) if targets.len() == 1 => {
             let target = &targets[0];
-            format!("Delete {} {}?", target.kind.label(), target.name)
+            (
+                " Confirm Delete ",
+                format!("Delete {} {}?", target.kind.label(), target.name),
+            )
         }
         Some(PendingDelete::Resources(targets)) => {
             let resource = targets
                 .first()
                 .map_or("resources", |target| target.kind.plural_name());
-            format!("Delete all {} selected {resource}?", targets.len())
+            (
+                " Confirm Delete ",
+                format!("Delete all {} selected {resource}?", targets.len()),
+            )
         }
-        Some(PendingDelete::Context { name }) => format!("Delete context {name}?"),
-        None => "Delete resource?".to_owned(),
+        Some(PendingDelete::Context { name }) => {
+            (" Confirm Delete ", format!("Delete context {name}?"))
+        }
+        Some(PendingDelete::DrainNode { name }) => (
+            " Confirm Drain ",
+            format!("Drain Node {name}? Managed pods will be evicted."),
+        ),
+        None => (" Confirm Delete ", "Delete resource?".to_owned()),
     };
     let buttons = if app.confirm_armed {
         Line::from(vec![
@@ -1916,7 +1936,12 @@ fn draw_delete_confirmation(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Span::styled(" [ OK ] ", Style::default().fg(MUTED)),
         ])
     };
-    let popup = centered_rect(60, 9, area);
+    let popup_width = if matches!(app.pending_delete, Some(PendingDelete::DrainNode { .. })) {
+        76
+    } else {
+        60
+    };
+    let popup = centered_rect(popup_width, 9, area);
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(vec![
@@ -1931,7 +1956,7 @@ fn draw_delete_confirmation(frame: &mut Frame<'_>, app: &App, area: Rect) {
             ))
             .centered(),
         ])
-        .block(popup_block(" Confirm Delete ").border_style(Style::default().fg(RED))),
+        .block(popup_block(title).border_style(Style::default().fg(RED))),
         popup,
     );
 }
@@ -2658,6 +2683,24 @@ mod tests {
             .expect("draw batch delete confirmation");
         let rendered = rendered_lines(&terminal, 120).join("\n");
         assert!(rendered.contains("Delete all 2 selected pods?"));
+    }
+
+    #[test]
+    fn node_drain_confirmation_explains_the_mutation() {
+        let mut app = app_with_rendered_pod();
+        app.pending_delete = Some(PendingDelete::DrainNode {
+            name: "worker-0".to_owned(),
+        });
+        app.overlay = Overlay::ConfirmDelete;
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("node drain terminal");
+
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw node drain confirmation");
+        let rendered = rendered_lines(&terminal, 120).join("\n");
+        assert!(rendered.contains("Confirm Drain"));
+        assert!(rendered.contains("Drain Node worker-0? Managed pods will be evicted."));
     }
 
     #[test]

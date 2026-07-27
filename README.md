@@ -145,6 +145,7 @@ The header always shows the actions available in the current view. These are the
 | `0`, `1`…`9` | All namespaces, then the nine most recent named namespaces |
 | `h`/`j`/`k`/`l`, arrows, `Ctrl-B`/`Ctrl-F`, `PgUp`/`PgDn`, `g`/`G` | Navigate, go back, or open contextually |
 | `Enter` | Drill into the selected resource |
+| `Shift-J` | Jump to the selected resource's controller owner |
 | `y`, `d` | YAML and `kubectl describe` |
 | `e` | Edit the selected resource with `kubectl edit` |
 | `l`, `p` | Current and previous logs |
@@ -154,6 +155,7 @@ The header always shows the actions available in the current view. These are the
 | Left-click a column | Sort; click again to reverse |
 | `Ctrl-R` | Restart the active watch |
 | `Ctrl-D` | Delete all marked resources, the current resource when none are marked, or an inactive context—with confirmation |
+| `r` on Nodes | Confirm, cordon, and drain the selected node |
 | `Ctrl-L`, `Ctrl-E`, `Ctrl-W` | Toggle logo, header, and wide columns |
 | `:q`, `Ctrl-C` | Quit |
 
@@ -170,6 +172,8 @@ Press `?` for the categorized keymap in the body. The full compatibility surface
   mutation paths.
 - `Ctrl-D` uses a guarded confirmation, batches all marked resources, and refuses the active
   context; `Ctrl-K` intentionally requests zero-grace deletion of the current resource.
+- Node drain refuses unmanaged pods before changing the node, skips DaemonSet and static mirror
+  pods, cordons the node, and uses the eviction API so PodDisruptionBudgets remain enforced.
 - `kubectl` is required for describe views, interactive resource editing, and kubeconfig context
   deletion.
 - The Metrics API is optional; Pod and Node usage columns remain unavailable when it is absent.
@@ -179,9 +183,9 @@ Press `?` for the categorized keymap in the body. The full compatibility surface
 ## Project status
 
 The high-scale list/watch pipeline, dynamic discovery, metrics, YAML, describe, logs, Secret
-decoding, context/namespace switching, mouse sorting, and RBAC policy views are functional.
-Exec/attach, port forwarding, editors, ownership traversal, and specialized workload/node
-mutations remain planned.
+decoding, context/namespace switching, mouse sorting, owner traversal, and RBAC policy views are
+functional. Exec/attach, port forwarding, editors, standalone cordon/uncordon, and workload
+restart remain planned.
 
 Kux follows the interaction model popularized by
 [K9s](https://github.com/derailed/k9s) but does not import K9s code and is not affiliated with the

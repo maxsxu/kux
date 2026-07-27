@@ -19,7 +19,7 @@ use k8s_openapi::api::{
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, Time};
 use kube::{
     Api, Client, Config, Resource, ResourceExt,
-    api::{DeleteParams, ListParams, LogParams, WatchParams},
+    api::{DeleteParams, EvictParams, ListParams, LogParams, Patch, PatchParams, WatchParams},
     config::KubeConfigOptions,
     core::{ApiResource, DynamicObject, GroupVersionKind, Request, WatchEvent},
     runtime::{WatchStreamExt, watcher},
@@ -34,9 +34,9 @@ use tokio::{
 use crate::{
     app::{ActionIntent, ContainerTarget, ContentKind, ResourceTarget},
     model::{
-        ChildResourceData, ContainerData, NamespaceInfo, NodeData, PodData, PolicyData,
-        ResourceData, ResourceDescriptor, ResourceKind, ResourceOperations, ResourceRow,
-        ResourceSnapshot, SourceState, TableCell, TableColumn,
+        ChildResourceData, ContainerData, NamespaceInfo, NodeData, OwnerReferenceData, PodData,
+        PolicyData, ResourceData, ResourceDescriptor, ResourceKind, ResourceOperations,
+        ResourceRow, ResourceSnapshot, SourceState, TableCell, TableColumn,
     },
 };
 
@@ -277,6 +277,7 @@ async fn handle_action(client: Client, context: &str, action: ActionIntent) -> A
         ActionIntent::AuthorizationPolicy { target } => {
             load_authorization_policy(client, target).await
         }
+        ActionIntent::DrainNode { name } => drain_node(client, &name).await,
     };
     result.unwrap_or_else(ActionResult::Error)
 }
@@ -309,6 +310,153 @@ async fn delete_resources(
         .collect::<Vec<_>>();
     failures.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     deletion_result(immediate, &resource, &first_identity, total, &failures)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DrainPod {
+    namespace: String,
+    name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PodDrainDisposition {
+    Evict(DrainPod),
+    Ignore,
+    Block(String),
+}
+
+async fn drain_node(client: Client, node_name: &str) -> Result<ActionResult, String> {
+    let pods = Api::<Pod>::all(client.clone())
+        .list(&ListParams::default().fields(&format!("spec.nodeName={node_name}")))
+        .await
+        .map_err(|error| format!("Unable to list pods on node {node_name}: {error}"))?;
+    let mut evictable = Vec::new();
+    let mut ignored = 0_usize;
+    let mut blockers = Vec::new();
+    for pod in &pods.items {
+        match pod_drain_disposition(pod) {
+            PodDrainDisposition::Evict(target) => evictable.push(target),
+            PodDrainDisposition::Ignore => ignored += 1,
+            PodDrainDisposition::Block(identity) => blockers.push(identity),
+        }
+    }
+    if !blockers.is_empty() {
+        blockers.sort_unstable();
+        return Err(format!(
+            "Cannot drain node {node_name}: unmanaged pods would not be recreated: {}",
+            summarize_identities(&blockers)
+        ));
+    }
+
+    Api::<Node>::all(client.clone())
+        .patch(
+            node_name,
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "spec": { "unschedulable": true } })),
+        )
+        .await
+        .map_err(|error| format!("Unable to cordon node {node_name}: {error}"))?;
+
+    let total = evictable.len();
+    let tasks = evictable.into_iter().map(|target| {
+        let client = client.clone();
+        async move {
+            let identity = format!("{}/{}", target.namespace, target.name);
+            let api = Api::<Pod>::namespaced(client, &target.namespace);
+            let result = api.evict(&target.name, &EvictParams::default()).await;
+            let result = match result {
+                Ok(_) => Ok(()),
+                Err(kube::Error::Api(status)) if status.code == 404 => Ok(()),
+                Err(error) => Err(error.to_string()),
+            };
+            (identity, result)
+        }
+    });
+    let mut failures = futures::stream::iter(tasks)
+        .buffer_unordered(5)
+        .filter_map(|(identity, result)| async move {
+            result.err().map(|error| format!("{identity}: {error}"))
+        })
+        .collect::<Vec<_>>()
+        .await;
+    failures.sort_unstable();
+    drain_result(node_name, total, ignored, &failures)
+}
+
+fn pod_drain_disposition(pod: &Pod) -> PodDrainDisposition {
+    let identity = format!(
+        "{}/{}",
+        pod.namespace().as_deref().unwrap_or("<unknown>"),
+        pod.name_any()
+    );
+    if pod.meta().deletion_timestamp.is_some()
+        || pod
+            .meta()
+            .annotations
+            .as_ref()
+            .is_some_and(|annotations| annotations.contains_key("kubernetes.io/config.mirror"))
+    {
+        return PodDrainDisposition::Ignore;
+    }
+    let controller = pod
+        .meta()
+        .owner_references
+        .as_ref()
+        .and_then(|owners| owners.iter().find(|owner| owner.controller == Some(true)));
+    if controller.is_some_and(|owner| owner.kind == "DaemonSet") {
+        return PodDrainDisposition::Ignore;
+    }
+    let terminal = pod
+        .status
+        .as_ref()
+        .and_then(|status| status.phase.as_deref())
+        .is_some_and(|phase| matches!(phase, "Succeeded" | "Failed"));
+    if controller.is_none() && !terminal {
+        return PodDrainDisposition::Block(identity);
+    }
+    let Some(namespace) = pod.namespace() else {
+        return PodDrainDisposition::Block(identity);
+    };
+    PodDrainDisposition::Evict(DrainPod {
+        namespace,
+        name: pod.name_any(),
+    })
+}
+
+fn drain_result(
+    node_name: &str,
+    total: usize,
+    ignored: usize,
+    failures: &[String],
+) -> Result<ActionResult, String> {
+    if !failures.is_empty() {
+        let accepted = total.saturating_sub(failures.len());
+        return Err(format!(
+            "Node {node_name} was cordoned; eviction accepted for {accepted} of {total} pods; failed: {}",
+            summarize_identities(failures)
+        ));
+    }
+    let ignored_suffix = if ignored == 0 {
+        String::new()
+    } else {
+        format!("; skipped {ignored} DaemonSet, static, or terminating pods")
+    };
+    Ok(ActionResult::Notice(format!(
+        "Drained node {node_name}: cordoned and eviction accepted for {total} pods{ignored_suffix}"
+    )))
+}
+
+fn summarize_identities(identities: &[String]) -> String {
+    let mut summary = identities
+        .iter()
+        .take(3)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if identities.len() > 3 {
+        let _ = write!(summary, ", and {} more", identities.len() - 3);
+    }
+    summary
 }
 
 fn deletion_result(
@@ -2132,9 +2280,16 @@ fn server_table_row(row: ServerTableRow, columns: &[TableColumn]) -> ResourceRow
                 .join(",")
         })
         .unwrap_or_default();
-    ResourceRow::new(namespace, name, status, ready, details, created_unix)
+    let owner = object
+        .as_ref()
+        .and_then(|object| owner_reference_data(object.meta()));
+    let row = ResourceRow::new(namespace, name, status, ready, details, created_unix)
         .with_labels(labels)
-        .with_table_cells(cells)
+        .with_table_cells(cells);
+    match owner {
+        Some(owner) => row.with_owner_reference_data(owner),
+        None => row,
+    }
 }
 
 fn table_cell(value: &serde_json::Value, column: Option<&TableColumn>) -> TableCell {
@@ -2894,7 +3049,27 @@ fn resource_row<K: ResourceExt>(
                 .join(",")
         })
         .unwrap_or_default();
-    ResourceRow::new(namespace, name, status, ready, details, created_unix).with_labels(labels)
+    let row =
+        ResourceRow::new(namespace, name, status, ready, details, created_unix).with_labels(labels);
+    match owner_reference_data(resource.meta()) {
+        Some(owner) => row.with_owner_reference_data(owner),
+        None => row,
+    }
+}
+
+fn owner_reference_data(
+    metadata: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta,
+) -> Option<OwnerReferenceData> {
+    let owners = metadata.owner_references.as_ref()?;
+    let owner = owners
+        .iter()
+        .find(|owner| owner.controller == Some(true))
+        .or_else(|| owners.first())?;
+    Some(OwnerReferenceData {
+        api_version: Arc::from(owner.api_version.as_str()),
+        kind: Arc::from(owner.kind.as_str()),
+        name: Arc::from(owner.name.as_str()),
+    })
 }
 
 #[cfg(test)]
@@ -2968,6 +3143,101 @@ mod tests {
     }
 
     #[test]
+    fn drain_plan_ignores_daemon_sets_and_blocks_unmanaged_pods() {
+        let daemon_set_pod: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "agent-1",
+                "namespace": "system",
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "DaemonSet",
+                    "name": "agent",
+                    "uid": "agent-uid",
+                    "controller": true
+                }]
+            },
+            "spec": { "containers": [] }
+        }))
+        .expect("valid DaemonSet Pod");
+        let unmanaged_pod: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "debug", "namespace": "default" },
+            "spec": { "containers": [] },
+            "status": { "phase": "Running" }
+        }))
+        .expect("valid unmanaged Pod");
+
+        assert_eq!(
+            pod_drain_disposition(&daemon_set_pod),
+            PodDrainDisposition::Ignore
+        );
+        assert_eq!(
+            pod_drain_disposition(&unmanaged_pod),
+            PodDrainDisposition::Block("default/debug".to_owned())
+        );
+    }
+
+    #[test]
+    fn drain_plan_evicts_managed_and_completed_pods() {
+        let managed_pod: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "api-7d9-x2",
+                "namespace": "prod",
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "ReplicaSet",
+                    "name": "api-7d9",
+                    "uid": "replica-set-uid",
+                    "controller": true
+                }]
+            },
+            "spec": { "containers": [] }
+        }))
+        .expect("valid managed Pod");
+        let completed_pod: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "done", "namespace": "jobs" },
+            "spec": { "containers": [] },
+            "status": { "phase": "Succeeded" }
+        }))
+        .expect("valid completed Pod");
+
+        assert_eq!(
+            pod_drain_disposition(&managed_pod),
+            PodDrainDisposition::Evict(DrainPod {
+                namespace: "prod".to_owned(),
+                name: "api-7d9-x2".to_owned()
+            })
+        );
+        assert_eq!(
+            pod_drain_disposition(&completed_pod),
+            PodDrainDisposition::Evict(DrainPod {
+                namespace: "jobs".to_owned(),
+                name: "done".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn drain_result_reports_partial_eviction_after_cordon() {
+        assert_eq!(
+            drain_result(
+                "worker-0",
+                3,
+                2,
+                &["prod/api-1: disruption budget".to_owned()]
+            ),
+            Err("Node worker-0 was cordoned; eviction accepted for 2 of 3 pods; failed: prod/api-1: disruption budget".to_owned())
+        );
+    }
+
+    #[test]
     fn deployment_row_declares_replica_sets_as_label_selected_children() {
         let deployment: Deployment = serde_json::from_value(serde_json::json!({
             "apiVersion": "apps/v1",
@@ -2989,6 +3259,41 @@ mod tests {
         let child = row.child_resource_data().expect("Deployment child data");
         assert!(child.kind.is_apps_v1_replica_set());
         assert_eq!(child.label_selector.as_ref(), "app=api,tier=backend");
+    }
+
+    #[test]
+    fn pod_row_preserves_the_controller_owner_reference() {
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "api-7d9-x2",
+                "namespace": "prod",
+                "ownerReferences": [
+                    {
+                        "apiVersion": "example.io/v1",
+                        "kind": "SideOwner",
+                        "name": "side-owner",
+                        "uid": "side-owner-uid"
+                    },
+                    {
+                        "apiVersion": "apps/v1",
+                        "kind": "ReplicaSet",
+                        "name": "api-7d9",
+                        "uid": "replica-set-uid",
+                        "controller": true
+                    }
+                ]
+            },
+            "spec": { "containers": [] }
+        }))
+        .expect("valid Pod");
+
+        let row = pod_row(&pod);
+        let owner = row.owner.as_ref().expect("Pod owner data");
+        assert_eq!(owner.api_version.as_ref(), "apps/v1");
+        assert_eq!(owner.kind.as_ref(), "ReplicaSet");
+        assert_eq!(owner.name.as_ref(), "api-7d9");
     }
 
     #[test]

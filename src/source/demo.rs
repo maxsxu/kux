@@ -5,9 +5,9 @@ use tokio::sync::{mpsc, watch};
 use crate::{
     app::{ActionIntent, ContentKind, ResourceTarget},
     model::{
-        ChildResourceData, ContainerData, NamespaceInfo, NodeData, PodData, PolicyData,
-        ResourceDescriptor, ResourceKind, ResourceOperations, ResourceRow, ResourceSnapshot,
-        SourceState, unix_now,
+        ChildResourceData, ContainerData, NamespaceInfo, NodeData, OwnerReferenceData, PodData,
+        PolicyData, ResourceDescriptor, ResourceKind, ResourceOperations, ResourceRow,
+        ResourceSnapshot, SourceState, unix_now,
     },
 };
 
@@ -78,6 +78,9 @@ fn demo_action(action: ActionIntent) -> ActionResult {
         ActionIntent::DeleteContext { name } => ActionResult::Error(format!(
             "Context deletion is unavailable in demo mode: {name}"
         )),
+        ActionIntent::DrainNode { name } => {
+            ActionResult::Notice(format!("Drained demo node {name}"))
+        }
         ActionIntent::Content { target, content } => demo_content(&target, content),
         ActionIntent::Containers { target } => {
             let namespace = target
@@ -326,6 +329,7 @@ fn build_rows(item_count: usize, request: &WatchRequest) -> Vec<Arc<ResourceRow>
             _ => row,
         };
         let row = with_demo_child(row, request, labels);
+        let row = with_demo_owner(row, request, index);
         rows.push(Arc::new(row));
     }
     rows.sort_unstable_by(|left, right| {
@@ -334,6 +338,18 @@ fn build_rows(item_count: usize, request: &WatchRequest) -> Vec<Arc<ResourceRow>
             .then(left.name.cmp(&right.name))
     });
     rows
+}
+
+fn with_demo_owner(row: ResourceRow, request: &WatchRequest, index: usize) -> ResourceRow {
+    if request.kind.is_apps_v1_replica_set() {
+        row.with_owner_reference_data(OwnerReferenceData {
+            api_version: Arc::from("apps/v1"),
+            kind: Arc::from("Deployment"),
+            name: Arc::from(format!("deploy-{index:07}")),
+        })
+    } else {
+        row
+    }
 }
 
 fn with_demo_child(row: ResourceRow, request: &WatchRequest, labels: String) -> ResourceRow {
