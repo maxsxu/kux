@@ -135,6 +135,7 @@ pub struct ViewState {
     pub kind: ResourceDescriptor,
     pub namespace: Option<String>,
     pub field_selector: Option<String>,
+    pub label_selector: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,6 +358,7 @@ pub struct App {
     pub namespace: Option<String>,
     pub kind: ResourceDescriptor,
     pub field_selector: Option<String>,
+    pub label_selector: Option<String>,
     pub resource_options: Vec<ResourceDescriptor>,
     pub list_mode: ListMode,
     pub generation: u64,
@@ -439,6 +441,7 @@ impl App {
             kind: kind.clone(),
             namespace: namespace.clone(),
             field_selector: None,
+            label_selector: None,
         };
         let recent_namespaces = namespace.iter().cloned().collect();
         Self {
@@ -448,6 +451,7 @@ impl App {
             namespace,
             kind: kind.clone(),
             field_selector: None,
+            label_selector: None,
             resource_options: ResourceKind::ALL
                 .into_iter()
                 .map(ResourceDescriptor::from)
@@ -1089,6 +1093,7 @@ impl App {
                         kind,
                         namespace,
                         field_selector: None,
+                        label_selector: None,
                     },
                     true,
                 )
@@ -1125,6 +1130,7 @@ impl App {
                         kind: self.kind.clone(),
                         namespace,
                         field_selector: self.field_selector.clone(),
+                        label_selector: self.label_selector.clone(),
                     },
                     true,
                 )
@@ -1225,6 +1231,7 @@ impl App {
                         kind: self.kind.clone(),
                         namespace: self.namespace.clone(),
                         field_selector: self.field_selector.clone(),
+                        label_selector: self.label_selector.clone(),
                     },
                     true,
                 )
@@ -1303,6 +1310,7 @@ impl App {
             {
                 self.ui.toggle(UiFlags::MANAGED_FIELDS);
                 self.reset_body_scroll();
+                self.scroll_to_first_content_match();
                 AppCommand::None
             }
             KeyCode::Char('x')
@@ -1311,6 +1319,7 @@ impl App {
             {
                 self.ui.toggle(UiFlags::SECRET_DECODED);
                 self.reset_body_scroll();
+                self.scroll_to_first_content_match();
                 self.notice = Some(
                     if self.ui.secret_decoded() {
                         "Secret values decoded"
@@ -1486,6 +1495,9 @@ impl App {
             self.body_query = filter;
             let matcher = FilterMatcher::new(&self.body_query);
             self.filter_error = matcher.error().map(str::to_owned);
+            if self.overlay == Overlay::Content && self.content_kind == Some(ContentKind::Yaml) {
+                self.scroll_to_first_content_match();
+            }
             if matches!(
                 self.overlay,
                 Overlay::Aliases | Overlay::Namespaces | Overlay::Contexts
@@ -1495,6 +1507,20 @@ impl App {
         } else {
             self.query = filter;
             self.rebuild_filter(None);
+        }
+    }
+
+    fn scroll_to_first_content_match(&mut self) {
+        if self.body_query.is_empty() || self.filter_error.is_some() {
+            return;
+        }
+        let matcher = FilterMatcher::new(&self.body_query);
+        let match_line = self
+            .active_content_body()
+            .lines()
+            .position(|line| matcher.matches_text(line));
+        if let Some(line) = match_line {
+            self.content_scroll = u16::try_from(line).unwrap_or(u16::MAX);
         }
     }
 
@@ -1517,6 +1543,7 @@ impl App {
                             kind: self.kind.clone(),
                             namespace: self.namespace.clone(),
                             field_selector: self.field_selector.clone(),
+                            label_selector: self.label_selector.clone(),
                         },
                         true,
                     )
@@ -1533,6 +1560,7 @@ impl App {
                             kind: self.kind.clone(),
                             namespace,
                             field_selector: self.field_selector.clone(),
+                            label_selector: self.label_selector.clone(),
                         },
                         true,
                     )
@@ -1567,6 +1595,7 @@ impl App {
                         kind,
                         namespace,
                         field_selector: None,
+                        label_selector: None,
                     },
                     true,
                 );
@@ -1585,6 +1614,7 @@ impl App {
             kind: self.kind.clone(),
             namespace: self.namespace.clone(),
             field_selector: self.field_selector.clone(),
+            label_selector: self.label_selector.clone(),
         }
     }
 
@@ -1617,6 +1647,7 @@ impl App {
         self.kind = view.kind.clone();
         self.namespace.clone_from(&view.namespace);
         self.field_selector.clone_from(&view.field_selector);
+        self.label_selector.clone_from(&view.label_selector);
         if view.kind.is_namespaced() {
             self.remember_namespace(view.namespace.clone());
         }
@@ -1668,6 +1699,7 @@ impl App {
                 kind: self.kind.clone(),
                 namespace,
                 field_selector: self.field_selector.clone(),
+                label_selector: self.label_selector.clone(),
             },
             true,
         )
@@ -2137,6 +2169,9 @@ impl App {
             self.pending_policy = Some(target.clone());
             return AppCommand::Action(ActionIntent::AuthorizationPolicy { target });
         }
+        if let Some(command) = self.open_child_resource() {
+            return command;
+        }
         match self.kind.known_kind() {
             Some(ResourceKind::Nodes) => {
                 let Some(node) = self.selected_row().map(|row| row.name.to_string()) else {
@@ -2149,6 +2184,7 @@ impl App {
                         kind: ResourceDescriptor::from(ResourceKind::Pods),
                         namespace: None,
                         field_selector: Some(format!("spec.nodeName={node}")),
+                        label_selector: None,
                     },
                     true,
                 )
@@ -2170,6 +2206,24 @@ impl App {
                 AppCommand::None
             }
         }
+    }
+
+    fn open_child_resource(&mut self) -> Option<AppCommand> {
+        let child = self.selected_row().and_then(|row| {
+            row.child_resource_data()
+                .map(|data| (row.namespace.to_string(), data.clone()))
+        })?;
+        let namespace = (child.0 != "-").then_some(child.0);
+        Some(self.request_view(
+            ViewState {
+                context: self.context.clone(),
+                kind: child.1.kind,
+                namespace,
+                field_selector: None,
+                label_selector: Some(child.1.label_selector.to_string()),
+            },
+            true,
+        ))
     }
 
     fn container_log_action(&self, previous: bool) -> AppCommand {
@@ -2353,6 +2407,7 @@ impl App {
                     kind: self.kind.clone(),
                     namespace: Some(namespace),
                     field_selector: self.field_selector.clone(),
+                    label_selector: self.label_selector.clone(),
                 },
                 true,
             )
@@ -3007,6 +3062,7 @@ mod tests {
                     kind: ResourceKind::Services.into(),
                     namespace: None,
                     field_selector: None,
+                    label_selector: None,
                 },
                 true,
             );
@@ -3137,6 +3193,7 @@ mod tests {
                 kind: ResourceKind::Deployments.into(),
                 namespace: Some("kube-system".to_owned()),
                 field_selector: None,
+                label_selector: None,
             })
         );
     }
@@ -3184,6 +3241,33 @@ mod tests {
     }
 
     #[test]
+    fn enter_on_a_parent_resource_opens_its_label_selected_child_view() {
+        let deployment = ResourceDescriptor::from(ResourceKind::Deployments);
+        let replica_set = descriptor("apps", "v1", "apps/v1", "ReplicaSet", "replicasets", true);
+        let row = ResourceRow::new("prod", "api", "Ready", "3/3", "3 available", 0)
+            .with_child_resource_data(crate::model::ChildResourceData {
+                kind: replica_set.clone(),
+                label_selector: Arc::from("app=api,tier=backend"),
+            });
+        let mut app = app_with_descriptor(deployment, Some("prod"), row);
+        app.query = "stale".to_owned();
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppCommand::Request(ViewState {
+                context: "demo".to_owned(),
+                kind: replica_set,
+                namespace: Some("prod".to_owned()),
+                field_selector: None,
+                label_selector: Some("app=api,tier=backend".to_owned()),
+            })
+        );
+        assert!(app.query.is_empty());
+        assert_eq!(app.label_selector.as_deref(), Some("app=api,tier=backend"));
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    #[test]
     fn quit_command_matches_k9s() {
         let mut app = app_with_rows();
         assert_eq!(type_input(&mut app, ':', "q"), AppCommand::Quit);
@@ -3200,6 +3284,7 @@ mod tests {
                 kind: ResourceKind::Pods.into(),
                 namespace: None,
                 field_selector: None,
+                label_selector: None,
             })
         );
         assert_eq!(app.context, "staging");
@@ -3217,6 +3302,7 @@ mod tests {
                 kind: ResourceKind::Pods.into(),
                 namespace: None,
                 field_selector: None,
+                label_selector: None,
             })
         );
     }
@@ -3233,6 +3319,7 @@ mod tests {
                 kind: ResourceKind::Pods.into(),
                 namespace: None,
                 field_selector: None,
+                label_selector: None,
             })
         );
     }
@@ -3652,6 +3739,7 @@ mod tests {
                 kind: ResourceKind::Pods.into(),
                 namespace: None,
                 field_selector: None,
+                label_selector: None,
             })
         );
         assert_eq!(app.recent_namespaces, vec!["dev", "prod"]);
@@ -3734,6 +3822,7 @@ mod tests {
                 kind: ResourceKind::Pods.into(),
                 namespace: Some("dev".to_owned()),
                 field_selector: None,
+                label_selector: None,
             })
         );
     }
@@ -4118,6 +4207,7 @@ mod tests {
                 kind: widget,
                 namespace: Some("prod".to_owned()),
                 field_selector: None,
+                label_selector: None,
             })
         );
     }
@@ -4275,6 +4365,7 @@ mod tests {
                 kind: ResourceKind::Pods.into(),
                 namespace: None,
                 field_selector: Some("spec.nodeName=worker-07".to_owned()),
+                label_selector: None,
             })
         );
         assert_eq!(
@@ -4288,6 +4379,7 @@ mod tests {
                 kind: ResourceKind::Nodes.into(),
                 namespace: None,
                 field_selector: None,
+                label_selector: None,
             })
         );
     }

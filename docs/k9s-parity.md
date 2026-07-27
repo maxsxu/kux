@@ -43,6 +43,7 @@ K9s key and reports that its backend is pending, and **planned** is not yet expo
 | Warp to namespace | `w` | Implemented in all-namespace views |
 | Pod and node metrics columns | automatic | Implemented through `metrics.k8s.io` |
 | Node → pods on node | `Enter` on Node | Implemented with server-side field selector |
+| Workload → owned children | `Enter` on Deployment/ReplicaSet/StatefulSet/DaemonSet | Implemented with server-side label selectors; selector-backed Services also open Pods |
 | Pod → containers | `Enter` on Pod | Implemented for regular, init, and ephemeral containers |
 | Container → logs | `Enter` on container | Implemented with explicit container selection |
 | APIService status table | `:apiservice` | Implemented with `NAME`, `SERVICE`, `AVAILABLE`, and `AGE` |
@@ -55,6 +56,7 @@ K9s key and reports that its backend is pending, and **planned** is not yet expo
 | --- | --- | --- |
 | Pod/container logs/previous logs | `l`, `p` | Implemented, last 500 lines |
 | Copy YAML/toggle managed fields | `c`, `m` in YAML | Implemented; copy uses the visible variant |
+| Search YAML without hiding context | `/query` in YAML | Implemented; keeps the full document and scrolls to the first matching line |
 | Copy decoded Secret data | `c` in Secret data view | Implemented; copies the data-only body |
 | Wrap/timestamps/fullscreen | `w`, `t`, `f` in content view | Implemented UI toggles |
 | Delete marked resources, current resource, or inactive context with Tab + Enter confirmation | `Ctrl-D` | Implemented; all marked resources are deleted as one bounded batch, while active/synthetic contexts and resources without delete capability remain protected |

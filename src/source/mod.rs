@@ -22,6 +22,7 @@ pub struct WatchRequest {
     pub kind: ResourceDescriptor,
     pub namespace: Option<String>,
     pub field_selector: Option<String>,
+    pub label_selector: Option<String>,
 }
 
 #[derive(Debug, Clone)]

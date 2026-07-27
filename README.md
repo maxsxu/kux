@@ -82,13 +82,16 @@ Navigation stays in place instead of stacking popups:
 
 ```text
 Node ──Enter──▶ Pods on node ──Enter──▶ Containers ──Enter──▶ Logs
+Deployment ──Enter──▶ ReplicaSets ──Enter──▶ Pods
+StatefulSet / DaemonSet / selector-backed Service ──Enter──▶ Pods
 ServiceAccount ──Enter──▶ Effective RBAC policy matrix
 Secret ──x──▶ Decoded data only
 Resource ──y / d / e──▶ Formatted YAML / kubectl describe / interactive kubectl edit
 ```
 
 Command and filter mode remain available from resource tables, contexts, details, YAML, describe,
-logs, containers, and authorization policy views.
+logs, containers, and authorization policy views. In YAML, `/` keeps the complete document visible
+and scrolls directly to the first matching line.
 
 ## Purpose-built Kubernetes views
 

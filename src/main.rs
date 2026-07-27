@@ -90,6 +90,7 @@ async fn main() -> Result<()> {
             kind: app.kind.clone(),
             namespace: app.namespace.clone(),
             field_selector: app.field_selector.clone(),
+            label_selector: app.label_selector.clone(),
         })
         .await
         .context("data source stopped before startup")?;
@@ -155,6 +156,7 @@ async fn run(
                                     kind: view.kind,
                                     namespace: view.namespace,
                                     field_selector: view.field_selector,
+                                    label_selector: view.label_selector,
                                 }).await.context("data source stopped")?;
                             }
                             AppCommand::Copy(value) => {

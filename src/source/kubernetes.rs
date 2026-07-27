@@ -12,11 +12,11 @@ use http::{
     header::{ACCEPT, HeaderValue},
 };
 use k8s_openapi::api::{
-    apps::v1::{DaemonSet, Deployment, StatefulSet},
+    apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet},
     core::v1::{ContainerStatus, Namespace, Node, Pod, Service},
     rbac::v1::{ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, Subject},
 };
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, Time};
 use kube::{
     Api, Client, Config, Resource, ResourceExt,
     api::{DeleteParams, ListParams, LogParams, WatchParams},
@@ -34,9 +34,9 @@ use tokio::{
 use crate::{
     app::{ActionIntent, ContainerTarget, ContentKind, ResourceTarget},
     model::{
-        ContainerData, NamespaceInfo, NodeData, PodData, PolicyData, ResourceData,
-        ResourceDescriptor, ResourceKind, ResourceRow, ResourceSnapshot, SourceState, TableCell,
-        TableColumn,
+        ChildResourceData, ContainerData, NamespaceInfo, NodeData, PodData, PolicyData,
+        ResourceData, ResourceDescriptor, ResourceKind, ResourceOperations, ResourceRow,
+        ResourceSnapshot, SourceState, TableCell, TableColumn,
     },
 };
 
@@ -204,6 +204,10 @@ async fn run_watch(
         Some(ResourceKind::Nodes) => {
             let api = Api::<Node>::all(client.clone());
             watch_api(api, client, settings, request, snapshots, node_row).await;
+        }
+        None if request.kind.is_apps_v1_replica_set() => {
+            let api = namespaced_api::<ReplicaSet>(client.clone(), request.namespace.as_deref());
+            watch_api(api, client, settings, request, snapshots, replica_set_row).await;
         }
         None => {
             let api = dynamic_api(client.clone(), &request.kind, request.namespace.as_deref());
@@ -599,7 +603,10 @@ impl EnrichmentState {
                 }
                 data.pods = self.node_pods.get(row.name.as_ref()).copied().unwrap_or(0);
             }
-            ResourceData::Generic | ResourceData::Container(_) | ResourceData::Policy(_) => {}
+            ResourceData::Generic
+            | ResourceData::ChildResource(_)
+            | ResourceData::Container(_)
+            | ResourceData::Policy(_) => {}
         }
     }
 
@@ -1561,6 +1568,9 @@ async fn watch_api<K, F>(
     if let Some(selector) = &request.field_selector {
         watcher_config = watcher_config.fields(selector);
     }
+    if let Some(selector) = &request.label_selector {
+        watcher_config = watcher_config.labels(selector);
+    }
     let stream = watcher::watcher(api, watcher_config).default_backoff();
     tokio::pin!(stream);
 
@@ -1717,7 +1727,14 @@ async fn watch_table_api(
     let mut revision = 0_u64;
     let mut retry_delay = Duration::from_secs(1);
     loop {
-        match list_table_pages(&api, &client, request.field_selector.as_deref()).await {
+        match list_table_pages(
+            &api,
+            &client,
+            request.field_selector.as_deref(),
+            request.label_selector.as_deref(),
+        )
+        .await
+        {
             Ok(mut listing) => {
                 revision = revision.wrapping_add(1);
                 publish_table(
@@ -1786,6 +1803,9 @@ async fn stream_table_watch(
     };
     if let Some(selector) = &request.field_selector {
         params = params.fields(selector);
+    }
+    if let Some(selector) = &request.label_selector {
+        params = params.labels(selector);
     }
     let raw = Request::new(api.resource_url())
         .watch(&params, &listing.resource_version)
@@ -1874,7 +1894,14 @@ async fn poll_table_api(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
-        match list_table_pages(&api, &client, request.field_selector.as_deref()).await {
+        match list_table_pages(
+            &api,
+            &client,
+            request.field_selector.as_deref(),
+            request.label_selector.as_deref(),
+        )
+        .await
+        {
             Ok(listing) => {
                 revision = revision.wrapping_add(1);
                 publish_table(
@@ -1905,6 +1932,7 @@ async fn list_table_pages(
     api: &Api<DynamicObject>,
     client: &Client,
     field_selector: Option<&str>,
+    label_selector: Option<&str>,
 ) -> Result<TableListing, String> {
     let mut columns: Arc<[TableColumn]> = Arc::from([]);
     let mut rows = FxHashMap::default();
@@ -1914,6 +1942,9 @@ async fn list_table_pages(
         let mut params = ListParams::default().limit(500);
         if let Some(selector) = field_selector {
             params = params.fields(selector);
+        }
+        if let Some(selector) = label_selector {
+            params = params.labels(selector);
         }
         if let Some(token) = &continue_token {
             params = params.continue_token(token);
@@ -2272,7 +2303,7 @@ fn deployment_row(deployment: &Deployment) -> ResourceRow {
         .as_ref()
         .and_then(|status| status.available_replicas)
         .unwrap_or(0);
-    resource_row(
+    let row = resource_row(
         deployment,
         deployment.namespace().unwrap_or_default(),
         deployment.name_any(),
@@ -2283,7 +2314,55 @@ fn deployment_row(deployment: &Deployment) -> ResourceRow {
         ),
         format!("{ready}/{desired}"),
         format!("{available} available"),
-    )
+    );
+    match deployment.spec.as_ref() {
+        Some(spec) => with_child_resource(
+            row,
+            replica_set_descriptor(),
+            label_selector_string(&spec.selector),
+        ),
+        None => row,
+    }
+}
+
+fn replica_set_row(replica_set: &ReplicaSet) -> ResourceRow {
+    let desired = replica_set
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.replicas)
+        .unwrap_or(1);
+    let ready = replica_set
+        .status
+        .as_ref()
+        .and_then(|status| status.ready_replicas)
+        .unwrap_or(0);
+    let row = resource_row(
+        replica_set,
+        replica_set.namespace().unwrap_or_default(),
+        replica_set.name_any(),
+        workload_status(
+            replica_set.meta().deletion_timestamp.is_some(),
+            ready,
+            desired,
+        ),
+        format!("{ready}/{desired}"),
+        replica_set
+            .status
+            .as_ref()
+            .and_then(|status| status.available_replicas)
+            .map_or_else(
+                || "-".to_owned(),
+                |available| format!("{available} available"),
+            ),
+    );
+    match replica_set.spec.as_ref() {
+        Some(spec) => with_child_resource(
+            row,
+            ResourceKind::Pods.into(),
+            label_selector_string(&spec.selector),
+        ),
+        None => row,
+    }
 }
 
 fn stateful_set_row(stateful_set: &StatefulSet) -> ResourceRow {
@@ -2297,7 +2376,7 @@ fn stateful_set_row(stateful_set: &StatefulSet) -> ResourceRow {
         .as_ref()
         .and_then(|status| status.ready_replicas)
         .unwrap_or(0);
-    resource_row(
+    let row = resource_row(
         stateful_set,
         stateful_set.namespace().unwrap_or_default(),
         stateful_set.name_any(),
@@ -2312,7 +2391,15 @@ fn stateful_set_row(stateful_set: &StatefulSet) -> ResourceRow {
             .as_ref()
             .and_then(|status| status.current_revision.clone())
             .unwrap_or_else(|| "-".to_owned()),
-    )
+    );
+    match stateful_set.spec.as_ref() {
+        Some(spec) => with_child_resource(
+            row,
+            ResourceKind::Pods.into(),
+            label_selector_string(&spec.selector),
+        ),
+        None => row,
+    }
 }
 
 fn daemon_set_row(daemon_set: &DaemonSet) -> ResourceRow {
@@ -2324,7 +2411,7 @@ fn daemon_set_row(daemon_set: &DaemonSet) -> ResourceRow {
         .status
         .as_ref()
         .map_or(0, |status| status.number_ready);
-    resource_row(
+    let row = resource_row(
         daemon_set,
         daemon_set.namespace().unwrap_or_default(),
         daemon_set.name_any(),
@@ -2342,7 +2429,15 @@ fn daemon_set_row(daemon_set: &DaemonSet) -> ResourceRow {
                 .and_then(|status| status.number_available)
                 .unwrap_or(0)
         ),
-    )
+    );
+    match daemon_set.spec.as_ref() {
+        Some(spec) => with_child_resource(
+            row,
+            ResourceKind::Pods.into(),
+            label_selector_string(&spec.selector),
+        ),
+        None => row,
+    }
 }
 
 fn service_row(service: &Service) -> ResourceRow {
@@ -2356,14 +2451,83 @@ fn service_row(service: &Service) -> ResourceRow {
     let ports = spec
         .and_then(|spec| spec.ports.as_ref())
         .map_or(0, Vec::len);
-    resource_row(
+    let row = resource_row(
         service,
         service.namespace().unwrap_or_default(),
         service.name_any(),
         service_type,
         format!("{ports} ports"),
         cluster_ip,
+    );
+    match spec.and_then(|spec| spec.selector.as_ref()) {
+        Some(selector) => {
+            with_child_resource(row, ResourceKind::Pods.into(), label_map_selector(selector))
+        }
+        None => row,
+    }
+}
+
+fn replica_set_descriptor() -> ResourceDescriptor {
+    ResourceDescriptor::new(
+        "apps",
+        "v1",
+        "apps/v1",
+        "ReplicaSet",
+        "replicasets",
+        true,
+        ResourceOperations::all(),
     )
+    .with_short_names(["rs"])
+}
+
+fn with_child_resource(
+    row: ResourceRow,
+    kind: ResourceDescriptor,
+    label_selector: String,
+) -> ResourceRow {
+    if label_selector.is_empty() {
+        row
+    } else {
+        row.with_child_resource_data(ChildResourceData {
+            kind,
+            label_selector: Arc::from(label_selector),
+        })
+    }
+}
+
+fn label_map_selector(labels: &BTreeMap<String, String>) -> String {
+    labels
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn label_selector_string(selector: &LabelSelector) -> String {
+    let mut terms = selector
+        .match_labels
+        .as_ref()
+        .map_or_else(Vec::new, |labels| {
+            labels
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect()
+        });
+    if let Some(expressions) = &selector.match_expressions {
+        terms.extend(expressions.iter().filter_map(|requirement| {
+            let values = requirement.values.as_deref().unwrap_or_default().join(",");
+            match requirement.operator.as_str() {
+                "In" => Some(format!("{} in ({values})", requirement.key)),
+                "NotIn" => Some(format!("{} notin ({values})", requirement.key)),
+                "Exists" => Some(requirement.key.clone()),
+                "DoesNotExist" => Some(format!("!{}", requirement.key)),
+                "Gt" => Some(format!("{}>{values}", requirement.key)),
+                "Lt" => Some(format!("{}<{values}", requirement.key)),
+                _ => None,
+            }
+        }));
+    }
+    terms.join(",")
 }
 
 fn dynamic_row(object: &DynamicObject) -> ResourceRow {
@@ -2548,11 +2712,23 @@ fn node_row(node: &Node) -> ResourceRow {
         .and_then(|values| values.get("memory"))
         .and_then(|quantity| parse_memory_bytes(&quantity.0))
         .unwrap_or(0);
+    let unschedulable = node
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.unschedulable)
+        .unwrap_or(false);
     resource_row(
         node,
         "-".to_owned(),
         node.name_any(),
-        if is_ready { "Ready" } else { "NotReady" }.to_owned(),
+        if unschedulable {
+            "Unschedulable"
+        } else if is_ready {
+            "Ready"
+        } else {
+            "NotReady"
+        }
+        .to_owned(),
         role.to_owned(),
         version.clone(),
     )
@@ -2754,6 +2930,95 @@ mod tests {
             namespace_info(&namespace),
             NamespaceInfo::discovered("payments", "Active", Some(3_600))
         );
+    }
+
+    #[test]
+    fn node_status_reports_unschedulable_before_readiness() {
+        let node: Node = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": { "name": "worker-0" },
+            "spec": { "unschedulable": true },
+            "status": {
+                "conditions": [{
+                    "type": "Ready",
+                    "status": "True",
+                    "lastHeartbeatTime": null,
+                    "lastTransitionTime": null,
+                    "reason": null,
+                    "message": null
+                }],
+                "nodeInfo": {
+                    "architecture": "arm64",
+                    "bootID": "boot",
+                    "containerRuntimeVersion": "containerd://1.0",
+                    "kernelVersion": "1.0",
+                    "kubeProxyVersion": "v1.32.0",
+                    "kubeletVersion": "v1.32.0",
+                    "machineID": "machine",
+                    "operatingSystem": "linux",
+                    "osImage": "Linux",
+                    "systemUUID": "uuid"
+                }
+            }
+        }))
+        .expect("valid Node");
+
+        assert_eq!(node_row(&node).status.as_ref(), "Unschedulable");
+    }
+
+    #[test]
+    fn deployment_row_declares_replica_sets_as_label_selected_children() {
+        let deployment: Deployment = serde_json::from_value(serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "api", "namespace": "prod" },
+            "spec": {
+                "replicas": 3,
+                "selector": { "matchLabels": { "app": "api", "tier": "backend" } },
+                "template": {
+                    "metadata": { "labels": { "app": "api", "tier": "backend" } },
+                    "spec": { "containers": [] }
+                }
+            },
+            "status": { "readyReplicas": 3, "availableReplicas": 3 }
+        }))
+        .expect("valid Deployment");
+
+        let row = deployment_row(&deployment);
+        let child = row.child_resource_data().expect("Deployment child data");
+        assert!(child.kind.is_apps_v1_replica_set());
+        assert_eq!(child.label_selector.as_ref(), "app=api,tier=backend");
+    }
+
+    #[test]
+    fn replica_set_row_declares_pods_as_label_selected_children() {
+        let replica_set: ReplicaSet = serde_json::from_value(serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": { "name": "api-7d9", "namespace": "prod" },
+            "spec": {
+                "replicas": 3,
+                "selector": { "matchLabels": { "pod-template-hash": "7d9" } },
+                "template": {
+                    "metadata": { "labels": { "pod-template-hash": "7d9" } },
+                    "spec": { "containers": [] }
+                }
+            },
+            "status": {
+                "replicas": 3,
+                "readyReplicas": 3,
+                "availableReplicas": 3,
+                "fullyLabeledReplicas": 3,
+                "observedGeneration": 1
+            }
+        }))
+        .expect("valid ReplicaSet");
+
+        let row = replica_set_row(&replica_set);
+        let child = row.child_resource_data().expect("ReplicaSet child data");
+        assert_eq!(child.kind.known_kind(), Some(ResourceKind::Pods));
+        assert_eq!(child.label_selector.as_ref(), "pod-template-hash=7d9");
     }
 
     #[test]
@@ -3487,7 +3752,7 @@ mod tests {
                 .find(|resource| resource.qualified_name() == qualified_name)
                 .unwrap_or_else(|| panic!("missing {qualified_name}"));
             let api = dynamic_api(client.clone(), resource, None);
-            let listing = list_table_pages(&api, &client, None)
+            let listing = list_table_pages(&api, &client, None, None)
                 .await
                 .unwrap_or_else(|error| panic!("table list {qualified_name}: {error}"));
             assert!(

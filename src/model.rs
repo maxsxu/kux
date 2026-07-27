@@ -314,6 +314,14 @@ impl ResourceDescriptor {
     }
 
     #[must_use]
+    pub fn is_apps_v1_replica_set(&self) -> bool {
+        self.group.as_ref() == "apps"
+            && self.version.as_ref() == "v1"
+            && self.kind.as_ref() == "ReplicaSet"
+            && self.plural.as_ref() == "replicasets"
+    }
+
+    #[must_use]
     pub fn is_custom_resource_definition(&self) -> bool {
         self.group.as_ref() == "apiextensions.k8s.io"
             && self.kind.as_ref() == "CustomResourceDefinition"
@@ -391,10 +399,17 @@ pub struct TableCell {
 pub enum ResourceData {
     #[default]
     Generic,
+    ChildResource(ChildResourceData),
     Pod(PodData),
     Node(NodeData),
     Container(ContainerData),
     Policy(PolicyData),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildResourceData {
+    pub kind: ResourceDescriptor,
+    pub label_selector: Arc<str>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -490,6 +505,12 @@ impl ResourceRow {
     }
 
     #[must_use]
+    pub fn with_child_resource_data(mut self, data: ChildResourceData) -> Self {
+        self.data = ResourceData::ChildResource(data);
+        self
+    }
+
+    #[must_use]
     pub fn with_node_data(mut self, data: NodeData) -> Self {
         self.search =
             Arc::from(format!("{}\n{}\n{}", self.search, data.taints, data.version).to_lowercase());
@@ -535,6 +556,15 @@ impl ResourceRow {
     #[must_use]
     pub const fn pod_data(&self) -> Option<&PodData> {
         if let ResourceData::Pod(data) = &self.data {
+            Some(data)
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn child_resource_data(&self) -> Option<&ChildResourceData> {
+        if let ResourceData::ChildResource(data) = &self.data {
             Some(data)
         } else {
             None

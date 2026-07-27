@@ -5,13 +5,11 @@ use tokio::sync::{mpsc, watch};
 use crate::{
     app::{ActionIntent, ContentKind, ResourceTarget},
     model::{
-        ContainerData, NamespaceInfo, NodeData, PodData, PolicyData, ResourceKind, ResourceRow,
-        ResourceSnapshot, SourceState, unix_now,
+        ChildResourceData, ContainerData, NamespaceInfo, NodeData, PodData, PolicyData,
+        ResourceDescriptor, ResourceKind, ResourceOperations, ResourceRow, ResourceSnapshot,
+        SourceState, unix_now,
     },
 };
-
-#[cfg(test)]
-use crate::model::ResourceDescriptor;
 
 use super::{ActionResult, WatchRequest};
 
@@ -279,6 +277,10 @@ fn build_rows(item_count: usize, request: &WatchRequest) -> Vec<Arc<ResourceRow>
         } else {
             ("Running", "1/1")
         };
+        let labels = request
+            .label_selector
+            .clone()
+            .unwrap_or_else(|| format!("app={prefix},team=team-{:03}", index % 250));
         let row = ResourceRow::new(
             if request.kind.is_namespaced() {
                 namespace
@@ -291,7 +293,7 @@ fn build_rows(item_count: usize, request: &WatchRequest) -> Vec<Arc<ResourceRow>
             (index % 13).to_string(),
             now - i64::try_from(index % (86400 * 365)).unwrap_or(i64::MAX),
         )
-        .with_labels(format!("app={prefix},team=team-{:03}", index % 250));
+        .with_labels(labels.clone());
         let row = match known_kind {
             Some(ResourceKind::Pods) => row.with_pod_data(PodData {
                 restarts: u32::try_from(index % 13).unwrap_or(0),
@@ -323,6 +325,7 @@ fn build_rows(item_count: usize, request: &WatchRequest) -> Vec<Arc<ResourceRow>
             }),
             _ => row,
         };
+        let row = with_demo_child(row, request, labels);
         rows.push(Arc::new(row));
     }
     rows.sort_unstable_by(|left, right| {
@@ -331,6 +334,37 @@ fn build_rows(item_count: usize, request: &WatchRequest) -> Vec<Arc<ResourceRow>
             .then(left.name.cmp(&right.name))
     });
     rows
+}
+
+fn with_demo_child(row: ResourceRow, request: &WatchRequest, labels: String) -> ResourceRow {
+    let child_kind = match request.kind.known_kind() {
+        Some(ResourceKind::Deployments) => Some(replica_set_descriptor()),
+        Some(ResourceKind::StatefulSets | ResourceKind::DaemonSets | ResourceKind::Services) => {
+            Some(ResourceKind::Pods.into())
+        }
+        _ if request.kind.is_apps_v1_replica_set() => Some(ResourceKind::Pods.into()),
+        _ => None,
+    };
+    match child_kind {
+        Some(kind) => row.with_child_resource_data(ChildResourceData {
+            kind,
+            label_selector: Arc::from(labels),
+        }),
+        None => row,
+    }
+}
+
+fn replica_set_descriptor() -> ResourceDescriptor {
+    ResourceDescriptor::new(
+        "apps",
+        "v1",
+        "apps/v1",
+        "ReplicaSet",
+        "replicasets",
+        true,
+        ResourceOperations::all(),
+    )
+    .with_short_names(["rs"])
 }
 
 #[cfg(test)]
@@ -347,6 +381,7 @@ mod tests {
                 kind: ResourceDescriptor::from(ResourceKind::Pods),
                 namespace: None,
                 field_selector: None,
+                label_selector: None,
             },
         );
         assert_eq!(rows.len(), 100_000);
@@ -363,6 +398,7 @@ mod tests {
                 kind: ResourceDescriptor::from(ResourceKind::Pods),
                 namespace: Some("team-007".to_owned()),
                 field_selector: None,
+                label_selector: None,
             },
         );
         assert_eq!(rows.len(), 4);
@@ -379,6 +415,7 @@ mod tests {
                 kind: ResourceDescriptor::from(ResourceKind::Pods),
                 namespace: None,
                 field_selector: Some("spec.nodeName=node-0000007".to_owned()),
+                label_selector: None,
             },
         );
         assert_eq!(rows.len(), 10);

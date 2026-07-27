@@ -545,16 +545,21 @@ fn action_hints(app: &App) -> Vec<HeaderHint> {
 
 fn resource_action_hints(app: &App) -> Vec<HeaderHint> {
     let enter_label = if app.kind.is_authorization_resource() {
-        "Policy"
+        "Policy".to_owned()
+    } else if let Some(child) = app
+        .selected_row()
+        .and_then(crate::model::ResourceRow::child_resource_data)
+    {
+        child.kind.label().to_owned()
     } else {
         match app.kind.known_kind() {
-            Some(ResourceKind::Nodes) => "Pods",
-            Some(ResourceKind::Pods) => "Containers",
-            _ => "Details",
+            Some(ResourceKind::Nodes) => "Pods".to_owned(),
+            Some(ResourceKind::Pods) => "Containers".to_owned(),
+            _ => "Details".to_owned(),
         }
     };
     let mut hints = vec![
-        action_hint("enter", enter_label),
+        action_hint("enter", &enter_label),
         action_hint("y", "YAML"),
         action_hint("d", "Describe"),
         action_hint("c", "Copy Name"),
@@ -1749,11 +1754,14 @@ fn draw_details(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 
 fn draw_content(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let body = app.active_content_body();
-    let filtered = body
-        .lines()
-        .filter(|line| app.body_line_matches(line))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let filtered = if app.content_kind == Some(ContentKind::Yaml) {
+        body.to_owned()
+    } else {
+        body.lines()
+            .filter(|line| app.body_line_matches(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     let lines = match app.content_kind {
         Some(ContentKind::Yaml | ContentKind::SecretData) => highlight_yaml(&filtered),
         Some(ContentKind::Describe) => highlight_describe(&filtered),
@@ -1971,7 +1979,7 @@ fn status_style(status: &str) -> Style {
         RED
     } else if matches!(
         normalized.as_str(),
-        "pending" | "progressing" | "unknown" | "scheduled"
+        "pending" | "progressing" | "unknown" | "scheduled" | "unschedulable"
     ) {
         YELLOW
     } else if matches!(
@@ -3518,6 +3526,43 @@ mod tests {
         let rendered = rendered_lines(&terminal, 80).join("\n");
         assert!(app.content_scroll > 0);
         assert!(rendered.contains("key099: value"));
+    }
+
+    #[test]
+    fn yaml_filter_scrolls_to_a_match_without_hiding_neighboring_lines() {
+        let mut app = App::new(
+            "demo",
+            Some("default".to_owned()),
+            ResourceKind::Pods,
+            false,
+            vec!["demo".to_owned()],
+        );
+        let yaml = (0..60)
+            .map(|index| format!("key{index:03}: value"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.show_content(
+            "YAML(default/api-0)",
+            yaml,
+            None,
+            None,
+            None,
+            ContentKind::Yaml,
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for character in "key040".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+
+        let backend = TestBackend::new(80, 14);
+        let mut terminal = Terminal::new(backend).expect("YAML search terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw searched YAML");
+        let rendered = rendered_lines(&terminal, 80).join("\n");
+        assert!(app.content_scroll > 0);
+        assert!(rendered.contains("key040: value"));
+        assert!(rendered.contains("key041: value"));
     }
 
     #[test]
