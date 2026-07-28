@@ -147,7 +147,7 @@ The header always shows the actions available in the current view. These are the
 | `Enter` | Drill into the selected resource |
 | `Shift-J` | Jump to the selected resource's controller owner |
 | `y`, `d` | YAML and `kubectl describe` |
-| `e` | Edit the selected resource with `kubectl edit` |
+| `e` | Edit the selected resource from its list, details, or YAML view with `kubectl edit` |
 | `l`, `p` | Current and previous logs |
 | `c`, `n` | Copy resource name or namespace |
 | `x` on Secret | Open decoded data only; in YAML, toggle decoded values |

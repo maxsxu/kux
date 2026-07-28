@@ -536,6 +536,7 @@ pub struct App {
     pub pending_delete: Option<PendingDelete>,
     pub read_only: bool,
     content_max_scroll: u16,
+    content_target: Option<ResourceTarget>,
     saved_resource_list: Option<SavedResourceList>,
     pending_containers: Option<ResourceTarget>,
     pending_policy: Option<ResourceTarget>,
@@ -631,6 +632,7 @@ impl App {
             pending_delete: None,
             read_only,
             content_max_scroll: 0,
+            content_target: None,
             saved_resource_list: None,
             pending_containers: None,
             pending_policy: None,
@@ -1275,14 +1277,15 @@ impl App {
         }
     }
 
-    fn namespace_content_action(&self, visible: &[usize]) -> AppCommand {
-        self.selected_namespace_target(visible)
-            .map_or(AppCommand::None, |target| {
-                AppCommand::Action(ActionIntent::Content {
-                    target,
-                    content: ContentKind::Yaml,
-                })
-            })
+    fn namespace_content_action(&mut self, visible: &[usize]) -> AppCommand {
+        let Some(target) = self.selected_namespace_target(visible) else {
+            return AppCommand::None;
+        };
+        self.content_target = Some(target.clone());
+        AppCommand::Action(ActionIntent::Content {
+            target,
+            content: ContentKind::Yaml,
+        })
     }
 
     fn namespace_edit_action(&mut self, visible: &[usize]) -> AppCommand {
@@ -1596,6 +1599,13 @@ impl App {
             return AppCommand::None;
         }
         match key.code {
+            KeyCode::Char('e') if self.content_kind == Some(ContentKind::Yaml) => {
+                let command = self.edit_content_action();
+                if matches!(&command, AppCommand::Edit(_)) {
+                    self.overlay = Overlay::None;
+                }
+                command
+            }
             KeyCode::Char('c')
                 if matches!(
                     self.content_kind,
@@ -2728,10 +2738,12 @@ impl App {
         })
     }
 
-    fn content_action(&self, content: ContentKind) -> AppCommand {
-        self.selected_target().map_or(AppCommand::None, |target| {
-            AppCommand::Action(ActionIntent::Content { target, content })
-        })
+    fn content_action(&mut self, content: ContentKind) -> AppCommand {
+        let Some(target) = self.selected_target() else {
+            return AppCommand::None;
+        };
+        self.content_target = Some(target.clone());
+        AppCommand::Action(ActionIntent::Content { target, content })
     }
 
     fn edit_action(&mut self) -> AppCommand {
@@ -2739,6 +2751,16 @@ impl App {
             return self.unsupported("Edit is disabled in read-only mode");
         }
         self.selected_target()
+            .map_or(AppCommand::None, AppCommand::Edit)
+    }
+
+    fn edit_content_action(&mut self) -> AppCommand {
+        if self.read_only {
+            return self.unsupported("Edit is disabled in read-only mode");
+        }
+        self.content_target
+            .clone()
+            .or_else(|| self.selected_target())
             .map_or(AppCommand::None, AppCommand::Edit)
     }
 
@@ -4399,6 +4421,62 @@ mod tests {
                 namespace: Some("prod".to_owned()),
                 name: "selected".to_owned(),
             })
+        );
+    }
+
+    #[test]
+    fn yaml_body_e_edits_the_resource_that_was_opened() {
+        let mut app = app_with_rows();
+        let target = ResourceTarget {
+            kind: ResourceKind::Pods.into(),
+            namespace: Some("prod".to_owned()),
+            name: "api-0".to_owned(),
+        };
+        assert_eq!(
+            app.content_action(ContentKind::Yaml),
+            AppCommand::Action(ActionIntent::Content {
+                target: target.clone(),
+                content: ContentKind::Yaml,
+            })
+        );
+        app.selected = 1;
+        app.show_content(
+            "YAML(prod/api-0)",
+            "kind: Pod",
+            None,
+            None,
+            None,
+            ContentKind::Yaml,
+        );
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)),
+            AppCommand::Edit(target)
+        );
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn read_only_yaml_edit_keeps_the_body_open() {
+        let mut app = app_with_rows();
+        app.show_content(
+            "YAML(prod/api-0)",
+            "kind: Pod",
+            None,
+            None,
+            None,
+            ContentKind::Yaml,
+        );
+        app.read_only = true;
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)),
+            AppCommand::None
+        );
+        assert_eq!(app.overlay, Overlay::Content);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Edit is disabled in read-only mode")
         );
     }
 

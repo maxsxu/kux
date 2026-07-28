@@ -460,6 +460,9 @@ fn action_hints(app: &App) -> Vec<HeaderHint> {
                 hints.push(action_hint("c", "Copy"));
             }
             if app.content_kind == Some(ContentKind::Yaml) {
+                if !app.read_only {
+                    hints.push(action_hint("e", "Edit"));
+                }
                 hints.push(action_hint(
                     "m",
                     if app.ui.managed_fields() {
@@ -2851,7 +2854,13 @@ mod tests {
     #[test]
     fn resource_edit_hint_is_available_only_when_mutations_are_enabled() {
         let mut app = app_with_rendered_pod();
-        for overlay in [Overlay::None, Overlay::Namespaces, Overlay::Details] {
+        app.content_kind = Some(ContentKind::Yaml);
+        for overlay in [
+            Overlay::None,
+            Overlay::Namespaces,
+            Overlay::Details,
+            Overlay::Content,
+        ] {
             app.overlay = overlay;
             assert!(
                 action_hints(&app)
@@ -2862,7 +2871,12 @@ mod tests {
         }
 
         app.read_only = true;
-        for overlay in [Overlay::None, Overlay::Namespaces, Overlay::Details] {
+        for overlay in [
+            Overlay::None,
+            Overlay::Namespaces,
+            Overlay::Details,
+            Overlay::Content,
+        ] {
             app.overlay = overlay;
             assert!(
                 action_hints(&app).iter().all(|hint| hint.key != "e"),
