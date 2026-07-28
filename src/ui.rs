@@ -592,6 +592,8 @@ fn resource_action_hints(app: &App) -> Vec<HeaderHint> {
         hints.push(action_hint("e", "Edit"));
         if app.kind.known_kind() == Some(ResourceKind::Nodes) {
             hints.push(action_hint("r", "Drain"));
+        } else if app.is_restartable_workload() {
+            hints.push(action_hint("r", "Restart"));
         }
         let delete_label = if app.marks.is_empty() {
             "Delete".to_owned()
@@ -1925,6 +1927,22 @@ fn draw_delete_confirmation(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 format!("Delete all {} selected {resource}?", targets.len()),
             )
         }
+        Some(PendingDelete::Restart(targets)) if targets.len() == 1 => {
+            let target = &targets[0];
+            (
+                " Confirm Restart ",
+                format!("Restart {} {}?", target.kind.kind, target.name),
+            )
+        }
+        Some(PendingDelete::Restart(targets)) => {
+            let resource = targets
+                .first()
+                .map_or("workloads", |target| target.kind.plural_name());
+            (
+                " Confirm Restart ",
+                format!("Restart all {} selected {resource}?", targets.len()),
+            )
+        }
         Some(PendingDelete::Context { name }) => {
             (" Confirm Delete ", format!("Delete context {name}?"))
         }
@@ -2790,6 +2808,33 @@ mod tests {
     }
 
     #[test]
+    fn workload_restart_confirmation_identifies_the_full_marked_batch() {
+        let mut app = app_with_rendered_pod();
+        let target = crate::app::ResourceTarget {
+            kind: ResourceKind::Deployments.into(),
+            namespace: Some("default".to_owned()),
+            name: "api".to_owned(),
+        };
+        app.pending_delete = Some(PendingDelete::Restart(vec![
+            target.clone(),
+            crate::app::ResourceTarget {
+                name: "worker".to_owned(),
+                ..target
+            },
+        ]));
+        app.overlay = Overlay::ConfirmDelete;
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("batch restart terminal");
+
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw batch restart confirmation");
+        let rendered = rendered_lines(&terminal, 120).join("\n");
+        assert!(rendered.contains("Confirm Restart"));
+        assert!(rendered.contains("Restart all 2 selected deployments?"));
+    }
+
+    #[test]
     fn node_drain_confirmation_explains_the_mutation() {
         let mut app = app_with_rendered_pod();
         app.pending_delete = Some(PendingDelete::DrainNode(DrainDialog::new(
@@ -2883,6 +2928,24 @@ mod tests {
                 "{overlay:?}"
             );
         }
+    }
+
+    #[test]
+    fn restart_hint_is_contextual_and_respects_read_only_mode() {
+        let mut app = app_with_rendered_pod();
+        app.kind = ResourceKind::Deployments.into();
+        assert!(
+            resource_action_hints(&app)
+                .iter()
+                .any(|hint| hint.key == "r" && hint.label == "Restart")
+        );
+
+        app.read_only = true;
+        assert!(
+            resource_action_hints(&app)
+                .iter()
+                .all(|hint| hint.key != "r")
+        );
     }
 
     #[test]

@@ -198,6 +198,9 @@ pub enum ActionIntent {
     AuthorizationPolicy {
         target: ResourceTarget,
     },
+    Restart {
+        targets: Vec<ResourceTarget>,
+    },
     DrainNode {
         name: String,
         options: NodeDrainOptions,
@@ -346,6 +349,7 @@ pub enum AppCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingDelete {
     Resources(Vec<ResourceTarget>),
+    Restart(Vec<ResourceTarget>),
     Context { name: String },
     DrainNode(DrainDialog),
 }
@@ -810,6 +814,15 @@ impl App {
         self.list_mode == ListMode::Resources
     }
 
+    #[must_use]
+    pub fn is_restartable_workload(&self) -> bool {
+        self.is_resource_view()
+            && self
+                .kind
+                .known_kind()
+                .is_some_and(ResourceKind::is_restartable)
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> AppCommand {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return AppCommand::Quit;
@@ -989,17 +1002,8 @@ impl App {
             KeyCode::Char('b') if known_kind == Some(ResourceKind::Services) => {
                 self.unsupported("Benchmarking is not implemented yet")
             }
-            KeyCode::Char('r')
-                if matches!(
-                    known_kind,
-                    Some(
-                        ResourceKind::Deployments
-                            | ResourceKind::StatefulSets
-                            | ResourceKind::DaemonSets
-                    )
-                ) =>
-            {
-                self.mutation_unavailable("Restart is not implemented yet")
+            KeyCode::Char('r') if self.is_restartable_workload() => {
+                self.open_workload_restart_confirmation()
             }
             KeyCode::Char('r') if known_kind == Some(ResourceKind::Nodes) => {
                 self.open_node_drain_confirmation()
@@ -1409,6 +1413,12 @@ impl App {
                                 targets,
                                 immediate: false,
                             })
+                        }
+                        PendingDelete::Restart(targets) => {
+                            self.overlay = Overlay::None;
+                            self.marks.clear();
+                            self.mark_anchor = None;
+                            AppCommand::Action(ActionIntent::Restart { targets })
                         }
                         PendingDelete::Context { name } => {
                             self.overlay = Overlay::Contexts;
@@ -2707,6 +2717,21 @@ impl App {
         AppCommand::None
     }
 
+    fn open_workload_restart_confirmation(&mut self) -> AppCommand {
+        if self.read_only {
+            return self.unsupported("Restart is disabled in read-only mode");
+        }
+        let targets = self.selected_or_marked_targets();
+        if targets.is_empty() {
+            return AppCommand::None;
+        }
+        self.pending_delete = Some(PendingDelete::Restart(targets));
+        self.confirm_armed = false;
+        self.notice = None;
+        self.overlay = Overlay::ConfirmDelete;
+        AppCommand::None
+    }
+
     fn open_node_drain_confirmation(&mut self) -> AppCommand {
         if self.read_only {
             return self.unsupported("Drain is disabled in read-only mode");
@@ -3758,6 +3783,101 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn restartable_workloads_require_confirmation() {
+        for kind in [
+            ResourceKind::Deployments,
+            ResourceKind::StatefulSets,
+            ResourceKind::DaemonSets,
+        ] {
+            let descriptor = ResourceDescriptor::from(kind);
+            let mut app = app_with_descriptor(
+                descriptor.clone(),
+                Some("prod"),
+                ResourceRow::new("prod", "api", "Ready", "1/1", "-", 0),
+            );
+            let target = ResourceTarget {
+                kind: descriptor,
+                namespace: Some("prod".to_owned()),
+                name: "api".to_owned(),
+            };
+
+            assert_eq!(
+                app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+                AppCommand::None
+            );
+            assert_eq!(
+                app.pending_delete,
+                Some(PendingDelete::Restart(vec![target.clone()]))
+            );
+            assert_eq!(
+                app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                AppCommand::None
+            );
+            app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+            assert_eq!(
+                app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                AppCommand::Action(ActionIntent::Restart {
+                    targets: vec![target],
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn workload_restart_targets_every_marked_resource() {
+        let mut app = App::new(
+            "demo",
+            Some("prod".to_owned()),
+            ResourceKind::Deployments,
+            false,
+            vec!["demo".to_owned()],
+        );
+        app.apply_snapshot(snapshot(
+            vec![
+                ResourceRow::new("prod", "api", "Ready", "3/3", "-", 0),
+                ResourceRow::new("prod", "worker", "Ready", "2/2", "-", 0),
+            ],
+            1,
+            ResourceKind::Deployments,
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        let Some(PendingDelete::Restart(targets)) = app.pending_delete.as_ref() else {
+            panic!("marked workloads should be pending restart");
+        };
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.name.as_str())
+                .collect::<Vec<_>>(),
+            ["api", "worker"]
+        );
+    }
+
+    #[test]
+    fn read_only_mode_blocks_workload_restart() {
+        let mut app = app_with_descriptor(
+            ResourceKind::Deployments.into(),
+            Some("prod"),
+            ResourceRow::new("prod", "api", "Ready", "3/3", "-", 0),
+        );
+        app.read_only = true;
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+            AppCommand::None
+        );
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Restart is disabled in read-only mode")
+        );
     }
 
     #[test]

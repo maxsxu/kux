@@ -283,6 +283,7 @@ async fn handle_action(client: Client, context: &str, action: ActionIntent) -> A
         ActionIntent::AuthorizationPolicy { target } => {
             load_authorization_policy(client, target).await
         }
+        ActionIntent::Restart { targets } => restart_workloads(client, targets).await,
         ActionIntent::DrainNode { name, options } => drain_node(client, &name, options).await,
     };
     result.unwrap_or_else(ActionResult::Error)
@@ -316,6 +317,112 @@ async fn delete_resources(
         .collect::<Vec<_>>();
     failures.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     deletion_result(immediate, &resource, &first_identity, total, &failures)
+}
+
+async fn restart_workloads(
+    client: Client,
+    targets: Vec<ResourceTarget>,
+) -> Result<ActionResult, String> {
+    let Some(first) = targets.first() else {
+        return Err("No workloads selected for restart".to_owned());
+    };
+    if targets.iter().any(|target| {
+        !target
+            .kind
+            .known_kind()
+            .is_some_and(ResourceKind::is_restartable)
+    }) {
+        return Err("Restart supports Deployments, StatefulSets, and DaemonSets".to_owned());
+    }
+    let total = targets.len();
+    let resource = first.kind.plural_name().to_owned();
+    let first_kind = first.kind.kind.to_string();
+    let first_identity = resource_identity(first);
+    let restarted_at = k8s_openapi::jiff::Timestamp::now().to_string();
+    let tasks = targets.into_iter().map(|target| {
+        let client = client.clone();
+        let restarted_at = restarted_at.clone();
+        async move {
+            let identity = resource_identity(&target);
+            (
+                identity,
+                restart_workload(client, &target, &restarted_at).await,
+            )
+        }
+    });
+    let results = futures::stream::iter(tasks)
+        .buffer_unordered(16)
+        .collect::<Vec<_>>()
+        .await;
+    let mut failures = results
+        .into_iter()
+        .filter_map(|(identity, result)| result.err().map(|error| (identity, error)))
+        .collect::<Vec<_>>();
+    failures.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    restart_result(&first_kind, &resource, &first_identity, total, &failures)
+}
+
+async fn restart_workload(
+    client: Client,
+    target: &ResourceTarget,
+    restarted_at: &str,
+) -> Result<(), String> {
+    let namespace = target
+        .namespace
+        .as_deref()
+        .ok_or_else(|| format!("{} requires a namespace", target.kind.kind))?;
+    dynamic_api(client, &target.kind, Some(namespace))
+        .patch(
+            &target.name,
+            &PatchParams::default(),
+            &Patch::Merge(restart_patch(restarted_at)),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn restart_patch(restarted_at: &str) -> serde_json::Value {
+    serde_json::json!({
+        "spec": {
+            "template": {
+                "metadata": {
+                    "annotations": {
+                        "kubectl.kubernetes.io/restartedAt": restarted_at
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn restart_result(
+    kind: &str,
+    resource: &str,
+    first_identity: &str,
+    total: usize,
+    failures: &[(String, String)],
+) -> Result<ActionResult, String> {
+    if failures.is_empty() {
+        return Ok(ActionResult::Notice(if total == 1 {
+            format!("Restart in progress for {kind} {first_identity}")
+        } else {
+            format!("Restart in progress for all {total} {resource}")
+        }));
+    }
+    let succeeded = total.saturating_sub(failures.len());
+    let mut details = failures
+        .iter()
+        .take(3)
+        .map(|(identity, error)| format!("{identity}: {error}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    if failures.len() > 3 {
+        let _ = write!(details, "; and {} more", failures.len() - 3);
+    }
+    Err(format!(
+        "Restart requested for {succeeded} of {total} {resource}; failed: {details}"
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3276,6 +3383,38 @@ mod tests {
         assert_eq!(
             node_row(&node).status.as_ref(),
             "NotReady,SchedulingDisabled"
+        );
+    }
+
+    #[test]
+    fn restart_patch_changes_the_pod_template_annotation() {
+        let patch = restart_patch("2026-07-28T01:02:03Z");
+        assert_eq!(
+            patch.pointer("/spec/template/metadata/annotations/kubectl.kubernetes.io~1restartedAt"),
+            Some(&serde_json::json!("2026-07-28T01:02:03Z"))
+        );
+    }
+
+    #[test]
+    fn restart_result_reports_success_and_partial_failures() {
+        assert_eq!(
+            restart_result("Deployment", "deployments", "prod/api", 1, &[]),
+            Ok(ActionResult::Notice(
+                "Restart in progress for Deployment prod/api".to_owned()
+            ))
+        );
+        assert_eq!(
+            restart_result(
+                "Deployment",
+                "deployments",
+                "prod/api",
+                2,
+                &[("prod/worker".to_owned(), "forbidden".to_owned())],
+            ),
+            Err(
+                "Restart requested for 1 of 2 deployments; failed: prod/worker: forbidden"
+                    .to_owned()
+            )
         );
     }
 

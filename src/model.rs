@@ -76,6 +76,14 @@ impl ResourceKind {
     }
 
     #[must_use]
+    pub const fn is_restartable(self) -> bool {
+        matches!(
+            self,
+            Self::Deployments | Self::StatefulSets | Self::DaemonSets
+        )
+    }
+
+    #[must_use]
     pub fn from_alias(alias: &str) -> Option<Self> {
         match alias.to_ascii_lowercase().as_str() {
             "pod" | "pods" | "po" => Some(Self::Pods),

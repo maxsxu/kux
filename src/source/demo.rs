@@ -81,6 +81,7 @@ fn demo_action(action: ActionIntent) -> ActionResult {
         ActionIntent::DrainNode { name, .. } => {
             ActionResult::Notice(format!("Drained demo node {name}"))
         }
+        ActionIntent::Restart { targets } => demo_restart(&targets),
         ActionIntent::Content { target, content } => demo_content(&target, content),
         ActionIntent::Containers { target } => {
             let namespace = target
@@ -169,6 +170,14 @@ fn demo_action(action: ActionIntent) -> ActionResult {
             }
         }
     }
+}
+
+fn demo_restart(targets: &[ResourceTarget]) -> ActionResult {
+    ActionResult::Notice(if targets.len() == 1 {
+        format!("Restart in progress for {}", targets[0].name)
+    } else {
+        format!("Restart in progress for {} demo workloads", targets.len())
+    })
 }
 
 fn demo_delete(targets: &[ResourceTarget], immediate: bool) -> ActionResult {
