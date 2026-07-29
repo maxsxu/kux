@@ -692,7 +692,7 @@ fn columns_for_view(app: &App, width: u16) -> Vec<ViewColumn> {
     } else {
         match app.kind.known_kind() {
             Some(ResourceKind::Pods) => pod_columns(),
-            Some(ResourceKind::Nodes) => node_columns(),
+            Some(ResourceKind::Nodes) => node_columns(app),
             _ => generic_columns(app.ui.wide()),
         }
     };
@@ -854,11 +854,26 @@ fn pod_columns() -> Vec<ViewColumn> {
     ]
 }
 
-fn node_columns() -> Vec<ViewColumn> {
+fn node_columns(app: &App) -> Vec<ViewColumn> {
+    let status_width = app
+        .snapshot
+        .rows
+        .iter()
+        .map(|row| row.status.chars().count())
+        .max()
+        .unwrap_or(0)
+        .clamp(8, 32);
+    let status_width = u16::try_from(status_width).unwrap_or(32);
+
     vec![
         view_column("NAME", SortField::Name, Constraint::Fill(5), 0),
-        view_column("STATUS", SortField::Status, Constraint::Length(10), 0),
-        view_column("TAINTS", SortField::Taints, Constraint::Fill(3), 70),
+        view_column(
+            "STATUS",
+            SortField::Status,
+            Constraint::Length(status_width),
+            0,
+        ),
+        view_column("TAINTS", SortField::Taints, Constraint::Length(8), 70),
         view_column("VERSION", SortField::Version, Constraint::Length(22), 88),
         view_column("PODS", SortField::Pods, Constraint::Length(7), 62),
         view_column("CPU", SortField::Cpu, Constraint::Length(8), 102),
@@ -3227,17 +3242,24 @@ mod tests {
             false,
             vec!["demo".to_owned()],
         );
-        let node = ResourceRow::new("-", "worker-0", "Ready", "worker", "v1.32.0", 0)
-            .with_node_data(NodeData {
-                taints: Arc::from("dedicated=system:NoSchedule,spot=true:NoExecute"),
-                taint_count: 2,
-                version: Arc::from("v1.32.0"),
-                pods: 42,
-                cpu_millis: Some(500),
-                cpu_allocatable_millis: 4_000,
-                memory_bytes: Some(4_096 * 1_048_576),
-                memory_allocatable_bytes: 16_384 * 1_048_576,
-            });
+        let node = ResourceRow::new(
+            "-",
+            "worker-0",
+            "NotReady,SchedulingDisabled",
+            "worker",
+            "v1.32.0",
+            0,
+        )
+        .with_node_data(NodeData {
+            taints: Arc::from("dedicated=system:NoSchedule,spot=true:NoExecute"),
+            taint_count: 2,
+            version: Arc::from("v1.32.0"),
+            pods: 42,
+            cpu_millis: Some(500),
+            cpu_allocatable_millis: 4_000,
+            memory_bytes: Some(4_096 * 1_048_576),
+            memory_allocatable_bytes: 16_384 * 1_048_576,
+        });
         assert_eq!(column_value(&node, SortField::Taints, 0), "2");
         nodes.apply_snapshot(ResourceSnapshot {
             generation: 1,
@@ -3258,6 +3280,16 @@ mod tests {
         ] {
             assert!(rendered.contains(header), "missing node column {header}");
         }
+        assert!(rendered.contains("NotReady,SchedulingDisabled"));
+        let header = rendered
+            .lines()
+            .find(|line| line.contains("STATUS") && line.contains("TAINTS"))
+            .expect("node table header");
+        let status_start = header.find("STATUS").expect("status column");
+        let taints_start = header.find("TAINTS").expect("taints column");
+        let version_start = header.find("VERSION").expect("version column");
+        assert_eq!(taints_start - status_start, 28);
+        assert_eq!(version_start - taints_start, 9);
         assert!(!rendered.contains("NAMESPACE"));
     }
 
