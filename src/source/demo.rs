@@ -278,9 +278,9 @@ fn build_rows(item_count: usize, request: &WatchRequest) -> Vec<Arc<ResourceRow>
         };
         let (status, ready) = if known_kind == Some(ResourceKind::Nodes) {
             if index % 101 == 0 {
-                ("NotReady,SchedulingDisabled", "worker")
+                ("NotReady,Unschedulable", "worker")
             } else if index % 17 == 0 {
-                ("Ready,SchedulingDisabled", "worker")
+                ("Ready,Unschedulable", "worker")
             } else {
                 ("Ready", "worker")
             }

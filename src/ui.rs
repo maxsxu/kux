@@ -2141,7 +2141,7 @@ fn status_style(status: &str) -> Style {
     } else if matches!(
         normalized.as_str(),
         "pending" | "progressing" | "unknown" | "scheduled" | "unschedulable"
-    ) || normalized.contains("schedulingdisabled")
+    ) || normalized.contains("unschedulable")
     {
         YELLOW
     } else if matches!(
@@ -3245,7 +3245,7 @@ mod tests {
         let node = ResourceRow::new(
             "-",
             "worker-0",
-            "NotReady,SchedulingDisabled",
+            "NotReady,Unschedulable",
             "worker",
             "v1.32.0",
             0,
@@ -3280,7 +3280,7 @@ mod tests {
         ] {
             assert!(rendered.contains(header), "missing node column {header}");
         }
-        assert!(rendered.contains("NotReady,SchedulingDisabled"));
+        assert!(rendered.contains("NotReady,Unschedulable"));
         let header = rendered
             .lines()
             .find(|line| line.contains("STATUS") && line.contains("TAINTS"))
@@ -3288,7 +3288,10 @@ mod tests {
         let status_start = header.find("STATUS").expect("status column");
         let taints_start = header.find("TAINTS").expect("taints column");
         let version_start = header.find("VERSION").expect("version column");
-        assert_eq!(taints_start - status_start, 28);
+        assert_eq!(
+            taints_start - status_start,
+            "NotReady,Unschedulable".chars().count() + 1
+        );
         assert_eq!(version_start - taints_start, 9);
         assert!(!rendered.contains("NAMESPACE"));
     }
@@ -3915,8 +3918,8 @@ mod tests {
         assert_eq!(readiness_style("-").fg, Some(MUTED));
         assert_eq!(status_style("KubernetesReady").fg, Some(GREEN));
         assert_eq!(status_style("NotReady").fg, Some(RED));
-        assert_eq!(status_style("NotReady,SchedulingDisabled").fg, Some(RED));
-        assert_eq!(status_style("Ready,SchedulingDisabled").fg, Some(YELLOW));
+        assert_eq!(status_style("NotReady,Unschedulable").fg, Some(RED));
+        assert_eq!(status_style("Ready,Unschedulable").fg, Some(YELLOW));
         assert_eq!(status_style("Scheduled").fg, Some(YELLOW));
         assert_eq!(age_color(30 * 60), GREEN);
         assert_eq!(age_color(12 * 60 * 60), CYAN);

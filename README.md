@@ -176,7 +176,7 @@ Press `?` for the categorized keymap in the body. The full compatibility surface
 - Workload restart uses a guarded confirmation and patches the Pod template's
   `kubectl.kubernetes.io/restartedAt` annotation, triggering the controller's normal rollout.
 - Node status combines readiness and scheduling state, for example `Ready` or
-  `NotReady,SchedulingDisabled`.
+  `NotReady,Unschedulable`.
 - Node drain exposes grace period (`-1` keeps the Kubernetes default), timeout, Ignore DaemonSets,
   Delete EmptyDir Data, Force, and Disable Eviction options. Static mirror pods are always skipped;
   the default checks block DaemonSet, EmptyDir, and unmanaged pods before cordoning. Evictions honor

@@ -3105,7 +3105,7 @@ fn node_row(node: &Node) -> ResourceRow {
         .and_then(|spec| spec.unschedulable)
         .unwrap_or(false);
     let status = if unschedulable {
-        format!("{readiness},SchedulingDisabled")
+        format!("{readiness},Unschedulable")
     } else {
         readiness.to_owned()
     };
@@ -3373,17 +3373,14 @@ mod tests {
         }))
         .expect("valid Node");
 
-        assert_eq!(node_row(&node).status.as_ref(), "Ready,SchedulingDisabled");
+        assert_eq!(node_row(&node).status.as_ref(), "Ready,Unschedulable");
         node.status
             .as_mut()
             .and_then(|status| status.conditions.as_mut())
             .and_then(|conditions| conditions.first_mut())
             .expect("Ready condition")
             .status = "False".to_owned();
-        assert_eq!(
-            node_row(&node).status.as_ref(),
-            "NotReady,SchedulingDisabled"
-        );
+        assert_eq!(node_row(&node).status.as_ref(), "NotReady,Unschedulable");
     }
 
     #[test]
