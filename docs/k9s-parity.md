@@ -66,7 +66,7 @@ K9s key and reports that its backend is pending, and **planned** is not yet expo
 | Port-forward list/start | `f`, `Shift-F` | Interaction; backend pending |
 | Owner navigation | `Shift-J` | Implemented through controller owner references and a server-side name selector |
 | Service benchmark | `b` | Interaction; backend pending |
-| Cordon/uncordon and drain | `u`, `r` on Nodes | Drain implemented with editable grace period and timeout plus Ignore DaemonSets, Delete EmptyDir Data, Force, and Disable Eviction toggles; preflight safety checks run before cordon and evictions remain PDB-aware unless explicitly disabled; standalone cordon/uncordon pending |
+| Cordon/uncordon and drain | `u`, `r` on Nodes | Cordon and uncordon use a guarded scheduling-state patch; drain includes editable grace period and timeout plus Ignore DaemonSets, Delete EmptyDir Data, Force, and Disable Eviction toggles; preflight safety checks run before cordon and evictions remain PDB-aware unless explicitly disabled |
 | Workload restart | `r` on Deployments/StatefulSets/DaemonSets | Implemented with confirmation, multi-selection, bounded concurrent Pod-template patches, and partial-failure reporting; unavailable in read-only mode |
 | Namespace use, UsedBy, CronJob trigger | `u`, `t` | Planned with those resource views |
 

@@ -591,6 +591,16 @@ fn resource_action_hints(app: &App) -> Vec<HeaderHint> {
     if !app.read_only {
         hints.push(action_hint("e", "Edit"));
         if app.kind.known_kind() == Some(ResourceKind::Nodes) {
+            let scheduling_action = if app
+                .selected_row()
+                .and_then(crate::model::ResourceRow::node_data)
+                .is_some_and(|data| data.unschedulable)
+            {
+                "Uncordon"
+            } else {
+                "Cordon"
+            };
+            hints.push(action_hint("u", scheduling_action));
             hints.push(action_hint("r", "Drain"));
         } else if app.is_restartable_workload() {
             hints.push(action_hint("r", "Restart"));
@@ -1419,6 +1429,7 @@ const HELP_CATEGORIES: &[HelpCategory] = &[
         &[
             ("Ctrl-D", "Delete marked / current"),
             ("Ctrl-K", "Kill immediately"),
+            ("u on Nodes", "Cordon / uncordon node"),
             ("r on Nodes", "Drain node with confirmation"),
             ("Ctrl-Z", "Toggle faults"),
         ],
@@ -1961,6 +1972,14 @@ fn draw_delete_confirmation(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Some(PendingDelete::Context { name }) => {
             (" Confirm Delete ", format!("Delete context {name}?"))
         }
+        Some(PendingDelete::NodeScheduling {
+            name,
+            unschedulable: true,
+        }) => (" Confirm Cordon ", format!("Cordon Node {name}?")),
+        Some(PendingDelete::NodeScheduling {
+            name,
+            unschedulable: false,
+        }) => (" Confirm Uncordon ", format!("Uncordon Node {name}?")),
         Some(PendingDelete::DrainNode(_)) => unreachable!("drain dialog handled above"),
         None => (" Confirm Delete ", "Delete resource?".to_owned()),
     };
@@ -2850,6 +2869,30 @@ mod tests {
     }
 
     #[test]
+    fn node_scheduling_confirmation_names_the_requested_operation() {
+        for (unschedulable, title, prompt) in [
+            (true, "Confirm Cordon", "Cordon Node worker-0?"),
+            (false, "Confirm Uncordon", "Uncordon Node worker-0?"),
+        ] {
+            let mut app = app_with_rendered_pod();
+            app.pending_delete = Some(PendingDelete::NodeScheduling {
+                name: "worker-0".to_owned(),
+                unschedulable,
+            });
+            app.overlay = Overlay::ConfirmDelete;
+            let backend = TestBackend::new(120, 30);
+            let mut terminal = Terminal::new(backend).expect("node scheduling terminal");
+
+            terminal
+                .draw(|frame| draw(frame, &mut app))
+                .expect("draw node scheduling confirmation");
+            let rendered = rendered_lines(&terminal, 120).join("\n");
+            assert!(rendered.contains(title));
+            assert!(rendered.contains(prompt));
+        }
+    }
+
+    #[test]
     fn node_drain_confirmation_explains_the_mutation() {
         let mut app = app_with_rendered_pod();
         app.pending_delete = Some(PendingDelete::DrainNode(DrainDialog::new(
@@ -2961,6 +3004,46 @@ mod tests {
                 .iter()
                 .all(|hint| hint.key != "r")
         );
+    }
+
+    #[test]
+    fn node_scheduling_hint_reflects_state_and_respects_read_only_mode() {
+        for (unschedulable, expected) in [(false, "Cordon"), (true, "Uncordon")] {
+            let mut app = App::new(
+                "demo",
+                None,
+                ResourceKind::Nodes,
+                false,
+                vec!["demo".to_owned()],
+            );
+            app.apply_snapshot(ResourceSnapshot {
+                generation: app.generation,
+                kind: ResourceKind::Nodes.into(),
+                rows: Arc::new(vec![Arc::new(
+                    ResourceRow::new("-", "worker-0", "Ready", "worker", "v1.32.0", 0)
+                        .with_node_data(NodeData {
+                            unschedulable,
+                            ..NodeData::default()
+                        }),
+                )]),
+                table_columns: Arc::from([]),
+                state: SourceState::Ready,
+                revision: 1,
+                emitted_at: Instant::now(),
+            });
+
+            assert!(
+                resource_action_hints(&app)
+                    .iter()
+                    .any(|hint| hint.key == "u" && hint.label == expected)
+            );
+            app.read_only = true;
+            assert!(
+                resource_action_hints(&app)
+                    .iter()
+                    .all(|hint| hint.key != "u")
+            );
+        }
     }
 
     #[test]
@@ -3251,6 +3334,7 @@ mod tests {
             0,
         )
         .with_node_data(NodeData {
+            unschedulable: true,
             taints: Arc::from("dedicated=system:NoSchedule,spot=true:NoExecute"),
             taint_count: 2,
             version: Arc::from("v1.32.0"),

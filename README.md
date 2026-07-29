@@ -156,6 +156,7 @@ The header always shows the actions available in the current view. These are the
 | `Ctrl-R` | Restart the active watch |
 | `Ctrl-D` | Delete all marked resources, the current resource when none are marked, or an inactive context—with confirmation |
 | `r` on Deployments, StatefulSets, or DaemonSets | Confirm and request a rollout restart for all marked workloads, or the current workload |
+| `u` on Nodes | Confirm and cordon or uncordon the selected node |
 | `r` on Nodes | Configure, confirm, cordon, and drain the selected node |
 | `Ctrl-L`, `Ctrl-E`, `Ctrl-W` | Toggle logo, header, and wide columns |
 | `:q`, `Ctrl-C` | Quit |
@@ -191,8 +192,7 @@ Press `?` for the categorized keymap in the body. The full compatibility surface
 
 The high-scale list/watch pipeline, dynamic discovery, metrics, YAML, describe, logs, Secret
 decoding, context/namespace switching, mouse sorting, owner traversal, and RBAC policy views are
-functional. Exec/attach, port forwarding, editors, standalone cordon/uncordon, and workload
-scaling remain planned.
+functional. Exec/attach, port forwarding, editors, and workload scaling remain planned.
 
 Kux follows the interaction model popularized by
 [K9s](https://github.com/derailed/k9s) but does not import K9s code and is not affiliated with the

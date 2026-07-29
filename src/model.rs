@@ -443,6 +443,7 @@ pub struct PodData {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NodeData {
+    pub unschedulable: bool,
     pub taints: Arc<str>,
     pub taint_count: u32,
     pub version: Arc<str>,

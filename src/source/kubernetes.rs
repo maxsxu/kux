@@ -284,6 +284,10 @@ async fn handle_action(client: Client, context: &str, action: ActionIntent) -> A
             load_authorization_policy(client, target).await
         }
         ActionIntent::Restart { targets } => restart_workloads(client, targets).await,
+        ActionIntent::SetNodeUnschedulable {
+            name,
+            unschedulable,
+        } => set_node_unschedulable(client, &name, unschedulable).await,
         ActionIntent::DrainNode { name, options } => drain_node(client, &name, options).await,
     };
     result.unwrap_or_else(ActionResult::Error)
@@ -481,14 +485,7 @@ async fn drain_node_with_options(
         ));
     }
 
-    Api::<Node>::all(client.clone())
-        .patch(
-            node_name,
-            &PatchParams::default(),
-            &Patch::Merge(serde_json::json!({ "spec": { "unschedulable": true } })),
-        )
-        .await
-        .map_err(|error| format!("Unable to cordon node {node_name}: {error}"))?;
+    patch_node_unschedulable(client.clone(), node_name, true).await?;
 
     let total = evictable.len();
     let tasks = evictable.iter().cloned().map(|target| {
@@ -513,6 +510,41 @@ async fn drain_node_with_options(
     }
     wait_for_drain_targets(&client, node_name, &evictable).await?;
     drain_result(node_name, total, ignored, &[])
+}
+
+async fn set_node_unschedulable(
+    client: Client,
+    node_name: &str,
+    unschedulable: bool,
+) -> Result<ActionResult, String> {
+    patch_node_unschedulable(client, node_name, unschedulable).await?;
+    let action = if unschedulable {
+        "Cordoned"
+    } else {
+        "Uncordoned"
+    };
+    Ok(ActionResult::Notice(format!("{action} node {node_name}")))
+}
+
+async fn patch_node_unschedulable(
+    client: Client,
+    node_name: &str,
+    unschedulable: bool,
+) -> Result<(), String> {
+    let action = if unschedulable { "cordon" } else { "uncordon" };
+    Api::<Node>::all(client)
+        .patch(
+            node_name,
+            &PatchParams::default(),
+            &Patch::Merge(node_unschedulable_patch(unschedulable)),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("Unable to {action} node {node_name}: {error}"))
+}
+
+fn node_unschedulable_patch(unschedulable: bool) -> serde_json::Value {
+    serde_json::json!({ "spec": { "unschedulable": unschedulable } })
 }
 
 async fn remove_drain_pod(
@@ -3118,6 +3150,7 @@ fn node_row(node: &Node) -> ResourceRow {
         version.clone(),
     )
     .with_node_data(NodeData {
+        unschedulable,
         taints: Arc::from(taints),
         taint_count: u32::try_from(taint_count).unwrap_or(u32::MAX),
         version: Arc::from(version),
@@ -3374,6 +3407,11 @@ mod tests {
         .expect("valid Node");
 
         assert_eq!(node_row(&node).status.as_ref(), "Ready,Unschedulable");
+        assert!(
+            node_row(&node)
+                .node_data()
+                .is_some_and(|data| data.unschedulable)
+        );
         node.status
             .as_mut()
             .and_then(|status| status.conditions.as_mut())
@@ -3381,6 +3419,18 @@ mod tests {
             .expect("Ready condition")
             .status = "False".to_owned();
         assert_eq!(node_row(&node).status.as_ref(), "NotReady,Unschedulable");
+    }
+
+    #[test]
+    fn node_scheduling_patch_sets_the_requested_state() {
+        assert_eq!(
+            node_unschedulable_patch(true).pointer("/spec/unschedulable"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            node_unschedulable_patch(false).pointer("/spec/unschedulable"),
+            Some(&serde_json::json!(false))
+        );
     }
 
     #[test]

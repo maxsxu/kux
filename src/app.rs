@@ -201,6 +201,10 @@ pub enum ActionIntent {
     Restart {
         targets: Vec<ResourceTarget>,
     },
+    SetNodeUnschedulable {
+        name: String,
+        unschedulable: bool,
+    },
     DrainNode {
         name: String,
         options: NodeDrainOptions,
@@ -351,6 +355,7 @@ pub enum PendingDelete {
     Resources(Vec<ResourceTarget>),
     Restart(Vec<ResourceTarget>),
     Context { name: String },
+    NodeScheduling { name: String, unschedulable: bool },
     DrainNode(DrainDialog),
 }
 
@@ -997,7 +1002,7 @@ impl App {
                 self.warp_to_selected_namespace()
             }
             KeyCode::Char('u') if known_kind == Some(ResourceKind::Nodes) => {
-                self.mutation_unavailable("Cordon/uncordon is not implemented yet")
+                self.open_node_scheduling_confirmation()
             }
             KeyCode::Char('b') if known_kind == Some(ResourceKind::Services) => {
                 self.unsupported("Benchmarking is not implemented yet")
@@ -1423,6 +1428,16 @@ impl App {
                         PendingDelete::Context { name } => {
                             self.overlay = Overlay::Contexts;
                             AppCommand::Action(ActionIntent::DeleteContext { name })
+                        }
+                        PendingDelete::NodeScheduling {
+                            name,
+                            unschedulable,
+                        } => {
+                            self.overlay = Overlay::None;
+                            AppCommand::Action(ActionIntent::SetNodeUnschedulable {
+                                name,
+                                unschedulable,
+                            })
                         }
                         PendingDelete::DrainNode(_) => AppCommand::None,
                     })
@@ -2748,6 +2763,28 @@ impl App {
         AppCommand::None
     }
 
+    fn open_node_scheduling_confirmation(&mut self) -> AppCommand {
+        if self.read_only {
+            return self.unsupported("Cordon/uncordon is disabled in read-only mode");
+        }
+        let Some((name, currently_unschedulable)) = self.selected_row().map(|row| {
+            (
+                row.name.to_string(),
+                row.node_data().is_some_and(|data| data.unschedulable),
+            )
+        }) else {
+            return AppCommand::None;
+        };
+        self.pending_delete = Some(PendingDelete::NodeScheduling {
+            name,
+            unschedulable: !currently_unschedulable,
+        });
+        self.confirm_armed = false;
+        self.notice = None;
+        self.overlay = Overlay::ConfirmDelete;
+        AppCommand::None
+    }
+
     fn immediate_delete(&mut self) -> AppCommand {
         if !self.is_resource_view() {
             return self.unsupported("Synthetic rows cannot be deleted");
@@ -2815,14 +2852,6 @@ impl App {
                 true,
             )
         })
-    }
-
-    fn mutation_unavailable(&mut self, message: &str) -> AppCommand {
-        if self.read_only {
-            self.unsupported("Mutation is disabled in read-only mode")
-        } else {
-            self.unsupported(message)
-        }
     }
 
     fn unsupported(&mut self, message: &str) -> AppCommand {
@@ -3877,6 +3906,63 @@ mod tests {
         assert_eq!(
             app.notice.as_deref(),
             Some("Restart is disabled in read-only mode")
+        );
+    }
+
+    #[test]
+    fn node_scheduling_toggle_confirms_cordon_and_uncordon() {
+        for (currently_unschedulable, requested_unschedulable) in [(false, true), (true, false)] {
+            let status = if currently_unschedulable {
+                "Ready,Unschedulable"
+            } else {
+                "Ready"
+            };
+            let row = ResourceRow::new("-", "worker-0", status, "worker", "v1.32.0", 0)
+                .with_node_data(crate::model::NodeData {
+                    unschedulable: currently_unschedulable,
+                    ..crate::model::NodeData::default()
+                });
+            let mut app = app_with_descriptor(ResourceKind::Nodes.into(), None, row);
+
+            assert_eq!(
+                app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)),
+                AppCommand::None
+            );
+            assert_eq!(app.overlay, Overlay::ConfirmDelete);
+            assert_eq!(
+                app.pending_delete,
+                Some(PendingDelete::NodeScheduling {
+                    name: "worker-0".to_owned(),
+                    unschedulable: requested_unschedulable,
+                })
+            );
+            app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+            assert_eq!(
+                app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                AppCommand::Action(ActionIntent::SetNodeUnschedulable {
+                    name: "worker-0".to_owned(),
+                    unschedulable: requested_unschedulable,
+                })
+            );
+            assert_eq!(app.overlay, Overlay::None);
+        }
+    }
+
+    #[test]
+    fn read_only_mode_blocks_node_scheduling_toggle() {
+        let row = ResourceRow::new("-", "worker-0", "Ready", "worker", "v1.32.0", 0)
+            .with_node_data(crate::model::NodeData::default());
+        let mut app = app_with_descriptor(ResourceKind::Nodes.into(), None, row);
+        app.read_only = true;
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)),
+            AppCommand::None
+        );
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Cordon/uncordon is disabled in read-only mode")
         );
     }
 

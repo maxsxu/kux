@@ -81,48 +81,13 @@ fn demo_action(action: ActionIntent) -> ActionResult {
         ActionIntent::DrainNode { name, .. } => {
             ActionResult::Notice(format!("Drained demo node {name}"))
         }
+        ActionIntent::SetNodeUnschedulable {
+            name,
+            unschedulable,
+        } => demo_set_node_unschedulable(&name, unschedulable),
         ActionIntent::Restart { targets } => demo_restart(&targets),
         ActionIntent::Content { target, content } => demo_content(&target, content),
-        ActionIntent::Containers { target } => {
-            let namespace = target
-                .namespace
-                .clone()
-                .unwrap_or_else(|| "default".to_owned());
-            let now = unix_now();
-            let rows = vec![
-                Arc::new(
-                    ResourceRow::new(
-                        namespace.clone(),
-                        "app",
-                        "Running",
-                        "true",
-                        "ghcr.io/example/kux-demo:v1.0.0",
-                        now - 180,
-                    )
-                    .with_container_data(ContainerData {
-                        image: Arc::from("ghcr.io/example/kux-demo:v1.0.0"),
-                        kind: Arc::from("container"),
-                        restarts: 0,
-                    }),
-                ),
-                Arc::new(
-                    ResourceRow::new(
-                        namespace,
-                        "sidecar",
-                        "Running",
-                        "true",
-                        "ghcr.io/example/metrics-sidecar:v0.8.2",
-                        now - 180,
-                    )
-                    .with_container_data(ContainerData {
-                        image: Arc::from("ghcr.io/example/metrics-sidecar:v0.8.2"),
-                        kind: Arc::from("container"),
-                        restarts: 1,
-                    }),
-                ),
-            ];
-            ActionResult::Containers { target, rows }
-        }
+        ActionIntent::Containers { target } => demo_containers(target),
         ActionIntent::ContainerLogs { target, previous } => {
             let label = if previous { "Previous Logs" } else { "Logs" };
             ActionResult::Content {
@@ -172,12 +137,62 @@ fn demo_action(action: ActionIntent) -> ActionResult {
     }
 }
 
+fn demo_containers(target: ResourceTarget) -> ActionResult {
+    let namespace = target
+        .namespace
+        .clone()
+        .unwrap_or_else(|| "default".to_owned());
+    let now = unix_now();
+    let rows = vec![
+        Arc::new(
+            ResourceRow::new(
+                namespace.clone(),
+                "app",
+                "Running",
+                "true",
+                "ghcr.io/example/kux-demo:v1.0.0",
+                now - 180,
+            )
+            .with_container_data(ContainerData {
+                image: Arc::from("ghcr.io/example/kux-demo:v1.0.0"),
+                kind: Arc::from("container"),
+                restarts: 0,
+            }),
+        ),
+        Arc::new(
+            ResourceRow::new(
+                namespace,
+                "sidecar",
+                "Running",
+                "true",
+                "ghcr.io/example/metrics-sidecar:v0.8.2",
+                now - 180,
+            )
+            .with_container_data(ContainerData {
+                image: Arc::from("ghcr.io/example/metrics-sidecar:v0.8.2"),
+                kind: Arc::from("container"),
+                restarts: 1,
+            }),
+        ),
+    ];
+    ActionResult::Containers { target, rows }
+}
+
 fn demo_restart(targets: &[ResourceTarget]) -> ActionResult {
     ActionResult::Notice(if targets.len() == 1 {
         format!("Restart in progress for {}", targets[0].name)
     } else {
         format!("Restart in progress for {} demo workloads", targets.len())
     })
+}
+
+fn demo_set_node_unschedulable(name: &str, unschedulable: bool) -> ActionResult {
+    let action = if unschedulable {
+        "Cordoned"
+    } else {
+        "Uncordoned"
+    };
+    ActionResult::Notice(format!("{action} demo node {name}"))
 }
 
 fn demo_delete(targets: &[ResourceTarget], immediate: bool) -> ActionResult {
@@ -276,21 +291,7 @@ fn build_rows(item_count: usize, request: &WatchRequest) -> Vec<Arc<ResourceRow>
         } else {
             format!("{prefix}-{index:07}")
         };
-        let (status, ready) = if known_kind == Some(ResourceKind::Nodes) {
-            if index % 101 == 0 {
-                ("NotReady,Unschedulable", "worker")
-            } else if index % 17 == 0 {
-                ("Ready,Unschedulable", "worker")
-            } else {
-                ("Ready", "worker")
-            }
-        } else if index % 101 == 0 {
-            ("CrashLoopBackOff", "0/1")
-        } else if index % 37 == 0 {
-            ("Pending", "0/1")
-        } else {
-            ("Running", "1/1")
-        };
+        let (status, ready, unschedulable) = demo_status(known_kind, index);
         let labels = request
             .label_selector
             .clone()
@@ -322,6 +323,7 @@ fn build_rows(item_count: usize, request: &WatchRequest) -> Vec<Arc<ResourceRow>
                 memory_limit_bytes: 1_024 * 1_048_576,
             }),
             Some(ResourceKind::Nodes) => row.with_node_data(NodeData {
+                unschedulable,
                 taints: Arc::from(if index % 10 == 0 {
                     "workload=system:NoSchedule"
                 } else {
@@ -349,6 +351,27 @@ fn build_rows(item_count: usize, request: &WatchRequest) -> Vec<Arc<ResourceRow>
             .then(left.name.cmp(&right.name))
     });
     rows
+}
+
+fn demo_status(
+    known_kind: Option<ResourceKind>,
+    index: usize,
+) -> (&'static str, &'static str, bool) {
+    if known_kind == Some(ResourceKind::Nodes) {
+        if index.is_multiple_of(101) {
+            ("NotReady,Unschedulable", "worker", true)
+        } else if index.is_multiple_of(17) {
+            ("Ready,Unschedulable", "worker", true)
+        } else {
+            ("Ready", "worker", false)
+        }
+    } else if index.is_multiple_of(101) {
+        ("CrashLoopBackOff", "0/1", false)
+    } else if index.is_multiple_of(37) {
+        ("Pending", "0/1", false)
+    } else {
+        ("Running", "1/1", false)
+    }
 }
 
 fn with_demo_owner(row: ResourceRow, request: &WatchRequest, index: usize) -> ResourceRow {
@@ -450,6 +473,22 @@ mod tests {
             row.pod_data()
                 .is_some_and(|data| data.node.as_ref() == "node-0000007")
         }));
+    }
+
+    #[test]
+    fn demo_node_scheduling_actions_report_the_requested_operation() {
+        for (unschedulable, expected) in [
+            (true, "Cordoned demo node worker-0"),
+            (false, "Uncordoned demo node worker-0"),
+        ] {
+            assert_eq!(
+                demo_action(ActionIntent::SetNodeUnschedulable {
+                    name: "worker-0".to_owned(),
+                    unschedulable,
+                }),
+                ActionResult::Notice(expected.to_owned())
+            );
+        }
     }
 
     #[test]
