@@ -334,6 +334,15 @@ fn pod_shell_args(context: &str, target: &PodShellTarget) -> Vec<String> {
     args
 }
 
+fn pod_shell_banner(target: &PodShellTarget) -> String {
+    format!(
+        "<<Kux-Shell>> Pod: {}/{} | Container: {}",
+        target.namespace,
+        target.pod,
+        target.container.as_deref().unwrap_or("<default>")
+    )
+}
+
 async fn open_pod_shell(
     terminal: &mut TerminalGuard,
     context: &str,
@@ -342,6 +351,9 @@ async fn open_pod_shell(
     terminal
         .suspend()
         .context("suspend terminal for pod shell")?;
+    terminal
+        .show_interactive_banner(&pod_shell_banner(target))
+        .context("render pod shell banner")?;
     let status = Command::new("kubectl")
         .args(pod_shell_args(context, target))
         .status()
@@ -379,7 +391,7 @@ mod tests {
         model::{ResourceDescriptor, ResourceOperations},
     };
 
-    use super::{edit_args, pod_shell_args};
+    use super::{edit_args, pod_shell_args, pod_shell_banner};
 
     fn target(group: &str, kind: &str, plural: &str, namespace: Option<&str>) -> ResourceTarget {
         ResourceTarget {
@@ -458,6 +470,23 @@ mod tests {
             !pod_shell_args("prod", &target)
                 .iter()
                 .any(|arg| arg == "--container")
+        );
+        assert_eq!(
+            pod_shell_banner(&target),
+            "<<Kux-Shell>> Pod: team-a/api-0 | Container: <default>"
+        );
+    }
+
+    #[test]
+    fn pod_shell_banner_names_an_explicit_container() {
+        let target = PodShellTarget {
+            namespace: "team-a".to_owned(),
+            pod: "api-0".to_owned(),
+            container: Some("sidecar".to_owned()),
+        };
+        assert_eq!(
+            pod_shell_banner(&target),
+            "<<Kux-Shell>> Pod: team-a/api-0 | Container: sidecar"
         );
     }
 }

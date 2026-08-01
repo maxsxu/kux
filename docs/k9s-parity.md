@@ -61,7 +61,7 @@ K9s key and reports that its backend is pending, and **planned** is not yet expo
 | Wrap/timestamps/fullscreen | `w`, `t`, `f` in content view | Implemented UI toggles |
 | Delete marked resources, current resource, or inactive context with Tab + Enter confirmation | `Ctrl-D` | Implemented; all marked resources are deleted as one bounded batch, while active/synthetic contexts and resources without delete capability remain protected |
 | Kill without confirmation | `Ctrl-K` | Implemented with zero grace period |
-| Pod shell | `s` | Implemented through interactive `kubectl exec` with the active context and namespace; a container selected in the container view is targeted explicitly, while the Pod view honors kubectl's default-container selection; unavailable in read-only mode |
+| Pod shell | `s` | Implemented through interactive `kubectl exec` with the active context and namespace; the host terminal is cleared and starts with a Kux Pod/container identity banner, a container selected in the container view is targeted explicitly, and the Pod view honors kubectl's default-container selection; unavailable in read-only mode |
 | Pod attach | `a` | Interaction; backend pending |
 | Edit any Kubernetes resource | `e` | Implemented from list, details, and YAML views through interactive `kubectl edit` with the active context and selected resource namespace; unavailable in read-only mode |
 | Port-forward list/start | `f`, `Shift-F` | Interaction; backend pending |

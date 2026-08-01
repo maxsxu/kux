@@ -9,7 +9,11 @@ use crossterm::{
     cursor,
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    style::{Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor},
+    terminal::{
+        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+        enable_raw_mode,
+    },
 };
 use ratatui::{
     Terminal,
@@ -56,6 +60,26 @@ impl TerminalGuard {
             DisableMouseCapture,
             LeaveAlternateScreen,
             cursor::Show
+        )?;
+        Ok(())
+    }
+
+    /// Clears the host screen and renders identity for an interactive child session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the terminal cannot be cleared or written.
+    pub fn show_interactive_banner(&mut self, banner: &str) -> Result<()> {
+        execute!(
+            self.terminal.backend_mut(),
+            Clear(ClearType::All),
+            cursor::MoveTo(0, 0),
+            SetBackgroundColor(Color::Green),
+            SetForegroundColor(Color::Black),
+            SetAttribute(Attribute::Bold),
+            Print(banner),
+            SetAttribute(Attribute::Reset),
+            Print("\r\n")
         )?;
         Ok(())
     }
