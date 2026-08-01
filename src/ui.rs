@@ -537,17 +537,22 @@ fn action_hints(app: &App) -> Vec<HeaderHint> {
                 action_hint("esc", "Back"),
             ]);
         }
-        _ if app.is_container_view() => {
-            hints.extend([
-                action_hint("enter", "Logs"),
-                action_hint("l", "Logs"),
-                action_hint("p", "Logs Previous"),
-                action_hint("c", "Copy Name"),
-                action_hint("esc", "Back"),
-            ]);
-        }
+        _ if app.is_container_view() => hints.extend(container_action_hints(app)),
         _ => hints.extend(resource_action_hints(app)),
     }
+    hints
+}
+
+fn container_action_hints(app: &App) -> Vec<HeaderHint> {
+    let mut hints = vec![
+        action_hint("enter", "Logs"),
+        action_hint("l", "Logs"),
+        action_hint("p", "Logs Previous"),
+    ];
+    if !app.read_only {
+        hints.push(action_hint("s", "Shell"));
+    }
+    hints.extend([action_hint("c", "Copy Name"), action_hint("esc", "Back")]);
     hints
 }
 
@@ -581,6 +586,9 @@ fn resource_action_hints(app: &App) -> Vec<HeaderHint> {
     if app.kind.known_kind() == Some(ResourceKind::Pods) {
         hints.push(action_hint("l", "Logs"));
         hints.push(action_hint("p", "Logs Previous"));
+        if !app.read_only {
+            hints.push(action_hint("s", "Shell"));
+        }
     }
     if app.selected_row().is_some_and(|row| row.owner.is_some()) {
         hints.push(action_hint("shift-j", "Owner"));
@@ -1408,6 +1416,7 @@ const HELP_CATEGORIES: &[HelpCategory] = &[
             ("c / n", "Copy name / namespace"),
             ("y / d / e", "YAML / describe / edit"),
             ("l / p", "Logs / previous logs"),
+            ("s on Pods", "Open an interactive pod shell"),
             ("Shift-J", "Open controller owner"),
         ],
     ),
@@ -3004,6 +3013,29 @@ mod tests {
                 .iter()
                 .all(|hint| hint.key != "r")
         );
+    }
+
+    #[test]
+    fn pod_shell_hint_is_contextual_and_respects_read_only_mode() {
+        let mut app = app_with_rendered_pod();
+        assert!(
+            resource_action_hints(&app)
+                .iter()
+                .any(|hint| hint.key == "s" && hint.label == "Shell")
+        );
+
+        app.list_mode = ListMode::Containers {
+            namespace: "default".to_owned(),
+            pod: "api-0".to_owned(),
+        };
+        assert!(
+            action_hints(&app)
+                .iter()
+                .any(|hint| hint.key == "s" && hint.label == "Shell")
+        );
+
+        app.read_only = true;
+        assert!(action_hints(&app).iter().all(|hint| hint.key != "s"));
     }
 
     #[test]

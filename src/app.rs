@@ -176,6 +176,13 @@ pub struct ContainerTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PodShellTarget {
+    pub namespace: String,
+    pub pod: String,
+    pub container: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionIntent {
     Delete {
         targets: Vec<ResourceTarget>,
@@ -347,6 +354,7 @@ pub enum AppCommand {
     Request(ViewState),
     Copy(String),
     Edit(ResourceTarget),
+    Shell(PodShellTarget),
     Action(ActionIntent),
 }
 
@@ -983,9 +991,8 @@ impl App {
             KeyCode::Char('p') if known_kind == Some(ResourceKind::Pods) => {
                 self.content_action(ContentKind::PreviousLogs)
             }
-            KeyCode::Char('s') if known_kind == Some(ResourceKind::Pods) => {
-                self.unsupported("Shell is not implemented yet")
-            }
+            KeyCode::Char('s') if self.is_container_view() => self.container_shell_action(),
+            KeyCode::Char('s') if known_kind == Some(ResourceKind::Pods) => self.pod_shell_action(),
             KeyCode::Char('a') if known_kind == Some(ResourceKind::Pods) => {
                 self.unsupported("Attach is not implemented yet")
             }
@@ -2613,6 +2620,39 @@ impl App {
                     container: row.name.to_string(),
                 },
                 previous,
+            })
+        })
+    }
+
+    fn pod_shell_action(&mut self) -> AppCommand {
+        if self.read_only {
+            return self.unsupported("Shell is disabled in read-only mode");
+        }
+        let Some(target) = self.selected_target() else {
+            return AppCommand::None;
+        };
+        let Some(namespace) = target.namespace else {
+            return self.unsupported("Pod shell requires a namespace");
+        };
+        AppCommand::Shell(PodShellTarget {
+            namespace,
+            pod: target.name,
+            container: None,
+        })
+    }
+
+    fn container_shell_action(&mut self) -> AppCommand {
+        if self.read_only {
+            return self.unsupported("Shell is disabled in read-only mode");
+        }
+        let ListMode::Containers { namespace, pod } = &self.list_mode else {
+            return AppCommand::None;
+        };
+        self.selected_row().map_or(AppCommand::None, |row| {
+            AppCommand::Shell(PodShellTarget {
+                namespace: namespace.clone(),
+                pod: pod.clone(),
+                container: Some(row.name.to_string()),
             })
         })
     }
@@ -5193,6 +5233,59 @@ mod tests {
         assert_eq!(
             app.selected_row().map(|row| row.name.as_ref()),
             Some("api-0")
+        );
+    }
+
+    #[test]
+    fn pod_shell_targets_the_selected_pod_and_optional_container() {
+        let mut app = app_with_rows();
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+            AppCommand::Shell(PodShellTarget {
+                namespace: "prod".to_owned(),
+                pod: "api-0".to_owned(),
+                container: None,
+            })
+        );
+
+        let AppCommand::Action(ActionIntent::Containers { target }) =
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("expected container request");
+        };
+        app.show_containers(
+            target,
+            vec![Arc::new(ResourceRow::new(
+                "prod",
+                "sidecar",
+                "Running",
+                "true",
+                "example/sidecar:v1",
+                0,
+            ))],
+        );
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+            AppCommand::Shell(PodShellTarget {
+                namespace: "prod".to_owned(),
+                pod: "api-0".to_owned(),
+                container: Some("sidecar".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn read_only_mode_blocks_pod_shell() {
+        let mut app = app_with_rows();
+        app.read_only = true;
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+            AppCommand::None
+        );
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Shell is disabled in read-only mode")
         );
     }
 

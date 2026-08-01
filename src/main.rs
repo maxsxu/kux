@@ -6,7 +6,7 @@ use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::StreamExt;
 use kube::{Client, Config, config::KubeConfigOptions};
 use kux::{
-    app::{App, AppCommand, Overlay, ResourceTarget},
+    app::{App, AppCommand, Overlay, PodShellTarget, ResourceTarget},
     cli::Cli,
     kubeconfig::{ContextCatalog, ContextInfo, fallback_contexts},
     model::ResourceSnapshot,
@@ -178,6 +178,12 @@ async fn run(
                                     Err(error) => app.show_transient_notice(format!("Edit failed: {error}")),
                                 }
                             }
+                            AppCommand::Shell(target) => {
+                                let result = open_pod_shell(&mut terminal, &app.context, &target)
+                                    .await
+                                    .context("restore terminal after pod shell")?;
+                                report_shell_result(&mut app, &target, result);
+                            }
                             AppCommand::Action(action) => {
                                 actions.send(action).await.context("action worker stopped")?;
                                 app.show_notice("Working…");
@@ -306,14 +312,74 @@ async fn edit_resource(
     Ok(status)
 }
 
+fn pod_shell_args(context: &str, target: &PodShellTarget) -> Vec<String> {
+    let mut args = vec![
+        "exec".to_owned(),
+        "-it".to_owned(),
+        "--context".to_owned(),
+        context.to_owned(),
+        "--namespace".to_owned(),
+        target.namespace.clone(),
+        target.pod.clone(),
+    ];
+    if let Some(container) = &target.container {
+        args.extend(["--container".to_owned(), container.clone()]);
+    }
+    args.extend([
+        "--".to_owned(),
+        "sh".to_owned(),
+        "-c".to_owned(),
+        "command -v bash >/dev/null && exec bash || exec sh".to_owned(),
+    ]);
+    args
+}
+
+async fn open_pod_shell(
+    terminal: &mut TerminalGuard,
+    context: &str,
+    target: &PodShellTarget,
+) -> Result<Result<std::process::ExitStatus, String>> {
+    terminal
+        .suspend()
+        .context("suspend terminal for pod shell")?;
+    let status = Command::new("kubectl")
+        .args(pod_shell_args(context, target))
+        .status()
+        .await
+        .map_err(|error| format!("Unable to run kubectl exec: {error}"));
+    terminal.resume()?;
+    Ok(status)
+}
+
+fn report_shell_result(
+    app: &mut App,
+    target: &PodShellTarget,
+    result: std::result::Result<std::process::ExitStatus, String>,
+) {
+    match result {
+        Ok(status) if status.success() => {
+            app.show_transient_notice(format!(
+                "Shell closed for {}/{}",
+                target.namespace, target.pod
+            ));
+        }
+        Ok(status) => {
+            app.show_transient_notice(format!("Shell failed: kubectl exec exited with {status}"));
+        }
+        Err(error) => {
+            app.show_transient_notice(format!("Shell failed: {error}"));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use kux::{
-        app::ResourceTarget,
+        app::{PodShellTarget, ResourceTarget},
         model::{ResourceDescriptor, ResourceOperations},
     };
 
-    use super::edit_args;
+    use super::{edit_args, pod_shell_args};
 
     fn target(group: &str, kind: &str, plural: &str, namespace: Option<&str>) -> ResourceTarget {
         ResourceTarget {
@@ -355,6 +421,43 @@ mod tests {
         assert_eq!(
             edit_args("prod", &target("", "Namespace", "namespaces", None)),
             ["edit", "namespaces", "selected", "--context", "prod"]
+        );
+    }
+
+    #[test]
+    fn pod_shell_args_preserve_context_namespace_and_optional_container() {
+        let target = PodShellTarget {
+            namespace: "team-a".to_owned(),
+            pod: "api-0".to_owned(),
+            container: Some("api".to_owned()),
+        };
+        assert_eq!(
+            pod_shell_args("prod", &target),
+            [
+                "exec",
+                "-it",
+                "--context",
+                "prod",
+                "--namespace",
+                "team-a",
+                "api-0",
+                "--container",
+                "api",
+                "--",
+                "sh",
+                "-c",
+                "command -v bash >/dev/null && exec bash || exec sh",
+            ]
+        );
+
+        let target = PodShellTarget {
+            container: None,
+            ..target
+        };
+        assert!(
+            !pod_shell_args("prod", &target)
+                .iter()
+                .any(|arg| arg == "--container")
         );
     }
 }

@@ -82,6 +82,7 @@ Navigation stays in place instead of stacking popups:
 
 ```text
 Node ──Enter──▶ Pods on node ──Enter──▶ Containers ──Enter──▶ Logs
+Pod ──s──▶ Interactive shell (or choose a container first with Enter)
 Deployment ──Enter──▶ ReplicaSets ──Enter──▶ Pods
 StatefulSet / DaemonSet / selector-backed Service ──Enter──▶ Pods
 ServiceAccount ──Enter──▶ Effective RBAC policy matrix
