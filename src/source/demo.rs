@@ -313,6 +313,7 @@ fn build_rows(item_count: usize, request: &WatchRequest) -> Vec<Arc<ResourceRow>
             Some(ResourceKind::Pods) => row.with_pod_data(PodData {
                 restarts: u32::try_from(index % 13).unwrap_or(0),
                 node: Arc::from(node),
+                default_container: Arc::from("app"),
                 cpu_millis: Some(u64::try_from(index % 500 + 1).unwrap_or(1)),
                 cpu_request_millis: 500,
                 cpu_limit_millis: 1_000,

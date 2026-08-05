@@ -179,7 +179,7 @@ pub struct ContainerTarget {
 pub struct PodShellTarget {
     pub namespace: String,
     pub pod: String,
-    pub container: Option<String>,
+    pub container: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2628,6 +2628,14 @@ impl App {
         if self.read_only {
             return self.unsupported("Shell is disabled in read-only mode");
         }
+        let Some(container) = self
+            .selected_row()
+            .and_then(ResourceRow::pod_data)
+            .map(|data| data.default_container.to_string())
+            .filter(|container| !container.is_empty())
+        else {
+            return self.unsupported("Pod has no regular containers");
+        };
         let Some(target) = self.selected_target() else {
             return AppCommand::None;
         };
@@ -2637,7 +2645,7 @@ impl App {
         AppCommand::Shell(PodShellTarget {
             namespace,
             pod: target.name,
-            container: None,
+            container,
         })
     }
 
@@ -2652,7 +2660,7 @@ impl App {
             AppCommand::Shell(PodShellTarget {
                 namespace: namespace.clone(),
                 pod: pod.clone(),
-                container: Some(row.name.to_string()),
+                container: row.name.to_string(),
             })
         })
     }
@@ -3210,7 +3218,10 @@ fn percent_of(value: Option<u64>, total: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{kubeconfig::ContextInfo, model::NamespaceInfo};
+    use crate::{
+        kubeconfig::ContextInfo,
+        model::{NamespaceInfo, PodData},
+    };
 
     fn context(
         name: &str,
@@ -5237,14 +5248,21 @@ mod tests {
     }
 
     #[test]
-    fn pod_shell_targets_the_selected_pod_and_optional_container() {
-        let mut app = app_with_rows();
+    fn pod_shell_targets_the_resolved_or_selected_container() {
+        let mut app = app_with_descriptor(
+            ResourceKind::Pods.into(),
+            None,
+            ResourceRow::new("prod", "api-0", "Running", "1/1", "0", 0).with_pod_data(PodData {
+                default_container: Arc::from("api"),
+                ..PodData::default()
+            }),
+        );
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
             AppCommand::Shell(PodShellTarget {
                 namespace: "prod".to_owned(),
                 pod: "api-0".to_owned(),
-                container: None,
+                container: "api".to_owned(),
             })
         );
 
@@ -5269,7 +5287,7 @@ mod tests {
             AppCommand::Shell(PodShellTarget {
                 namespace: "prod".to_owned(),
                 pod: "api-0".to_owned(),
-                container: Some("sidecar".to_owned()),
+                container: "sidecar".to_owned(),
             })
         );
     }

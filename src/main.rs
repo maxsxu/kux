@@ -322,9 +322,7 @@ fn pod_shell_args(context: &str, target: &PodShellTarget) -> Vec<String> {
         target.namespace.clone(),
         target.pod.clone(),
     ];
-    if let Some(container) = &target.container {
-        args.extend(["--container".to_owned(), container.clone()]);
-    }
+    args.extend(["--container".to_owned(), target.container.clone()]);
     args.extend([
         "--".to_owned(),
         "sh".to_owned(),
@@ -337,9 +335,7 @@ fn pod_shell_args(context: &str, target: &PodShellTarget) -> Vec<String> {
 fn pod_shell_banner(target: &PodShellTarget) -> String {
     format!(
         "<<Kux-Shell>> Pod: {}/{} | Container: {}",
-        target.namespace,
-        target.pod,
-        target.container.as_deref().unwrap_or("<default>")
+        target.namespace, target.pod, target.container
     )
 }
 
@@ -437,11 +433,11 @@ mod tests {
     }
 
     #[test]
-    fn pod_shell_args_preserve_context_namespace_and_optional_container() {
+    fn pod_shell_args_preserve_context_namespace_and_container() {
         let target = PodShellTarget {
             namespace: "team-a".to_owned(),
             pod: "api-0".to_owned(),
-            container: Some("api".to_owned()),
+            container: "api".to_owned(),
         };
         assert_eq!(
             pod_shell_args("prod", &target),
@@ -462,18 +458,9 @@ mod tests {
             ]
         );
 
-        let target = PodShellTarget {
-            container: None,
-            ..target
-        };
-        assert!(
-            !pod_shell_args("prod", &target)
-                .iter()
-                .any(|arg| arg == "--container")
-        );
         assert_eq!(
             pod_shell_banner(&target),
-            "<<Kux-Shell>> Pod: team-a/api-0 | Container: <default>"
+            "<<Kux-Shell>> Pod: team-a/api-0 | Container: api"
         );
     }
 
@@ -482,7 +469,7 @@ mod tests {
         let target = PodShellTarget {
             namespace: "team-a".to_owned(),
             pod: "api-0".to_owned(),
-            container: Some("sidecar".to_owned()),
+            container: "sidecar".to_owned(),
         };
         assert_eq!(
             pod_shell_banner(&target),

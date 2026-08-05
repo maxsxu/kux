@@ -433,6 +433,7 @@ pub struct ChildResourceData {
 pub struct PodData {
     pub restarts: u32,
     pub node: Arc<str>,
+    pub default_container: Arc<str>,
     pub cpu_millis: Option<u64>,
     pub cpu_request_millis: u64,
     pub cpu_limit_millis: u64,

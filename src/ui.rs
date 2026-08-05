@@ -3321,6 +3321,7 @@ mod tests {
             ResourceRow::new("default", "api-0", "Running", "1/1", "3", 0).with_pod_data(PodData {
                 restarts: 3,
                 node: Arc::from("worker-0"),
+                default_container: Arc::from("api"),
                 cpu_millis: Some(25),
                 cpu_request_millis: 100,
                 cpu_limit_millis: 200,

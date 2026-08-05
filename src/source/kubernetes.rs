@@ -2682,6 +2682,7 @@ fn pod_row(pod: &Pod) -> ResourceRow {
         .as_ref()
         .and_then(|spec| spec.node_name.clone())
         .unwrap_or_else(|| "-".to_owned());
+    let default_container = pod_default_container(pod).unwrap_or_default();
     resource_row(
         pod,
         namespace,
@@ -2693,12 +2694,35 @@ fn pod_row(pod: &Pod) -> ResourceRow {
     .with_pod_data(PodData {
         restarts: u32::try_from(restarts.max(0)).unwrap_or(0),
         node: Arc::from(node),
+        default_container: Arc::from(default_container),
         cpu_millis: None,
         cpu_request_millis,
         cpu_limit_millis,
         memory_bytes: None,
         memory_request_bytes,
         memory_limit_bytes,
+    })
+}
+
+fn pod_default_container(pod: &Pod) -> Option<&str> {
+    const DEFAULT_CONTAINER_ANNOTATION: &str = "kubectl.kubernetes.io/default-container";
+
+    let spec = pod.spec.as_ref()?;
+    let annotated = pod
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(DEFAULT_CONTAINER_ANNOTATION))
+        .map(String::as_str)
+        .filter(|name| {
+            spec.containers
+                .iter()
+                .any(|container| container.name == *name)
+        });
+    annotated.or_else(|| {
+        spec.containers
+            .first()
+            .map(|container| container.name.as_str())
     })
 }
 
@@ -3812,6 +3836,45 @@ mod tests {
         let data = row.pod_data().expect("pod data");
         assert_eq!(data.restarts, 3);
         assert_eq!(data.node.as_ref(), "-");
+        assert_eq!(data.default_container.as_ref(), "api");
+    }
+
+    #[test]
+    fn pod_default_container_honors_valid_annotation_and_falls_back_to_first() {
+        let mut pod = Pod {
+            metadata: ObjectMeta {
+                annotations: Some(BTreeMap::from([(
+                    "kubectl.kubernetes.io/default-container".to_owned(),
+                    "sidecar".to_owned(),
+                )])),
+                ..ObjectMeta::default()
+            },
+            spec: Some(PodSpec {
+                containers: vec![
+                    Container {
+                        name: "api".to_owned(),
+                        ..Container::default()
+                    },
+                    Container {
+                        name: "sidecar".to_owned(),
+                        ..Container::default()
+                    },
+                ],
+                ..PodSpec::default()
+            }),
+            ..Pod::default()
+        };
+
+        assert_eq!(pod_default_container(&pod), Some("sidecar"));
+        pod.metadata
+            .annotations
+            .as_mut()
+            .expect("annotations")
+            .insert(
+                "kubectl.kubernetes.io/default-container".to_owned(),
+                "missing".to_owned(),
+            );
+        assert_eq!(pod_default_container(&pod), Some("api"));
     }
 
     #[test]
