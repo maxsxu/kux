@@ -101,19 +101,20 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         Overlay::Help => draw_help(frame, app, body_area),
         Overlay::Content => draw_content(frame, app, body_area),
         Overlay::Details => draw_details(frame, app, body_area),
+        Overlay::PortForwards => draw_port_forwards(frame, app, body_area),
         _ => draw_resources(frame, app, body_area),
     }
 
     match app.overlay {
         Overlay::ConfirmDelete => draw_delete_confirmation(frame, app, area),
         Overlay::PortForwardDialog => draw_port_forward_dialog(frame, app, area),
-        Overlay::PortForwards => draw_port_forwards(frame, app, area),
         Overlay::Aliases
         | Overlay::Namespaces
         | Overlay::Contexts
         | Overlay::Help
         | Overlay::Content
         | Overlay::Details
+        | Overlay::PortForwards
         | Overlay::None => {}
     }
 }
@@ -613,6 +614,7 @@ fn resource_action_hints(app: &App) -> Vec<HeaderHint> {
     if app.kind.known_kind() == Some(ResourceKind::Pods) {
         hints.push(action_hint("l", "Logs"));
         hints.push(action_hint("p", "Logs Previous"));
+        hints.push(action_hint("o", "Node"));
         if !app.read_only {
             hints.push(action_hint("s", "Shell"));
         }
@@ -1452,6 +1454,9 @@ const HELP_CATEGORIES: &[HelpCategory] = &[
             ("c / n", "Copy name / namespace"),
             ("y / d / e", "YAML / describe / edit"),
             ("l / p", "Logs / previous logs"),
+            ("o on Pods", "Open the Pod's Node"),
+            ("f / :pf", "Open the context port-forward list"),
+            ("Shift-F", "Start Pod/Service port forward"),
             ("s on Pods", "Open an interactive pod shell"),
             ("Shift-J", "Open controller owner"),
         ],
@@ -1854,6 +1859,7 @@ fn draw_content(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let lines = match app.content_kind {
         Some(ContentKind::Yaml | ContentKind::SecretData) => highlight_yaml(&filtered),
         Some(ContentKind::Describe) => highlight_describe(&filtered),
+        Some(ContentKind::Logs | ContentKind::PreviousLogs) => highlight_logs(&filtered),
         _ => filtered
             .lines()
             .map(|line| Line::raw(line.to_owned()))
@@ -1879,6 +1885,67 @@ fn draw_content(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         paragraph
     };
     frame.render_widget(paragraph, area);
+}
+
+fn highlight_logs(body: &str) -> Vec<Line<'static>> {
+    body.lines().map(highlight_log_line).collect()
+}
+
+fn highlight_log_line(line: &str) -> Line<'static> {
+    let message_style = log_message_style(line);
+    let Some(separator) = line.find(char::is_whitespace) else {
+        return Line::from(Span::styled(line.to_owned(), message_style));
+    };
+    let (prefix, message) = line.split_at(separator);
+    if !looks_like_log_timestamp(prefix) {
+        return Line::from(Span::styled(line.to_owned(), message_style));
+    }
+    Line::from(vec![
+        Span::styled(prefix.to_owned(), Style::default().fg(PURPLE)),
+        Span::styled(message.to_owned(), message_style),
+    ])
+}
+
+fn looks_like_log_timestamp(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (bytes.len() >= 10
+        && bytes.get(4) == Some(&b'-')
+        && bytes.get(7) == Some(&b'-')
+        && bytes[..4].iter().all(u8::is_ascii_digit))
+        || (bytes.len() >= 5
+            && matches!(bytes.first(), Some(b'I' | b'W' | b'E' | b'F'))
+            && bytes[1..5].iter().all(u8::is_ascii_digit))
+}
+
+fn log_message_style(line: &str) -> Style {
+    let normalized = line.to_ascii_lowercase();
+    if contains_log_level(&normalized, &["fatal", "panic", "error", "err"])
+        || normalized.starts_with('e')
+            && looks_like_log_timestamp(line.split_whitespace().next().unwrap_or(""))
+    {
+        Style::default().fg(RED).bold()
+    } else if contains_log_level(&normalized, &["warning", "warn"])
+        || normalized.starts_with('w')
+            && looks_like_log_timestamp(line.split_whitespace().next().unwrap_or(""))
+    {
+        Style::default().fg(ORANGE)
+    } else if contains_log_level(&normalized, &["debug"]) {
+        Style::default().fg(CYAN)
+    } else if contains_log_level(&normalized, &["trace"]) {
+        Style::default().fg(MUTED)
+    } else if contains_log_level(&normalized, &["info"])
+        || normalized.starts_with('i')
+            && looks_like_log_timestamp(line.split_whitespace().next().unwrap_or(""))
+    {
+        Style::default().fg(GREEN)
+    } else {
+        Style::default().fg(Color::White)
+    }
+}
+
+fn contains_log_level(line: &str, levels: &[&str]) -> bool {
+    line.split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|word| levels.contains(&word))
 }
 
 fn paragraph_content_height(lines: &[Line<'_>], width: u16, wrap: bool) -> usize {
@@ -2087,26 +2154,34 @@ fn port_forward_option_line(label: &str, value: &str, selected: bool) -> Line<'s
     ])
 }
 
-fn draw_port_forwards(frame: &mut Frame<'_>, app: &App, dialog_area: Rect) {
-    let height = u16::try_from(app.port_forwards.len().saturating_add(6))
-        .unwrap_or(u16::MAX)
-        .clamp(8, 22)
-        .min(dialog_area.height);
-    let popup = centered_rect(78, height, dialog_area);
-    frame.render_widget(Clear, popup);
+fn draw_port_forwards(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let title = format!(" portforwards(all)[{}] ", app.port_forwards.len());
+    let capacity = usize::from(area.height.saturating_sub(3)).max(1);
+    let start = app
+        .overlay_selected
+        .saturating_add(1)
+        .saturating_sub(capacity)
+        .min(app.port_forwards.len().saturating_sub(capacity));
     let rows = app
         .port_forwards
         .iter()
         .enumerate()
+        .skip(start)
+        .take(capacity)
         .map(|(index, forward)| {
-            let target = forward.target.namespace.as_ref().map_or_else(
-                || forward.target.name.clone(),
-                |namespace| format!("{namespace}/{}", forward.target.name),
-            );
             Row::new([
-                Cell::from(target),
+                Cell::from(
+                    forward
+                        .target
+                        .namespace
+                        .as_deref()
+                        .unwrap_or("-")
+                        .to_owned(),
+                ),
+                Cell::from(forward.target.kind.kind.to_string()),
+                Cell::from(forward.target.name.clone()),
+                Cell::from(format!("{}->{}", forward.local_port, forward.remote_port)),
                 Cell::from(forward.address.clone()),
-                Cell::from(format!("{}:{}", forward.local_port, forward.remote_port)),
                 Cell::from(forward.state.label()),
             ])
             .style(if index == app.overlay_selected {
@@ -2118,19 +2193,33 @@ fn draw_port_forwards(frame: &mut Frame<'_>, app: &App, dialog_area: Rect) {
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(44),
+            Constraint::Percentage(18),
+            Constraint::Length(9),
+            Constraint::Percentage(30),
+            Constraint::Length(15),
             Constraint::Percentage(20),
-            Constraint::Percentage(20),
-            Constraint::Percentage(16),
+            Constraint::Length(10),
         ],
     )
     .header(
-        Row::new(["TARGET", "ADDRESS", "LOCAL:REMOTE", "STATUS"])
-            .style(Style::default().fg(YELLOW).bold()),
+        Row::new([
+            "NAMESPACE",
+            "KIND",
+            "NAME",
+            "LOCAL->REMOTE",
+            "ADDRESS",
+            "STATUS",
+        ])
+        .style(Style::default().fg(YELLOW).bold()),
     )
     .column_spacing(1)
-    .block(popup_block(" <PortForwards> ").border_style(Style::default().fg(BODY_BORDER)));
-    frame.render_widget(table, popup);
+    .block(notice_block(
+        popup_block(&title)
+            .title_alignment(Alignment::Center)
+            .border_style(Style::default().fg(BODY_BORDER)),
+        app,
+    ));
+    frame.render_widget(table, area);
 }
 
 fn draw_delete_confirmation(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -2792,6 +2881,37 @@ mod tests {
         assert!(rendered.contains("Container Port:"));
         assert!(rendered.contains("Local Port:"));
         assert!(rendered.contains("localhost"));
+    }
+
+    #[test]
+    fn renders_global_port_forward_list() {
+        let mut app = app_with_rendered_pod();
+        app.show_port_forwards(vec![crate::app::PortForwardInfo {
+            id: 1,
+            context: "demo".to_owned(),
+            target: crate::app::ResourceTarget {
+                kind: ResourceKind::Services.into(),
+                namespace: Some("default".to_owned()),
+                name: "api".to_owned(),
+            },
+            remote_port: 8080,
+            local_port: 18080,
+            address: "localhost".to_owned(),
+            state: crate::app::PortForwardState::Running,
+        }]);
+        let backend = TestBackend::new(140, 40);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw port-forward list");
+        let rendered = rendered_lines(&terminal, 140).join("\n");
+
+        assert!(rendered.contains("portforwards(all)[1]"));
+        assert!(rendered.contains("default"));
+        assert!(rendered.contains("Service"));
+        assert!(rendered.contains("api"));
+        assert!(rendered.contains("18080->8080"));
+        assert!(rendered.contains("Running"));
     }
 
     #[test]
@@ -4288,5 +4408,21 @@ mod tests {
         assert_eq!(lines[0].spans[1].style.fg, Some(CYAN));
         assert_eq!(lines[2].spans[0].content.as_ref(), "  ");
         assert_eq!(lines[3].spans[0].content.as_ref(), "    ");
+    }
+
+    #[test]
+    fn log_highlighter_colors_timestamps_and_severity() {
+        let lines = highlight_logs(
+            "2026-08-05T10:00:00Z INFO started\n\
+             2026-08-05T10:00:01Z WARN retrying\n\
+             2026-08-05T10:00:02Z ERROR failed\n\
+             {\"level\":\"debug\",\"message\":\"probe\"}",
+        );
+
+        assert_eq!(lines[0].spans[0].style.fg, Some(PURPLE));
+        assert_eq!(lines[0].spans[1].style.fg, Some(GREEN));
+        assert_eq!(lines[1].spans[1].style.fg, Some(ORANGE));
+        assert_eq!(lines[2].spans[1].style.fg, Some(RED));
+        assert_eq!(lines[3].spans[0].style.fg, Some(CYAN));
     }
 }

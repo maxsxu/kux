@@ -850,11 +850,7 @@ async fn fetch_content(
         let body = api
             .logs(
                 &target.name,
-                &LogParams {
-                    previous: content_kind == ContentKind::PreviousLogs,
-                    tail_lines: Some(500),
-                    ..LogParams::default()
-                },
+                &pod_log_params(None, content_kind == ContentKind::PreviousLogs),
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -1718,12 +1714,7 @@ async fn fetch_container_logs(
     let body = Api::<Pod>::namespaced(client, &target.namespace)
         .logs(
             &target.pod,
-            &LogParams {
-                container: Some(target.container.clone()),
-                previous,
-                tail_lines: Some(500),
-                ..LogParams::default()
-            },
+            &pod_log_params(Some(target.container.clone()), previous),
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -1743,6 +1734,15 @@ async fn fetch_container_logs(
             ContentKind::Logs
         },
     })
+}
+
+fn pod_log_params(container: Option<String>, previous: bool) -> LogParams {
+    LogParams {
+        container,
+        previous,
+        tail_lines: Some(500),
+        ..LogParams::default()
+    }
 }
 
 fn container_rows(pod: &Pod) -> Vec<ResourceRow> {
@@ -3911,6 +3911,15 @@ mod tests {
         assert_eq!(row.port_forward_ports().len(), 1);
         assert_eq!(row.port_forward_ports()[0].display(), "80(http)");
         assert_eq!(row.port_forward_ports()[0].port, 80);
+    }
+
+    #[test]
+    fn previous_log_params_keep_the_selected_container() {
+        let params = pod_log_params(Some("sidecar".to_owned()), true);
+
+        assert_eq!(params.container.as_deref(), Some("sidecar"));
+        assert!(params.previous);
+        assert_eq!(params.tail_lines, Some(500));
     }
 
     #[test]

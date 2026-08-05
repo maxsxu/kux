@@ -262,9 +262,9 @@ async fn handle_app_command(
                 app.show_transient_notice(format!("Port forward failed: {error}"));
             }
         },
-        AppCommand::ShowPortForwards(target) => {
-            let forwards = port_forwards.summaries_for(&app.context, &target);
-            app.show_port_forwards(target, forwards);
+        AppCommand::ShowPortForwards => {
+            let forwards = port_forwards.summaries(&app.context);
+            app.show_port_forwards(forwards);
         }
         AppCommand::StopPortForward(id) => {
             if let Some(forward) = port_forwards.stop(id) {
@@ -288,10 +288,7 @@ async fn handle_app_command(
 }
 
 fn refresh_visible_port_forwards(app: &mut App, manager: &PortForwardManager) {
-    let Some(target) = app.port_forward_target().cloned() else {
-        return;
-    };
-    let forwards = manager.summaries_for(&app.context, &target);
+    let forwards = manager.summaries(&app.context);
     app.refresh_port_forwards(forwards);
 }
 

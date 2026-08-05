@@ -142,6 +142,15 @@ impl PortForwardManager {
     }
 
     #[must_use]
+    pub fn summaries(&self, context: &str) -> Vec<PortForwardInfo> {
+        self.sessions
+            .values()
+            .filter(|session| session.info.context == context)
+            .map(|session| session.info.clone())
+            .collect()
+    }
+
+    #[must_use]
     pub fn summaries_for(&self, context: &str, target: &ResourceTarget) -> Vec<PortForwardInfo> {
         self.sessions
             .values()
@@ -318,6 +327,8 @@ mod tests {
             manager.summaries_for("demo", &target)[0].state,
             PortForwardState::Running
         );
+        assert_eq!(manager.summaries("demo").len(), 1);
+        assert!(manager.summaries("other").is_empty());
         assert_eq!(
             manager.stop(info.id).map(|forward| forward.id),
             Some(info.id)

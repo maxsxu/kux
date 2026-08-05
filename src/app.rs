@@ -463,7 +463,7 @@ pub enum AppCommand {
     Edit(ResourceTarget),
     Shell(PodShellTarget),
     StartPortForward(PortForwardRequest),
-    ShowPortForwards(ResourceTarget),
+    ShowPortForwards,
     StopPortForward(u64),
     Action(ActionIntent),
 }
@@ -678,7 +678,6 @@ pub struct App {
     input_before_edit: String,
     drain_value_edit_state: DrainValueEditState,
     port_forward_value_edit_state: DrainValueEditState,
-    port_forward_target: Option<ResourceTarget>,
 }
 
 impl App {
@@ -778,7 +777,6 @@ impl App {
             input_before_edit: String::new(),
             drain_value_edit_state: DrainValueEditState::Pristine,
             port_forward_value_edit_state: DrainValueEditState::Pristine,
-            port_forward_target: None,
         }
     }
 
@@ -1107,12 +1105,13 @@ impl App {
             KeyCode::Char('l') if self.is_container_view() => self.container_log_action(false),
             KeyCode::Char('p') if self.is_container_view() => self.container_log_action(true),
             KeyCode::Char('l') if known_kind == Some(ResourceKind::Pods) => {
-                self.content_action(ContentKind::Logs)
+                self.pod_log_action(false)
             }
             KeyCode::Char('l') => self.open_selected(),
             KeyCode::Char('p') if known_kind == Some(ResourceKind::Pods) => {
-                self.content_action(ContentKind::PreviousLogs)
+                self.pod_log_action(true)
             }
+            KeyCode::Char('o') if known_kind == Some(ResourceKind::Pods) => self.open_pod_node(),
             KeyCode::Char('s') if self.is_container_view() => self.container_shell_action(),
             KeyCode::Char('s') if known_kind == Some(ResourceKind::Pods) => self.pod_shell_action(),
             KeyCode::Char('a') if known_kind == Some(ResourceKind::Pods) => {
@@ -1125,8 +1124,7 @@ impl App {
                     Some(ResourceKind::Pods | ResourceKind::Services)
                 ) =>
             {
-                self.selected_target()
-                    .map_or(AppCommand::None, AppCommand::ShowPortForwards)
+                AppCommand::ShowPortForwards
             }
             KeyCode::Char('w') if self.namespace.is_none() && self.kind.is_namespaced() => {
                 self.warp_to_selected_namespace()
@@ -1447,7 +1445,6 @@ impl App {
         }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q' | 'f') => {
-                self.port_forward_target = None;
                 self.port_forwards.clear();
                 self.notice = None;
                 self.overlay = Overlay::None;
@@ -2211,6 +2208,7 @@ impl App {
                     self.open_namespaces()
                 }
             }
+            "pf" | "portforward" | "portforwards" => AppCommand::ShowPortForwards,
             alias => {
                 let kind = match self.resolve_resource(alias) {
                     Ok(kind) => kind,
@@ -2486,6 +2484,9 @@ impl App {
             "ns".to_owned(),
             "namespace".to_owned(),
             "namespaces".to_owned(),
+            "pf".to_owned(),
+            "portforward".to_owned(),
+            "portforwards".to_owned(),
             "q".to_owned(),
             "quit".to_owned(),
         ]);
@@ -2925,6 +2926,50 @@ impl App {
         })
     }
 
+    fn pod_log_action(&mut self, previous: bool) -> AppCommand {
+        let Some(row) = self.selected_row() else {
+            return AppCommand::None;
+        };
+        let Some(container) = row
+            .pod_data()
+            .map(|data| data.default_container.to_string())
+            .filter(|container| !container.is_empty())
+        else {
+            return self.unsupported("Pod has no regular containers");
+        };
+        let namespace = row.namespace.to_string();
+        let pod = row.name.to_string();
+        AppCommand::Action(ActionIntent::ContainerLogs {
+            target: ContainerTarget {
+                namespace,
+                pod,
+                container,
+            },
+            previous,
+        })
+    }
+
+    fn open_pod_node(&mut self) -> AppCommand {
+        let Some(node) = self
+            .selected_row()
+            .and_then(ResourceRow::pod_data)
+            .map(|data| data.node.to_string())
+            .filter(|node| !node.is_empty() && node != "-")
+        else {
+            return self.unsupported("Pod is not assigned to a Node");
+        };
+        self.request_view(
+            ViewState {
+                context: self.context.clone(),
+                kind: ResourceKind::Nodes.into(),
+                namespace: None,
+                field_selector: Some(format!("metadata.name={node}")),
+                label_selector: None,
+            },
+            true,
+        )
+    }
+
     fn pod_shell_action(&mut self) -> AppCommand {
         if self.read_only {
             return self.unsupported("Shell is disabled in read-only mode");
@@ -3283,12 +3328,7 @@ impl App {
         self.notice = Some(notice.into());
     }
 
-    pub fn show_port_forwards(&mut self, target: ResourceTarget, forwards: Vec<PortForwardInfo>) {
-        if forwards.is_empty() {
-            self.show_transient_notice(format!("No active port forwards for {}", target.name));
-            return;
-        }
-        self.port_forward_target = Some(target);
+    pub fn show_port_forwards(&mut self, forwards: Vec<PortForwardInfo>) {
         self.port_forwards = forwards;
         self.overlay_selected = 0;
         self.notice = None;
@@ -3305,8 +3345,6 @@ impl App {
             .map(|forward| forward.id);
         self.port_forwards = forwards;
         if self.port_forwards.is_empty() {
-            self.port_forward_target = None;
-            self.overlay = Overlay::None;
             self.overlay_selected = 0;
             return;
         }
@@ -3318,11 +3356,6 @@ impl App {
             })
             .unwrap_or(0)
             .min(self.port_forwards.len().saturating_sub(1));
-    }
-
-    #[must_use]
-    pub const fn port_forward_target(&self) -> Option<&ResourceTarget> {
-        self.port_forward_target.as_ref()
     }
 
     pub fn show_notice(&mut self, notice: impl Into<String>) {
@@ -3648,9 +3681,19 @@ mod tests {
         app.apply_snapshot(snapshot(
             vec![
                 ResourceRow::new("prod", "api-0", "Running", "1/1", "0", 0)
-                    .with_labels("app=api,env=prod"),
+                    .with_labels("app=api,env=prod")
+                    .with_pod_data(PodData {
+                        node: Arc::from("node-a"),
+                        default_container: Arc::from("api"),
+                        ..PodData::default()
+                    }),
                 ResourceRow::new("dev", "worker-0", "CrashLoopBackOff", "0/1", "3", 0)
-                    .with_labels("app=worker,env=dev"),
+                    .with_labels("app=worker,env=dev")
+                    .with_pod_data(PodData {
+                        node: Arc::from("node-b"),
+                        default_container: Arc::from("worker"),
+                        ..PodData::default()
+                    }),
             ],
             1,
             ResourceKind::Pods,
@@ -3776,15 +3819,6 @@ mod tests {
         );
         assert_eq!(resource.overlay, Overlay::Details);
 
-        let mut pods = app_with_rows();
-        assert!(matches!(
-            pods.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)),
-            AppCommand::Action(ActionIntent::Content {
-                content: ContentKind::Logs,
-                ..
-            })
-        ));
-
         let mut chooser = app_with_rows();
         chooser.open_aliases();
         let visible = chooser.visible_resource_indices();
@@ -3808,6 +3842,25 @@ mod tests {
         chooser.open_aliases();
         chooser.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
         assert_eq!(chooser.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn pod_log_hotkeys_target_the_resolved_container_for_current_and_previous_logs() {
+        let mut pods = app_with_rows();
+        assert!(matches!(
+            pods.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)),
+            AppCommand::Action(ActionIntent::ContainerLogs {
+                target: ContainerTarget { ref container, .. },
+                previous: false,
+            }) if container == "api"
+        ));
+        assert!(matches!(
+            pods.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)),
+            AppCommand::Action(ActionIntent::ContainerLogs {
+                target: ContainerTarget { ref container, .. },
+                previous: true,
+            }) if container == "api"
+        ));
     }
 
     #[test]
@@ -5551,6 +5604,49 @@ mod tests {
     }
 
     #[test]
+    fn o_on_pod_opens_its_node_and_history_returns() {
+        let mut app = app_with_rows();
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)),
+            AppCommand::Request(ViewState {
+                context: "demo".to_owned(),
+                kind: ResourceKind::Nodes.into(),
+                namespace: None,
+                field_selector: Some("metadata.name=node-a".to_owned()),
+                label_selector: None,
+            })
+        );
+        assert_eq!(app.kind.known_kind(), Some(ResourceKind::Nodes));
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            AppCommand::Request(ViewState {
+                context: "demo".to_owned(),
+                kind: ResourceKind::Pods.into(),
+                namespace: None,
+                field_selector: None,
+                label_selector: None,
+            })
+        );
+    }
+
+    #[test]
+    fn o_reports_an_unassigned_pod() {
+        let mut app = app_with_descriptor(
+            ResourceKind::Pods.into(),
+            None,
+            ResourceRow::new("prod", "pending", "Pending", "0/1", "0", 0)
+                .with_pod_data(PodData::default()),
+        );
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)),
+            AppCommand::None
+        );
+        assert_eq!(app.notice.as_deref(), Some("Pod is not assigned to a Node"));
+    }
+
+    #[test]
     fn pod_container_drilldown_opens_selected_container_logs_and_restores_parent() {
         let mut app = app_with_rows();
         let AppCommand::Action(ActionIntent::Containers { target }) =
@@ -5725,24 +5821,38 @@ mod tests {
     fn active_port_forward_overlay_stops_selected_session() {
         let mut app = app_with_rows();
         let target = app.selected_target().unwrap();
-        app.show_port_forwards(
-            target.clone(),
-            vec![PortForwardInfo {
-                id: 7,
-                context: "demo".to_owned(),
-                target,
-                remote_port: 8080,
-                local_port: 18080,
-                address: "localhost".to_owned(),
-                state: PortForwardState::Running,
-            }],
-        );
+        app.show_port_forwards(vec![PortForwardInfo {
+            id: 7,
+            context: "demo".to_owned(),
+            target,
+            remote_port: 8080,
+            local_port: 18080,
+            address: "localhost".to_owned(),
+            state: PortForwardState::Running,
+        }]);
 
         assert_eq!(app.overlay, Overlay::PortForwards);
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
             AppCommand::StopPortForward(7)
         );
+    }
+
+    #[test]
+    fn f_and_pf_command_open_the_global_port_forward_list() {
+        let mut app = app_with_rows();
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)),
+            AppCommand::ShowPortForwards
+        );
+        assert_eq!(
+            type_input(&mut app, ':', "pf"),
+            AppCommand::ShowPortForwards
+        );
+        assert!(app.command_names().contains(&"portforwards".to_owned()));
+        app.show_port_forwards(Vec::new());
+        assert_eq!(app.overlay, Overlay::PortForwards);
+        assert!(app.port_forwards.is_empty());
     }
 
     #[test]

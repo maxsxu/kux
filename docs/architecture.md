@@ -87,7 +87,9 @@ names.
 Node drilldown starts a Pod watch with a server-side `spec.nodeName` field selector. Pod drilldown
 fetches one Pod and compacts regular, init, and ephemeral containers into transient rows. The
 parent Pod snapshot continues receiving coalesced watch updates and is restored locally on Esc;
-container log requests set `LogParams.container` explicitly. The
+container log requests, including previous logs, set `LogParams.container` explicitly. Pod-to-Node
+navigation reuses the compact `spec.nodeName` and starts a Node watch with a server-side name
+selector. The
 workload drilldown contract stores the discovered child kind and compact Kubernetes label selector
 on the parent row. Deployment watches open ReplicaSets, while ReplicaSet, StatefulSet, DaemonSet,
 and selector-backed Service watches open Pods; the next watch applies that selector server-side.

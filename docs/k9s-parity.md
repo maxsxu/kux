@@ -54,7 +54,7 @@ K9s key and reports that its backend is pending, and **planned** is not yet expo
 
 | Interaction | Key | Status |
 | --- | --- | --- |
-| Pod/container logs/previous logs | `l`, `p` | Implemented, last 500 lines |
+| Pod/container logs/previous logs | `l`, `p` | Implemented, last 500 lines; Pod actions resolve and pass the selected default container for both current and previous requests, and timestamps/severity levels are colorized without changing the raw content |
 | Copy YAML/toggle managed fields | `c`, `m` in YAML | Implemented; copy uses the visible variant |
 | Search YAML without hiding context | `/query` in YAML | Implemented; keeps the full document and scrolls to the first matching line |
 | Copy decoded Secret data | `c` in Secret data view | Implemented; copies the data-only body |
@@ -64,8 +64,9 @@ K9s key and reports that its backend is pending, and **planned** is not yet expo
 | Pod shell | `s` | Implemented through interactive `kubectl exec` with the active context and namespace; the host terminal is cleared and starts with a Kux Pod/container identity banner, and Kux explicitly targets the valid `kubectl.kubernetes.io/default-container` annotation or the first `spec.containers` entry; unavailable in read-only mode |
 | Pod attach | `a` | Interaction; backend pending |
 | Edit any Kubernetes resource | `e` | Implemented from list, details, and YAML views through interactive `kubectl edit` with the active context and selected resource namespace; unavailable in read-only mode |
-| Port-forward list/start | `f`, `Shift-F` | Implemented for Pods and Services with declared TCP-port suggestions, editable local port/address, bounded `kubectl port-forward` subprocesses, an active-forward list, and `Ctrl-D` stop; starting a forward is unavailable in read-only mode |
+| Port-forward list/start | `f`, `:pf`, `Shift-F` | Implemented for Pods and Services with declared TCP-port suggestions, editable local port/address, bounded `kubectl port-forward` subprocesses, a context-wide full-body list, and `Ctrl-D` stop; starting a forward is unavailable in read-only mode |
 | Owner navigation | `Shift-J` | Implemented through controller owner references and a server-side name selector |
+| Pod Node navigation | `o` | Implemented through the compact Pod `spec.nodeName` and a server-side Node name selector |
 | Service benchmark | `b` | Interaction; backend pending |
 | Cordon/uncordon and drain | `u`, `r` on Nodes | Cordon and uncordon use a guarded scheduling-state patch; drain includes editable grace period and timeout plus Ignore DaemonSets, Delete EmptyDir Data, Force, and Disable Eviction toggles; preflight safety checks run before cordon and evictions remain PDB-aware unless explicitly disabled |
 | Workload restart | `r` on Deployments/StatefulSets/DaemonSets | Implemented with confirmation, multi-selection, bounded concurrent Pod-template patches, and partial-failure reporting; unavailable in read-only mode |

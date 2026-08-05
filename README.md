@@ -83,6 +83,7 @@ Navigation stays in place instead of stacking popups:
 ```text
 Node ──Enter──▶ Pods on node ──Enter──▶ Containers ──Enter──▶ Logs
 Pod ──s──▶ Interactive shell with the resolved spec container in its identity banner
+Pod ──o──▶ Assigned Node
 Deployment ──Enter──▶ ReplicaSets ──Enter──▶ Pods
 StatefulSet / DaemonSet / selector-backed Service ──Enter──▶ Pods
 ServiceAccount ──Enter──▶ Effective RBAC policy matrix
@@ -149,7 +150,8 @@ The header always shows the actions available in the current view. These are the
 | `Shift-J` | Jump to the selected resource's controller owner |
 | `y`, `d` | YAML and `kubectl describe` |
 | `e` | Edit the selected resource from its list, details, or YAML view with `kubectl edit` |
-| `l`, `p` | Current and previous logs |
+| `l`, `p` | Colorized current and previous logs for the resolved Pod/container |
+| `o` on Pods | Jump to the Pod's assigned Node |
 | `c`, `n` | Copy resource name or namespace |
 | `x` on Secret | Open decoded data only; in YAML, toggle decoded values |
 | `Space`, `Ctrl-Space`, `Ctrl-\` | Mark one, mark a range, clear marks |
@@ -159,7 +161,8 @@ The header always shows the actions available in the current view. These are the
 | `r` on Deployments, StatefulSets, or DaemonSets | Confirm and request a rollout restart for all marked workloads, or the current workload |
 | `u` on Nodes | Confirm and cordon or uncordon the selected node |
 | `r` on Nodes | Configure, confirm, cordon, and drain the selected node |
-| `Shift-F`, `f` on Pods or Services | Start a port forward, or inspect and stop active forwards |
+| `Shift-F` on Pods or Services | Start a port forward |
+| `f` on Pods or Services, `:pf` globally | Open the context-wide port-forward list; `Ctrl-D` stops one |
 | `Ctrl-L`, `Ctrl-E`, `Ctrl-W` | Toggle logo, header, and wide columns |
 | `:q`, `Ctrl-C` | Quit |
 
