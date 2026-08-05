@@ -10,6 +10,7 @@ use kux::{
     cli::Cli,
     kubeconfig::{ContextCatalog, ContextInfo, fallback_contexts},
     model::ResourceSnapshot,
+    port_forward::PortForwardManager,
     source::{self, ActionResult, KubernetesSettings, WatchRequest},
     terminal::TerminalGuard,
     ui,
@@ -141,54 +142,26 @@ async fn run(
     let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut dirty = true;
+    let (port_forward_events_tx, mut port_forward_events_rx) = mpsc::channel(64);
+    let mut port_forwards = PortForwardManager::new(port_forward_events_tx);
 
     loop {
         tokio::select! {
             event = events.next() => {
                 match event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                        match app.handle_key(key) {
-                            AppCommand::Quit => break,
-                            AppCommand::Request(view) => {
-                                requests.send(WatchRequest {
-                                    generation: app.generation,
-                                    context: view.context,
-                                    kind: view.kind,
-                                    namespace: view.namespace,
-                                    field_selector: view.field_selector,
-                                    label_selector: view.label_selector,
-                                }).await.context("data source stopped")?;
-                            }
-                            AppCommand::Copy(value) => {
-                                handle_copy(&mut app, &mut terminal, &value);
-                            }
-                            AppCommand::Edit(target) => {
-                                let result = edit_resource(&mut terminal, &app.context, &target)
-                                    .await
-                                    .context("restore terminal after resource edit")?;
-                                match result {
-                                    Ok(status) if status.success() => app.show_transient_notice(format!(
-                                        "Edited {} {}",
-                                        target.kind.qualified_name(),
-                                        target.name
-                                    )),
-                                    Ok(status) => app.show_transient_notice(format!(
-                                        "Edit failed: kubectl edit exited with {status}"
-                                    )),
-                                    Err(error) => app.show_transient_notice(format!("Edit failed: {error}")),
-                                }
-                            }
-                            AppCommand::Shell(target) => {
-                                let result = open_pod_shell(&mut terminal, &app.context, &target)
-                                    .await
-                                    .context("restore terminal after pod shell")?;
-                                report_shell_result(&mut app, &target, result);
-                            }
-                            AppCommand::Action(action) => {
-                                actions.send(action).await.context("action worker stopped")?;
-                                app.show_notice("Working…");
-                            }
-                            AppCommand::None => {}
+                        let command = app.handle_key(key);
+                        if handle_app_command(
+                            command,
+                            &mut app,
+                            &mut terminal,
+                            &requests,
+                            &actions,
+                            &mut port_forwards,
+                        )
+                        .await?
+                        {
+                            break;
                         }
                         dirty = true;
                     }
@@ -214,6 +187,13 @@ async fn run(
                 apply_action_result(&mut app, result);
                 dirty = true;
             }
+            Some(event) = port_forward_events_rx.recv() => {
+                if let Some(notice) = port_forwards.handle_event(event) {
+                    app.show_transient_notice(notice);
+                }
+                refresh_visible_port_forwards(&mut app, &port_forwards);
+                dirty = true;
+            }
             _ = heartbeat.tick() => {
                 app.tick();
                 dirty = true;
@@ -225,6 +205,94 @@ async fn run(
         }
     }
     Ok(())
+}
+
+async fn handle_app_command(
+    command: AppCommand,
+    app: &mut App,
+    terminal: &mut TerminalGuard,
+    requests: &mpsc::Sender<WatchRequest>,
+    actions: &mpsc::Sender<kux::app::ActionIntent>,
+    port_forwards: &mut PortForwardManager,
+) -> Result<bool> {
+    match command {
+        AppCommand::Quit => return Ok(true),
+        AppCommand::Request(view) => {
+            requests
+                .send(WatchRequest {
+                    generation: app.generation,
+                    context: view.context,
+                    kind: view.kind,
+                    namespace: view.namespace,
+                    field_selector: view.field_selector,
+                    label_selector: view.label_selector,
+                })
+                .await
+                .context("data source stopped")?;
+        }
+        AppCommand::Copy(value) => handle_copy(app, terminal, &value),
+        AppCommand::Edit(target) => {
+            let result = edit_resource(terminal, &app.context, &target)
+                .await
+                .context("restore terminal after resource edit")?;
+            match result {
+                Ok(status) if status.success() => app.show_transient_notice(format!(
+                    "Edited {} {}",
+                    target.kind.qualified_name(),
+                    target.name
+                )),
+                Ok(status) => app.show_transient_notice(format!(
+                    "Edit failed: kubectl edit exited with {status}"
+                )),
+                Err(error) => app.show_transient_notice(format!("Edit failed: {error}")),
+            }
+        }
+        AppCommand::Shell(target) => {
+            let result = open_pod_shell(terminal, &app.context, &target)
+                .await
+                .context("restore terminal after pod shell")?;
+            report_shell_result(app, &target, result);
+        }
+        AppCommand::StartPortForward(request) => match port_forwards.start(&app.context, request) {
+            Ok(forward) => app.show_transient_notice(format!(
+                "Starting port forward on {}:{}",
+                forward.address, forward.local_port
+            )),
+            Err(error) => {
+                app.show_transient_notice(format!("Port forward failed: {error}"));
+            }
+        },
+        AppCommand::ShowPortForwards(target) => {
+            let forwards = port_forwards.summaries_for(&app.context, &target);
+            app.show_port_forwards(target, forwards);
+        }
+        AppCommand::StopPortForward(id) => {
+            if let Some(forward) = port_forwards.stop(id) {
+                app.show_transient_notice(format!(
+                    "Stopping port forward on {}:{}",
+                    forward.address, forward.local_port
+                ));
+            }
+            refresh_visible_port_forwards(app, port_forwards);
+        }
+        AppCommand::Action(action) => {
+            actions
+                .send(action)
+                .await
+                .context("action worker stopped")?;
+            app.show_notice("Working…");
+        }
+        AppCommand::None => {}
+    }
+    Ok(false)
+}
+
+fn refresh_visible_port_forwards(app: &mut App, manager: &PortForwardManager) {
+    let Some(target) = app.port_forward_target().cloned() else {
+        return;
+    };
+    let forwards = manager.summaries_for(&app.context, &target);
+    app.refresh_port_forwards(forwards);
 }
 
 fn apply_action_result(app: &mut App, result: ActionResult) {

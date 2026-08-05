@@ -6,8 +6,8 @@ use crate::{
     app::{ActionIntent, ContentKind, ResourceTarget},
     model::{
         ChildResourceData, ContainerData, NamespaceInfo, NodeData, OwnerReferenceData, PodData,
-        PolicyData, ResourceDescriptor, ResourceKind, ResourceOperations, ResourceRow,
-        ResourceSnapshot, SourceState, unix_now,
+        PolicyData, PortForwardPort, ResourceDescriptor, ResourceKind, ResourceOperations,
+        ResourceRow, ResourceSnapshot, SourceState, unix_now,
     },
 };
 
@@ -308,7 +308,8 @@ fn build_rows(item_count: usize, request: &WatchRequest) -> Vec<Arc<ResourceRow>
             (index % 13).to_string(),
             now - i64::try_from(index % (86400 * 365)).unwrap_or(i64::MAX),
         )
-        .with_labels(labels.clone());
+        .with_labels(labels.clone())
+        .with_port_forward_ports(demo_port_forward_ports(known_kind));
         let row = match known_kind {
             Some(ResourceKind::Pods) => row.with_pod_data(PodData {
                 restarts: u32::try_from(index % 13).unwrap_or(0),
@@ -352,6 +353,29 @@ fn build_rows(item_count: usize, request: &WatchRequest) -> Vec<Arc<ResourceRow>
             .then(left.name.cmp(&right.name))
     });
     rows
+}
+
+fn demo_port_forward_ports(kind: Option<ResourceKind>) -> Vec<PortForwardPort> {
+    match kind {
+        Some(ResourceKind::Pods) => vec![
+            PortForwardPort {
+                container: Some(Arc::from("app")),
+                name: Arc::from("http"),
+                port: 8080,
+            },
+            PortForwardPort {
+                container: Some(Arc::from("sidecar")),
+                name: Arc::from("metrics"),
+                port: 9090,
+            },
+        ],
+        Some(ResourceKind::Services) => vec![PortForwardPort {
+            container: None,
+            name: Arc::from("http"),
+            port: 8080,
+        }],
+        _ => Vec::new(),
+    }
 }
 
 fn demo_status(

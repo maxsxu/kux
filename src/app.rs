@@ -10,8 +10,8 @@ use regex::RegexBuilder;
 
 use crate::kubeconfig::ContextInfo;
 use crate::model::{
-    NamespaceInfo, OwnerReferenceData, ResourceDescriptor, ResourceKind, ResourceOperations,
-    ResourceRow, ResourceSnapshot, SourceState, unix_now,
+    NamespaceInfo, OwnerReferenceData, PortForwardPort, ResourceDescriptor, ResourceKind,
+    ResourceOperations, ResourceRow, ResourceSnapshot, SourceState, unix_now,
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -180,6 +180,113 @@ pub struct PodShellTarget {
     pub namespace: String,
     pub pod: String,
     pub container: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortForwardRequest {
+    pub target: ResourceTarget,
+    pub remote_port: u16,
+    pub local_port: u16,
+    pub address: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortForwardState {
+    Starting,
+    Running,
+}
+
+impl PortForwardState {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Starting => "Starting",
+            Self::Running => "Running",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortForwardInfo {
+    pub id: u64,
+    pub context: String,
+    pub target: ResourceTarget,
+    pub remote_port: u16,
+    pub local_port: u16,
+    pub address: String,
+    pub state: PortForwardState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortForwardDialog {
+    pub target: ResourceTarget,
+    pub ports: Vec<PortForwardPort>,
+    pub remote_port: String,
+    pub local_port: String,
+    pub address: String,
+}
+
+pub const PORT_FORWARD_REMOTE_FIELD: usize = 0;
+pub const PORT_FORWARD_LOCAL_FIELD: usize = 1;
+pub const PORT_FORWARD_ADDRESS_FIELD: usize = 2;
+pub const PORT_FORWARD_OK_FIELD: usize = 3;
+pub const PORT_FORWARD_CANCEL_FIELD: usize = 4;
+const PORT_FORWARD_FIELD_COUNT: usize = 5;
+
+impl PortForwardDialog {
+    fn new(target: ResourceTarget, ports: Vec<PortForwardPort>) -> Self {
+        let remote_port = ports
+            .first()
+            .map_or_else(String::new, PortForwardPort::selector);
+        let local_port = ports
+            .first()
+            .map_or_else(String::new, |port| port.port.to_string());
+        Self {
+            target,
+            ports,
+            remote_port,
+            local_port,
+            address: "localhost".to_owned(),
+        }
+    }
+
+    fn request(&self) -> Result<PortForwardRequest, String> {
+        let remote = self
+            .remote_port
+            .rsplit_once("::")
+            .map_or(self.remote_port.as_str(), |(_, port)| port)
+            .trim();
+        let remote_port = parse_port(remote, "Container/Service port")?;
+        let local_port = parse_port(&self.local_port, "Local port")?;
+        let address = self.address.trim();
+        if address.is_empty() {
+            return Err("Address cannot be empty".to_owned());
+        }
+        Ok(PortForwardRequest {
+            target: self.target.clone(),
+            remote_port,
+            local_port,
+            address: address.to_owned(),
+        })
+    }
+}
+
+fn parse_port(value: &str, label: &str) -> Result<u16, String> {
+    value
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port > 0)
+        .ok_or_else(|| format!("{label} must be between 1 and 65535"))
+}
+
+fn port_forward_field_mut(dialog: &mut PortForwardDialog, field: usize) -> &mut String {
+    match field {
+        PORT_FORWARD_REMOTE_FIELD => &mut dialog.remote_port,
+        PORT_FORWARD_LOCAL_FIELD => &mut dialog.local_port,
+        PORT_FORWARD_ADDRESS_FIELD => &mut dialog.address,
+        _ => unreachable!("only editable port-forward fields are requested"),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,6 +462,9 @@ pub enum AppCommand {
     Copy(String),
     Edit(ResourceTarget),
     Shell(PodShellTarget),
+    StartPortForward(PortForwardRequest),
+    ShowPortForwards(ResourceTarget),
+    StopPortForward(u64),
     Action(ActionIntent),
 }
 
@@ -386,6 +496,8 @@ pub enum Overlay {
     Details,
     Content,
     ConfirmDelete,
+    PortForwardDialog,
+    PortForwards,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -551,6 +663,8 @@ pub struct App {
     pub filter_error: Option<String>,
     pub confirm_armed: bool,
     pub pending_delete: Option<PendingDelete>,
+    pub port_forward_dialog: Option<PortForwardDialog>,
+    pub port_forwards: Vec<PortForwardInfo>,
     pub read_only: bool,
     content_max_scroll: u16,
     content_target: Option<ResourceTarget>,
@@ -563,6 +677,8 @@ pub struct App {
     completion_index: usize,
     input_before_edit: String,
     drain_value_edit_state: DrainValueEditState,
+    port_forward_value_edit_state: DrainValueEditState,
+    port_forward_target: Option<ResourceTarget>,
 }
 
 impl App {
@@ -647,6 +763,8 @@ impl App {
             filter_error: None,
             confirm_armed: false,
             pending_delete: None,
+            port_forward_dialog: None,
+            port_forwards: Vec::new(),
             read_only,
             content_max_scroll: 0,
             content_target: None,
@@ -659,6 +777,8 @@ impl App {
             completion_index: 0,
             input_before_edit: String::new(),
             drain_value_edit_state: DrainValueEditState::Pristine,
+            port_forward_value_edit_state: DrainValueEditState::Pristine,
+            port_forward_target: None,
         }
     }
 
@@ -847,10 +967,12 @@ impl App {
         if self.input_mode != InputMode::Browse {
             return self.handle_input_key(key);
         }
-        if self.overlay != Overlay::ConfirmDelete
-            && !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        if !matches!(
+            self.overlay,
+            Overlay::ConfirmDelete | Overlay::PortForwardDialog | Overlay::PortForwards
+        ) && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
         {
             match key.code {
                 KeyCode::Char(':') => return self.start_input(InputMode::Command),
@@ -1003,7 +1125,8 @@ impl App {
                     Some(ResourceKind::Pods | ResourceKind::Services)
                 ) =>
             {
-                self.unsupported("Port-forward list is not implemented yet")
+                self.selected_target()
+                    .map_or(AppCommand::None, AppCommand::ShowPortForwards)
             }
             KeyCode::Char('w') if self.namespace.is_none() && self.kind.is_namespaced() => {
                 self.warp_to_selected_namespace()
@@ -1088,7 +1211,7 @@ impl App {
                     Some(ResourceKind::Pods | ResourceKind::Services)
                 ) =>
             {
-                return self.unsupported("Port forwarding is not implemented yet");
+                return self.open_port_forward_dialog();
             }
             KeyCode::Char('J') => {
                 return self.open_owner_resource();
@@ -1171,7 +1294,185 @@ impl App {
             Overlay::ConfirmDelete => self.handle_confirm_overlay(key),
             Overlay::Content => self.handle_content_overlay(key),
             Overlay::Details => self.handle_details_overlay(key),
+            Overlay::PortForwardDialog => self.handle_port_forward_dialog(key),
+            Overlay::PortForwards => self.handle_port_forwards_overlay(key),
             Overlay::None => self.close_overlay_on(key),
+        }
+    }
+
+    fn open_port_forward_dialog(&mut self) -> AppCommand {
+        if self.read_only {
+            return self.unsupported("Port forwarding is disabled in read-only mode");
+        }
+        let Some(target) = self.selected_target() else {
+            return AppCommand::None;
+        };
+        let ports = self
+            .selected_row()
+            .map_or_else(Vec::new, |row| row.port_forward_ports().to_vec());
+        self.port_forward_dialog = Some(PortForwardDialog::new(target, ports));
+        self.overlay_selected = PORT_FORWARD_REMOTE_FIELD;
+        self.port_forward_value_edit_state = DrainValueEditState::Pristine;
+        self.notice = None;
+        self.overlay = Overlay::PortForwardDialog;
+        AppCommand::None
+    }
+
+    fn handle_port_forward_dialog(&mut self, key: KeyEvent) -> AppCommand {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q' | '?') => self.cancel_port_forward_dialog(),
+            KeyCode::Tab | KeyCode::Down | KeyCode::Right => {
+                self.move_port_forward_field(1);
+                AppCommand::None
+            }
+            KeyCode::BackTab | KeyCode::Up | KeyCode::Left => {
+                self.move_port_forward_field(-1);
+                AppCommand::None
+            }
+            KeyCode::Backspace if self.editable_port_forward_field() => {
+                let field = self.overlay_selected;
+                if let Some(dialog) = self.port_forward_dialog.as_mut() {
+                    port_forward_field_mut(dialog, field).pop();
+                }
+                self.port_forward_value_edit_state = DrainValueEditState::Editing;
+                self.notice = None;
+                AppCommand::None
+            }
+            KeyCode::Enter => self.activate_port_forward_field(),
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && self.edit_port_forward_value(character) =>
+            {
+                AppCommand::None
+            }
+            _ => AppCommand::None,
+        }
+    }
+
+    fn move_port_forward_field(&mut self, direction: isize) {
+        self.overlay_selected = if direction < 0 {
+            self.overlay_selected
+                .checked_sub(1)
+                .unwrap_or(PORT_FORWARD_FIELD_COUNT - 1)
+        } else {
+            (self.overlay_selected + 1) % PORT_FORWARD_FIELD_COUNT
+        };
+        self.port_forward_value_edit_state = DrainValueEditState::Pristine;
+        self.notice = None;
+    }
+
+    fn editable_port_forward_field(&self) -> bool {
+        matches!(
+            self.overlay_selected,
+            PORT_FORWARD_REMOTE_FIELD | PORT_FORWARD_LOCAL_FIELD | PORT_FORWARD_ADDRESS_FIELD
+        )
+    }
+
+    fn edit_port_forward_value(&mut self, character: char) -> bool {
+        let field = self.overlay_selected;
+        let accepted = match field {
+            PORT_FORWARD_REMOTE_FIELD => {
+                character.is_ascii_alphanumeric() || matches!(character, ':' | '-' | '_' | '.')
+            }
+            PORT_FORWARD_LOCAL_FIELD => character.is_ascii_digit(),
+            PORT_FORWARD_ADDRESS_FIELD => {
+                character.is_ascii_alphanumeric()
+                    || matches!(character, '.' | ',' | ':' | '-' | '[' | ']')
+            }
+            _ => false,
+        };
+        if !accepted {
+            return false;
+        }
+        let replace = self.port_forward_value_edit_state == DrainValueEditState::Pristine;
+        if let Some(dialog) = self.port_forward_dialog.as_mut() {
+            let value = port_forward_field_mut(dialog, field);
+            if replace {
+                value.clear();
+            }
+            value.push(character);
+        }
+        self.port_forward_value_edit_state = DrainValueEditState::Editing;
+        self.notice = None;
+        true
+    }
+
+    fn activate_port_forward_field(&mut self) -> AppCommand {
+        match self.overlay_selected {
+            PORT_FORWARD_REMOTE_FIELD | PORT_FORWARD_LOCAL_FIELD | PORT_FORWARD_ADDRESS_FIELD => {
+                self.move_port_forward_field(1);
+                AppCommand::None
+            }
+            PORT_FORWARD_OK_FIELD => {
+                let request = self
+                    .port_forward_dialog
+                    .as_ref()
+                    .map(PortForwardDialog::request);
+                match request {
+                    Some(Ok(request)) => {
+                        self.port_forward_dialog = None;
+                        self.overlay = Overlay::None;
+                        self.notice = None;
+                        AppCommand::StartPortForward(request)
+                    }
+                    Some(Err(error)) => {
+                        self.notice = Some(error);
+                        AppCommand::None
+                    }
+                    None => AppCommand::None,
+                }
+            }
+            PORT_FORWARD_CANCEL_FIELD => self.cancel_port_forward_dialog(),
+            _ => AppCommand::None,
+        }
+    }
+
+    fn cancel_port_forward_dialog(&mut self) -> AppCommand {
+        self.port_forward_dialog = None;
+        self.notice = None;
+        self.overlay = Overlay::None;
+        AppCommand::None
+    }
+
+    fn handle_port_forwards_overlay(&mut self, key: KeyEvent) -> AppCommand {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
+            return self
+                .port_forwards
+                .get(self.overlay_selected)
+                .map_or(AppCommand::None, |forward| {
+                    AppCommand::StopPortForward(forward.id)
+                });
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q' | 'f') => {
+                self.port_forward_target = None;
+                self.port_forwards.clear();
+                self.notice = None;
+                self.overlay = Overlay::None;
+                AppCommand::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.overlay_selected = self
+                    .overlay_selected
+                    .saturating_add(1)
+                    .min(self.port_forwards.len().saturating_sub(1));
+                AppCommand::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.overlay_selected = self.overlay_selected.saturating_sub(1);
+                AppCommand::None
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                self.overlay_selected = 0;
+                AppCommand::None
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                self.overlay_selected = self.port_forwards.len().saturating_sub(1);
+                AppCommand::None
+            }
+            _ => AppCommand::None,
         }
     }
 
@@ -2980,6 +3281,48 @@ impl App {
 
     pub fn show_transient_notice(&mut self, notice: impl Into<String>) {
         self.notice = Some(notice.into());
+    }
+
+    pub fn show_port_forwards(&mut self, target: ResourceTarget, forwards: Vec<PortForwardInfo>) {
+        if forwards.is_empty() {
+            self.show_transient_notice(format!("No active port forwards for {}", target.name));
+            return;
+        }
+        self.port_forward_target = Some(target);
+        self.port_forwards = forwards;
+        self.overlay_selected = 0;
+        self.notice = None;
+        self.overlay = Overlay::PortForwards;
+    }
+
+    pub fn refresh_port_forwards(&mut self, forwards: Vec<PortForwardInfo>) {
+        if self.overlay != Overlay::PortForwards {
+            return;
+        }
+        let selected_id = self
+            .port_forwards
+            .get(self.overlay_selected)
+            .map(|forward| forward.id);
+        self.port_forwards = forwards;
+        if self.port_forwards.is_empty() {
+            self.port_forward_target = None;
+            self.overlay = Overlay::None;
+            self.overlay_selected = 0;
+            return;
+        }
+        self.overlay_selected = selected_id
+            .and_then(|id| {
+                self.port_forwards
+                    .iter()
+                    .position(|forward| forward.id == id)
+            })
+            .unwrap_or(0)
+            .min(self.port_forwards.len().saturating_sub(1));
+    }
+
+    #[must_use]
+    pub const fn port_forward_target(&self) -> Option<&ResourceTarget> {
+        self.port_forward_target.as_ref()
     }
 
     pub fn show_notice(&mut self, notice: impl Into<String>) {
@@ -5304,6 +5647,101 @@ mod tests {
         assert_eq!(
             app.notice.as_deref(),
             Some("Shell is disabled in read-only mode")
+        );
+    }
+
+    #[test]
+    fn shift_f_opens_pod_port_forward_dialog_and_starts_selected_mapping() {
+        let row = ResourceRow::new("prod", "api-0", "Running", "1/1", "0", 0)
+            .with_port_forward_ports(vec![PortForwardPort {
+                container: Some(Arc::from("api")),
+                name: Arc::from("http"),
+                port: 8080,
+            }]);
+        let mut app = app_with_descriptor(ResourceKind::Pods.into(), Some("prod"), row);
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::SHIFT)),
+            AppCommand::None
+        );
+        assert_eq!(app.overlay, Overlay::PortForwardDialog);
+        let dialog = app.port_forward_dialog.as_ref().unwrap();
+        assert_eq!(dialog.remote_port, "api::8080");
+        assert_eq!(dialog.local_port, "8080");
+        assert_eq!(dialog.address, "localhost");
+
+        app.overlay_selected = PORT_FORWARD_OK_FIELD;
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppCommand::StartPortForward(PortForwardRequest {
+                target: ResourceTarget {
+                    kind: ResourceKind::Pods.into(),
+                    namespace: Some("prod".to_owned()),
+                    name: "api-0".to_owned(),
+                },
+                remote_port: 8080,
+                local_port: 8080,
+                address: "localhost".to_owned(),
+            })
+        );
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn port_forward_dialog_validates_values_without_closing() {
+        let row = ResourceRow::new("prod", "api", "ClusterIP", "1 ports", "10.0.0.1", 0);
+        let mut app = app_with_descriptor(ResourceKind::Services.into(), Some("prod"), row);
+        app.handle_key(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::SHIFT));
+        app.overlay_selected = PORT_FORWARD_OK_FIELD;
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppCommand::None
+        );
+        assert_eq!(app.overlay, Overlay::PortForwardDialog);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Container/Service port must be between 1 and 65535")
+        );
+    }
+
+    #[test]
+    fn read_only_mode_blocks_new_port_forwards() {
+        let mut app = app_with_rows();
+        app.read_only = true;
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::SHIFT)),
+            AppCommand::None
+        );
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Port forwarding is disabled in read-only mode")
+        );
+    }
+
+    #[test]
+    fn active_port_forward_overlay_stops_selected_session() {
+        let mut app = app_with_rows();
+        let target = app.selected_target().unwrap();
+        app.show_port_forwards(
+            target.clone(),
+            vec![PortForwardInfo {
+                id: 7,
+                context: "demo".to_owned(),
+                target,
+                remote_port: 8080,
+                local_port: 18080,
+                address: "localhost".to_owned(),
+                state: PortForwardState::Running,
+            }],
+        );
+
+        assert_eq!(app.overlay, Overlay::PortForwards);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+            AppCommand::StopPortForward(7)
         );
     }
 

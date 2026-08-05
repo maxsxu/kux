@@ -387,8 +387,37 @@ pub struct ResourceRow {
     pub created_unix: i64,
     pub search: Arc<str>,
     pub owner: Option<OwnerReferenceData>,
+    port_forward_ports: Option<Arc<Vec<PortForwardPort>>>,
     pub data: ResourceData,
     pub table_cells: Arc<[TableCell]>,
+}
+
+/// A declared TCP port that can be selected by the port-forward dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortForwardPort {
+    pub container: Option<Arc<str>>,
+    pub name: Arc<str>,
+    pub port: u16,
+}
+
+impl PortForwardPort {
+    #[must_use]
+    pub fn selector(&self) -> String {
+        self.container.as_ref().map_or_else(
+            || self.port.to_string(),
+            |container| format!("{container}::{}", self.port),
+        )
+    }
+
+    #[must_use]
+    pub fn display(&self) -> String {
+        let selector = self.selector();
+        if self.name.is_empty() {
+            selector
+        } else {
+            format!("{selector}({})", self.name)
+        }
+    }
 }
 
 /// Compact controller-owner identity used for Shift+J navigation.
@@ -504,6 +533,7 @@ impl ResourceRow {
             created_unix,
             search: Arc::from(search),
             owner: None,
+            port_forward_ports: None,
             data: ResourceData::Generic,
             table_cells: Arc::from([]),
         }
@@ -541,6 +571,27 @@ impl ResourceRow {
         );
         self.owner = Some(owner);
         self
+    }
+
+    #[must_use]
+    pub fn with_port_forward_ports(mut self, ports: Vec<PortForwardPort>) -> Self {
+        if !ports.is_empty() {
+            let searchable = ports
+                .iter()
+                .map(PortForwardPort::display)
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.search = Arc::from(format!("{}\n{searchable}", self.search).to_lowercase());
+        }
+        self.port_forward_ports = (!ports.is_empty()).then(|| Arc::new(ports));
+        self
+    }
+
+    #[must_use]
+    pub fn port_forward_ports(&self) -> &[PortForwardPort] {
+        self.port_forward_ports
+            .as_deref()
+            .map_or(&[], Vec::as_slice)
     }
 
     #[must_use]

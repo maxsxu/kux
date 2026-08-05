@@ -41,8 +41,8 @@ use crate::{
     },
     model::{
         ChildResourceData, ContainerData, NamespaceInfo, NodeData, OwnerReferenceData, PodData,
-        PolicyData, ResourceData, ResourceDescriptor, ResourceKind, ResourceOperations,
-        ResourceRow, ResourceSnapshot, SourceState, TableCell, TableColumn,
+        PolicyData, PortForwardPort, ResourceData, ResourceDescriptor, ResourceKind,
+        ResourceOperations, ResourceRow, ResourceSnapshot, SourceState, TableCell, TableColumn,
     },
 };
 
@@ -2702,6 +2702,25 @@ fn pod_row(pod: &Pod) -> ResourceRow {
         memory_request_bytes,
         memory_limit_bytes,
     })
+    .with_port_forward_ports(pod_forward_ports(pod))
+}
+
+fn pod_forward_ports(pod: &Pod) -> Vec<PortForwardPort> {
+    pod.spec
+        .iter()
+        .flat_map(|spec| &spec.containers)
+        .flat_map(|container| {
+            container.ports.iter().flatten().filter_map(|port| {
+                let is_tcp = port.protocol.as_deref().unwrap_or("TCP") == "TCP";
+                let port_number = u16::try_from(port.container_port).ok()?;
+                (is_tcp && port_number > 0).then(|| PortForwardPort {
+                    container: Some(Arc::from(container.name.as_str())),
+                    name: Arc::from(port.name.as_deref().unwrap_or("")),
+                    port: port_number,
+                })
+            })
+        })
+        .collect()
 }
 
 fn pod_default_container(pod: &Pod) -> Option<&str> {
@@ -2897,13 +2916,31 @@ fn service_row(service: &Service) -> ResourceRow {
         service_type,
         format!("{ports} ports"),
         cluster_ip,
-    );
+    )
+    .with_port_forward_ports(service_forward_ports(service));
     match spec.and_then(|spec| spec.selector.as_ref()) {
         Some(selector) => {
             with_child_resource(row, ResourceKind::Pods.into(), label_map_selector(selector))
         }
         None => row,
     }
+}
+
+fn service_forward_ports(service: &Service) -> Vec<PortForwardPort> {
+    service
+        .spec
+        .iter()
+        .flat_map(|spec| spec.ports.iter().flatten())
+        .filter_map(|port| {
+            let is_tcp = port.protocol.as_deref().unwrap_or("TCP") == "TCP";
+            let port_number = u16::try_from(port.port).ok()?;
+            (is_tcp && port_number > 0).then(|| PortForwardPort {
+                container: None,
+                name: Arc::from(port.name.as_deref().unwrap_or("")),
+                port: port_number,
+            })
+        })
+        .collect()
 }
 
 fn replica_set_descriptor() -> ResourceDescriptor {
@@ -3363,8 +3400,8 @@ fn owner_reference_data(
 mod tests {
     use k8s_openapi::{
         api::core::v1::{
-            Container, ContainerState, ContainerStateWaiting, ContainerStatus, NamespaceStatus,
-            PodSpec, PodStatus,
+            Container, ContainerPort, ContainerState, ContainerStateWaiting, ContainerStatus,
+            NamespaceStatus, PodSpec, PodStatus,
         },
         apimachinery::pkg::apis::meta::v1::{ManagedFieldsEntry, ObjectMeta, Time},
     };
@@ -3812,6 +3849,19 @@ mod tests {
             spec: Some(PodSpec {
                 containers: vec![Container {
                     name: "api".into(),
+                    ports: Some(vec![
+                        ContainerPort {
+                            container_port: 8080,
+                            name: Some("http".to_owned()),
+                            protocol: Some("TCP".to_owned()),
+                            ..ContainerPort::default()
+                        },
+                        ContainerPort {
+                            container_port: 5353,
+                            protocol: Some("UDP".to_owned()),
+                            ..ContainerPort::default()
+                        },
+                    ]),
                     ..Container::default()
                 }],
                 ..PodSpec::default()
@@ -3837,6 +3887,30 @@ mod tests {
         assert_eq!(data.restarts, 3);
         assert_eq!(data.node.as_ref(), "-");
         assert_eq!(data.default_container.as_ref(), "api");
+        assert_eq!(row.port_forward_ports().len(), 1);
+        assert_eq!(row.port_forward_ports()[0].display(), "api::8080(http)");
+    }
+
+    #[test]
+    fn service_row_exposes_only_tcp_service_ports() {
+        let service: Service = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "api", "namespace": "prod" },
+            "spec": {
+                "selector": { "app": "api" },
+                "ports": [
+                    { "name": "http", "port": 80, "targetPort": 8080, "protocol": "TCP" },
+                    { "name": "dns", "port": 53, "protocol": "UDP" }
+                ]
+            }
+        }))
+        .expect("valid Service");
+
+        let row = service_row(&service);
+        assert_eq!(row.port_forward_ports().len(), 1);
+        assert_eq!(row.port_forward_ports()[0].display(), "80(http)");
+        assert_eq!(row.port_forward_ports()[0].port, 80);
     }
 
     #[test]

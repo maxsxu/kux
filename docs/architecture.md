@@ -103,6 +103,6 @@ ClusterRoleBinding drilldowns reuse the same rule-to-verb-matrix projection.
 
 1. Preserve server-provided discovery short names and singular aliases in addition to plural/Kind
    completion.
-2. Implement exec/attach, port forwarding, editing, and specialized workload actions.
+2. Implement attach and specialized workload actions.
 3. Benchmark update throughput and resident memory at 100k, 500k, and 1M synthetic rows in CI.
 4. Add Kubernetes impersonation-aware permission checks before presenting mutating actions.

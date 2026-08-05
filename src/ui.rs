@@ -11,7 +11,9 @@ use crate::{
         App, ColumnHitbox, ContentKind, DRAIN_CANCEL_FIELD, DRAIN_DELETE_EMPTYDIR_DATA_FIELD,
         DRAIN_DISABLE_EVICTION_FIELD, DRAIN_FORCE_FIELD, DRAIN_GRACE_PERIOD_FIELD,
         DRAIN_IGNORE_DAEMON_SETS_FIELD, DRAIN_OK_FIELD, DRAIN_TIMEOUT_FIELD, DrainDialog,
-        InputMode, ListMode, Overlay, PendingDelete, SortField,
+        InputMode, ListMode, Overlay, PORT_FORWARD_ADDRESS_FIELD, PORT_FORWARD_CANCEL_FIELD,
+        PORT_FORWARD_LOCAL_FIELD, PORT_FORWARD_OK_FIELD, PORT_FORWARD_REMOTE_FIELD, PendingDelete,
+        PortForwardDialog, SortField,
     },
     model::{ResourceKind, SourceState, format_age},
 };
@@ -104,6 +106,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 
     match app.overlay {
         Overlay::ConfirmDelete => draw_delete_confirmation(frame, app, area),
+        Overlay::PortForwardDialog => draw_port_forward_dialog(frame, app, area),
+        Overlay::PortForwards => draw_port_forwards(frame, app, area),
         Overlay::Aliases
         | Overlay::Namespaces
         | Overlay::Contexts
@@ -449,48 +453,16 @@ fn namespace_hints(app: &App) -> Vec<HeaderHint> {
 }
 
 fn action_hints(app: &App) -> Vec<HeaderHint> {
-    let mut hints = vec![action_hint(":", "Command"), action_hint("/", "Filter")];
+    let mut hints = if matches!(
+        app.overlay,
+        Overlay::ConfirmDelete | Overlay::PortForwardDialog | Overlay::PortForwards
+    ) {
+        Vec::new()
+    } else {
+        vec![action_hint(":", "Command"), action_hint("/", "Filter")]
+    };
     match app.overlay {
-        Overlay::Content => {
-            hints.push(action_hint("esc", "Back"));
-            if matches!(
-                app.content_kind,
-                Some(ContentKind::Yaml | ContentKind::SecretData)
-            ) {
-                hints.push(action_hint("c", "Copy"));
-            }
-            if app.content_kind == Some(ContentKind::Yaml) {
-                if !app.read_only {
-                    hints.push(action_hint("e", "Edit"));
-                }
-                hints.push(action_hint(
-                    "m",
-                    if app.ui.managed_fields() {
-                        "Managed On"
-                    } else {
-                        "Managed Off"
-                    },
-                ));
-            }
-            if app.can_decode_content() {
-                hints.push(action_hint(
-                    "x",
-                    if app.is_content_decoded() {
-                        "Encoded"
-                    } else {
-                        "Decode"
-                    },
-                ));
-            }
-            hints.push(action_hint("w", "Wrap"));
-            hints.push(action_hint("f", "Fullscreen"));
-            if matches!(
-                app.content_kind,
-                Some(ContentKind::Logs | ContentKind::PreviousLogs)
-            ) {
-                hints.push(action_hint("t", "Timestamps"));
-            }
-        }
+        Overlay::Content => hints.extend(content_action_hints(app)),
         Overlay::Aliases => {
             hints.extend([
                 action_hint("enter", "Open"),
@@ -530,6 +502,20 @@ fn action_hints(app: &App) -> Vec<HeaderHint> {
                 hints.push(action_hint("e", "Edit"));
             }
         }
+        Overlay::PortForwardDialog => {
+            hints.extend([
+                action_hint("tab", "Next Field"),
+                action_hint("enter", "Select"),
+                action_hint("esc", "Cancel"),
+            ]);
+        }
+        Overlay::PortForwards => {
+            hints.extend([
+                action_hint("j/k", "Move"),
+                action_hint("ctrl-d", "Stop"),
+                action_hint("esc", "Back"),
+            ]);
+        }
         _ if app.is_policy_view() => {
             hints.extend([
                 action_hint("c", "Copy Name"),
@@ -539,6 +525,47 @@ fn action_hints(app: &App) -> Vec<HeaderHint> {
         }
         _ if app.is_container_view() => hints.extend(container_action_hints(app)),
         _ => hints.extend(resource_action_hints(app)),
+    }
+    hints
+}
+
+fn content_action_hints(app: &App) -> Vec<HeaderHint> {
+    let mut hints = vec![action_hint("esc", "Back")];
+    if matches!(
+        app.content_kind,
+        Some(ContentKind::Yaml | ContentKind::SecretData)
+    ) {
+        hints.push(action_hint("c", "Copy"));
+    }
+    if app.content_kind == Some(ContentKind::Yaml) {
+        if !app.read_only {
+            hints.push(action_hint("e", "Edit"));
+        }
+        hints.push(action_hint(
+            "m",
+            if app.ui.managed_fields() {
+                "Managed On"
+            } else {
+                "Managed Off"
+            },
+        ));
+    }
+    if app.can_decode_content() {
+        hints.push(action_hint(
+            "x",
+            if app.is_content_decoded() {
+                "Encoded"
+            } else {
+                "Decode"
+            },
+        ));
+    }
+    hints.extend([action_hint("w", "Wrap"), action_hint("f", "Fullscreen")]);
+    if matches!(
+        app.content_kind,
+        Some(ContentKind::Logs | ContentKind::PreviousLogs)
+    ) {
+        hints.push(action_hint("t", "Timestamps"));
     }
     hints
 }
@@ -588,6 +615,15 @@ fn resource_action_hints(app: &App) -> Vec<HeaderHint> {
         hints.push(action_hint("p", "Logs Previous"));
         if !app.read_only {
             hints.push(action_hint("s", "Shell"));
+        }
+    }
+    if matches!(
+        app.kind.known_kind(),
+        Some(ResourceKind::Pods | ResourceKind::Services)
+    ) {
+        hints.push(action_hint("f", "Port Forwards"));
+        if !app.read_only {
+            hints.push(action_hint("shift-f", "Port Forward"));
         }
     }
     if app.selected_row().is_some_and(|row| row.owner.is_some()) {
@@ -1940,6 +1976,163 @@ fn describe_value_style(value: &str) -> Style {
     }
 }
 
+fn draw_port_forward_dialog(frame: &mut Frame<'_>, app: &App, dialog_area: Rect) {
+    let Some(dialog) = app.port_forward_dialog.as_ref() else {
+        return;
+    };
+    let exposed = dialog
+        .ports
+        .iter()
+        .take(6)
+        .map(|port| {
+            Line::from(Span::styled(port.display(), Style::default().fg(YELLOW))).centered()
+        })
+        .collect::<Vec<_>>();
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            port_forward_target_label(dialog),
+            Style::default().fg(YELLOW).bold(),
+        ))
+        .centered(),
+        Line::from(""),
+        Line::from(Span::styled(
+            if dialog.ports.is_empty() {
+                "No declared TCP ports"
+            } else {
+                "Exposed Ports:"
+            },
+            Style::default().fg(YELLOW),
+        ))
+        .centered(),
+    ];
+    lines.extend(exposed);
+    lines.push(Line::from(""));
+    let remote_label = if dialog.target.kind.known_kind() == Some(ResourceKind::Services) {
+        "Service Port:"
+    } else {
+        "Container Port:"
+    };
+    lines.extend([
+        port_forward_option_line(
+            remote_label,
+            &dialog.remote_port,
+            app.overlay_selected == PORT_FORWARD_REMOTE_FIELD,
+        ),
+        port_forward_option_line(
+            "Local Port:",
+            &dialog.local_port,
+            app.overlay_selected == PORT_FORWARD_LOCAL_FIELD,
+        ),
+        port_forward_option_line(
+            "Address:",
+            &dialog.address,
+            app.overlay_selected == PORT_FORWARD_ADDRESS_FIELD,
+        ),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "   OK   ",
+                drain_button_style(app.overlay_selected == PORT_FORWARD_OK_FIELD),
+            ),
+            Span::raw("        "),
+            Span::styled(
+                " Cancel ",
+                drain_button_style(app.overlay_selected == PORT_FORWARD_CANCEL_FIELD),
+            ),
+        ])
+        .centered(),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Tab/↑/↓ fields · type values · Enter selects · Esc cancels",
+            Style::default().fg(MUTED),
+        ))
+        .centered(),
+    ]);
+
+    let height = u16::try_from(lines.len().saturating_add(2))
+        .unwrap_or(u16::MAX)
+        .min(dialog_area.height);
+    let popup = centered_rect(70, height, dialog_area);
+    frame.render_widget(Clear, popup);
+    let block = notice_block(
+        popup_block(" <PortForward> ").border_style(Style::default().fg(BODY_BORDER)),
+        app,
+    );
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+fn port_forward_target_label(dialog: &PortForwardDialog) -> String {
+    dialog.target.namespace.as_ref().map_or_else(
+        || dialog.target.name.clone(),
+        |namespace| format!("{namespace}/{}", dialog.target.name),
+    )
+}
+
+fn port_forward_option_line(label: &str, value: &str, selected: bool) -> Line<'static> {
+    let value = if value.is_empty() {
+        "<enter value>"
+    } else {
+        value
+    };
+    let value_style = if selected {
+        Style::default().fg(Color::White).bg(SELECTED).bold()
+    } else {
+        Style::default().fg(CYAN)
+    };
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(format!("{label:<20}"), Style::default().fg(PINK).bold()),
+        Span::styled(format!(" {value} "), value_style),
+    ])
+}
+
+fn draw_port_forwards(frame: &mut Frame<'_>, app: &App, dialog_area: Rect) {
+    let height = u16::try_from(app.port_forwards.len().saturating_add(6))
+        .unwrap_or(u16::MAX)
+        .clamp(8, 22)
+        .min(dialog_area.height);
+    let popup = centered_rect(78, height, dialog_area);
+    frame.render_widget(Clear, popup);
+    let rows = app
+        .port_forwards
+        .iter()
+        .enumerate()
+        .map(|(index, forward)| {
+            let target = forward.target.namespace.as_ref().map_or_else(
+                || forward.target.name.clone(),
+                |namespace| format!("{namespace}/{}", forward.target.name),
+            );
+            Row::new([
+                Cell::from(target),
+                Cell::from(forward.address.clone()),
+                Cell::from(format!("{}:{}", forward.local_port, forward.remote_port)),
+                Cell::from(forward.state.label()),
+            ])
+            .style(if index == app.overlay_selected {
+                Style::default().fg(Color::White).bg(SELECTED).bold()
+            } else {
+                Style::default().fg(CYAN)
+            })
+        });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(44),
+            Constraint::Percentage(20),
+            Constraint::Percentage(20),
+            Constraint::Percentage(16),
+        ],
+    )
+    .header(
+        Row::new(["TARGET", "ADDRESS", "LOCAL:REMOTE", "STATUS"])
+            .style(Style::default().fg(YELLOW).bold()),
+    )
+    .column_spacing(1)
+    .block(popup_block(" <PortForwards> ").border_style(Style::default().fg(BODY_BORDER)));
+    frame.render_widget(table, popup);
+}
+
 fn draw_delete_confirmation(frame: &mut Frame<'_>, app: &App, area: Rect) {
     if let Some(PendingDelete::DrainNode(dialog)) = app.pending_delete.as_ref() {
         draw_drain_confirmation(frame, app, dialog, area);
@@ -2212,8 +2405,8 @@ mod tests {
     use crate::{
         kubeconfig::ContextInfo,
         model::{
-            NamespaceInfo, NodeData, PodData, PolicyData, ResourceDescriptor, ResourceOperations,
-            ResourceRow, ResourceSnapshot, TableCell, TableColumn,
+            NamespaceInfo, NodeData, PodData, PolicyData, PortForwardPort, ResourceDescriptor,
+            ResourceOperations, ResourceRow, ResourceSnapshot, TableCell, TableColumn,
         },
     };
 
@@ -2564,6 +2757,41 @@ mod tests {
             .expect("nested name line");
         assert_eq!(name_column, metadata_column + 2);
         assert!(!lines.iter().any(|line| line.contains("NAME       STATUS")));
+    }
+
+    #[test]
+    fn renders_port_forward_dialog_with_target_and_exposed_ports() {
+        let mut app = app_with_rendered_pod();
+        let row = ResourceRow::new("default", "api-0", "Running", "1/1", "0", 0)
+            .with_port_forward_ports(vec![PortForwardPort {
+                container: Some(Arc::from("api")),
+                name: Arc::from("http"),
+                port: 8080,
+            }]);
+        app.apply_snapshot(ResourceSnapshot {
+            generation: app.generation,
+            kind: ResourceKind::Pods.into(),
+            rows: Arc::new(vec![Arc::new(row)]),
+            table_columns: Arc::from([]),
+            state: SourceState::Ready,
+            revision: 2,
+            emitted_at: Instant::now(),
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::SHIFT));
+        let backend = TestBackend::new(140, 40);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw port-forward dialog");
+        let rendered = rendered_lines(&terminal, 140).join("\n");
+
+        assert!(rendered.contains("<PortForward>"));
+        assert!(rendered.contains("default/api-0"));
+        assert!(rendered.contains("Exposed Ports:"));
+        assert!(rendered.contains("api::8080(http)"));
+        assert!(rendered.contains("Container Port:"));
+        assert!(rendered.contains("Local Port:"));
+        assert!(rendered.contains("localhost"));
     }
 
     #[test]

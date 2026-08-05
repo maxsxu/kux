@@ -159,6 +159,7 @@ The header always shows the actions available in the current view. These are the
 | `r` on Deployments, StatefulSets, or DaemonSets | Confirm and request a rollout restart for all marked workloads, or the current workload |
 | `u` on Nodes | Confirm and cordon or uncordon the selected node |
 | `r` on Nodes | Configure, confirm, cordon, and drain the selected node |
+| `Shift-F`, `f` on Pods or Services | Start a port forward, or inspect and stop active forwards |
 | `Ctrl-L`, `Ctrl-E`, `Ctrl-W` | Toggle logo, header, and wide columns |
 | `:q`, `Ctrl-C` | Quit |
 
@@ -171,8 +172,8 @@ Press `?` for the categorized keymap in the body. The full compatibility surface
   Name/Cluster/User/Namespace and supports `c` to copy the selected context name; `:ns` shows
   Name/Status/Age, and `y` opens the selected Namespace YAML.
 - Kux uses the active kubeconfig context and default namespace unless overridden.
-- Start with `--read-only` to disable resource and context deletion, kill, edit, restart, and future
-  mutation paths.
+- Start with `--read-only` to disable resource and context deletion, kill, edit, restart, Pod shell,
+  port forwarding, and future mutation paths.
 - `Ctrl-D` uses a guarded confirmation, batches all marked resources, and refuses the active
   context; `Ctrl-K` intentionally requests zero-grace deletion of the current resource.
 - Workload restart uses a guarded confirmation and patches the Pod template's
@@ -183,8 +184,8 @@ Press `?` for the categorized keymap in the body. The full compatibility surface
   Delete EmptyDir Data, Force, and Disable Eviction options. Static mirror pods are always skipped;
   the default checks block DaemonSet, EmptyDir, and unmanaged pods before cordoning. Evictions honor
   PodDisruptionBudgets unless Disable Eviction is selected.
-- `kubectl` is required for describe views, interactive resource editing, and kubeconfig context
-  deletion.
+- `kubectl` is required for describe views, interactive resource editing, Pod shell, port
+  forwarding, and kubeconfig context deletion.
 - The Metrics API is optional; Pod and Node usage columns remain unavailable when it is absent.
 - Use `--legacy-list` for API servers that do not support streaming initial lists.
 - Use `--no-logo` for compact terminals; `Ctrl-L` toggles the logo at runtime.
@@ -192,8 +193,9 @@ Press `?` for the categorized keymap in the body. The full compatibility surface
 ## Project status
 
 The high-scale list/watch pipeline, dynamic discovery, metrics, YAML, describe, logs, Secret
-decoding, context/namespace switching, mouse sorting, owner traversal, and RBAC policy views are
-functional. Exec/attach, port forwarding, editors, and workload scaling remain planned.
+decoding, context/namespace switching, mouse sorting, owner traversal, Pod shell, port forwarding,
+interactive editing, and RBAC policy views are functional. Attach and workload scaling remain
+planned.
 
 Kux follows the interaction model popularized by
 [K9s](https://github.com/derailed/k9s) but does not import K9s code and is not affiliated with the
