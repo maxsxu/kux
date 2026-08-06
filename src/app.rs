@@ -3368,7 +3368,7 @@ impl App {
     #[must_use]
     pub fn source_label(&self) -> &str {
         match &self.snapshot.state {
-            SourceState::Loading => "loading",
+            SourceState::Loading { .. } => "loading",
             SourceState::Ready => "watching",
             SourceState::Error(_) => "degraded",
         }

@@ -2065,6 +2065,8 @@ async fn watch_api<K, F>(
 const TABLE_ACCEPT: &str = "application/json;as=Table;v=v1;g=meta.k8s.io,\
                            application/json;as=Table;v=v1beta1;g=meta.k8s.io,\
                            application/json";
+const TABLE_PAGE_SIZE: u32 = 5_000;
+const TABLE_INCLUDE_OBJECT: &str = "Metadata";
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2135,15 +2137,38 @@ async fn watch_table_api(
     let mut revision = 0_u64;
     let mut retry_delay = Duration::from_secs(1);
     loop {
-        match list_table_pages(
+        let progressive_initial_list = revision == 0;
+        let mut partial_columns: Arc<[TableColumn]> = Arc::from([]);
+        let mut partial_rows = FxHashMap::default();
+        let mut next_progress_rows = 1_usize;
+        match list_table_pages_with_progress(
             &api,
             &client,
             request.field_selector.as_deref(),
             request.label_selector.as_deref(),
+            |columns, rows, complete| {
+                if !progressive_initial_list || complete || rows.len() < next_progress_rows {
+                    return;
+                }
+                partial_columns = Arc::clone(columns);
+                partial_rows.clone_from(rows);
+                revision = revision.wrapping_add(1);
+                publish_table(
+                    &snapshots,
+                    &request,
+                    rows,
+                    Arc::clone(columns),
+                    SourceState::Loading { loaded: rows.len() },
+                    revision,
+                );
+                next_progress_rows = rows.len().saturating_mul(2).max(rows.len() + 1);
+            },
         )
         .await
         {
             Ok(mut listing) => {
+                drop(partial_rows);
+                drop(partial_columns);
                 revision = revision.wrapping_add(1);
                 publish_table(
                     &snapshots,
@@ -2184,8 +2209,8 @@ async fn watch_table_api(
                 publish_table(
                     &snapshots,
                     &request,
-                    &FxHashMap::default(),
-                    Arc::from([]),
+                    &partial_rows,
+                    partial_columns,
                     SourceState::Error(Arc::from(error)),
                     revision,
                 );
@@ -2342,12 +2367,25 @@ async fn list_table_pages(
     field_selector: Option<&str>,
     label_selector: Option<&str>,
 ) -> Result<TableListing, String> {
+    list_table_pages_with_progress(api, client, field_selector, label_selector, |_, _, _| {}).await
+}
+
+async fn list_table_pages_with_progress<F>(
+    api: &Api<DynamicObject>,
+    client: &Client,
+    field_selector: Option<&str>,
+    label_selector: Option<&str>,
+    mut on_page: F,
+) -> Result<TableListing, String>
+where
+    F: FnMut(&Arc<[TableColumn]>, &FxHashMap<Arc<str>, Arc<ResourceRow>>, bool),
+{
     let mut columns: Arc<[TableColumn]> = Arc::from([]);
     let mut rows = FxHashMap::default();
     let mut resource_version = String::new();
     let mut continue_token: Option<String> = None;
     loop {
-        let mut params = ListParams::default().limit(500);
+        let mut params = ListParams::default().limit(TABLE_PAGE_SIZE);
         if let Some(selector) = field_selector {
             params = params.fields(selector);
         }
@@ -2376,7 +2414,9 @@ async fn list_table_pages(
             rows.insert(Arc::clone(&row.key), row);
         }
         continue_token = page.continue_token;
-        if continue_token.as_deref().is_none_or(str::is_empty) {
+        let complete = continue_token.as_deref().is_none_or(str::is_empty);
+        on_page(&columns, &rows, complete);
+        if complete {
             return Ok(TableListing {
                 columns,
                 rows,
@@ -2399,9 +2439,12 @@ fn table_request(mut request: HttpRequest<Vec<u8>>) -> Result<HttpRequest<Vec<u8
     } else {
         "?"
     };
-    let uri = format!("{}{separator}includeObject=Object", request.uri())
-        .parse()
-        .map_err(|error| format!("Unable to add Kubernetes Table options: {error}"))?;
+    let uri = format!(
+        "{}{separator}includeObject={TABLE_INCLUDE_OBJECT}",
+        request.uri()
+    )
+    .parse()
+    .map_err(|error| format!("Unable to add Kubernetes Table options: {error}"))?;
     *request.uri_mut() = uri;
     Ok(request)
 }
@@ -4453,9 +4496,9 @@ mod tests {
     }
 
     #[test]
-    fn requests_kubectl_table_representation_with_embedded_objects() {
+    fn requests_large_kubectl_table_pages_with_metadata_only() {
         let request = Request::new("/apis/example.io/v1/widgets")
-            .list(&ListParams::default().limit(500))
+            .list(&ListParams::default().limit(TABLE_PAGE_SIZE))
             .expect("list request");
         let request = table_request(request).expect("table request");
 
@@ -4464,8 +4507,9 @@ mod tests {
             TABLE_ACCEPT
         );
         let query = request.uri().query().expect("query");
-        assert!(query.contains("limit=500"));
-        assert!(query.contains("includeObject=Object"));
+        assert!(query.contains("limit=5000"));
+        assert!(query.contains("includeObject=Metadata"));
+        assert!(!query.contains("includeObject=Object"));
     }
 
     #[test]
@@ -4493,8 +4537,8 @@ mod tests {
                     "1970-01-01T01:00:00Z"
                 ],
                 "object": {
-                    "apiVersion": "example.io/v1",
-                    "kind": "Widget",
+                    "apiVersion": "meta.k8s.io/v1",
+                    "kind": "PartialObjectMetadata",
                     "metadata": {
                         "name": "example",
                         "namespace": "demo",
@@ -4616,5 +4660,47 @@ mod tests {
             );
             assert!(!listing.rows.is_empty(), "no {qualified_name} rows");
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires KUX_LIVE_CONTEXT and access to a large Kubernetes cluster"]
+    async fn live_large_dynamic_resource_table_list() {
+        let context = std::env::var("KUX_LIVE_CONTEXT").expect("KUX_LIVE_CONTEXT");
+        let qualified_name = std::env::var("KUX_LIVE_RESOURCE")
+            .unwrap_or_else(|_| "applications.argoproj.io".to_owned());
+        let client = client_for_context(&context)
+            .await
+            .expect("Kubernetes client");
+        let resources = discover_resources(client.clone())
+            .await
+            .expect("API discovery");
+        let resource = resources
+            .iter()
+            .find(|resource| resource.qualified_name() == qualified_name)
+            .unwrap_or_else(|| panic!("missing {qualified_name}"));
+        let api = dynamic_api(client.clone(), resource, None);
+        let started = Instant::now();
+        let mut progress = Vec::new();
+        let listing =
+            list_table_pages_with_progress(&api, &client, None, None, |_, rows, complete| {
+                progress.push((rows.len(), complete));
+            })
+            .await
+            .unwrap_or_else(|error| panic!("table list {qualified_name}: {error}"));
+        eprintln!(
+            "listed {} {qualified_name} rows in {:?}",
+            listing.rows.len(),
+            started.elapsed()
+        );
+        assert!(!listing.columns.is_empty(), "no Table columns");
+        assert!(!listing.rows.is_empty(), "no {qualified_name} rows");
+        assert!(
+            listing
+                .rows
+                .values()
+                .any(|row| row.namespace.as_ref() != "-")
+        );
+        assert!(progress.first().is_some_and(|(loaded, _)| *loaded > 0));
+        assert!(progress.last().is_some_and(|(_, complete)| *complete));
     }
 }

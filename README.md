@@ -124,6 +124,8 @@ flowchart LR
 - **Atomic relists.** A new list is assembled off-screen and swapped in only when complete.
 - **Bounded delivery.** `tokio::watch` retains the newest snapshot instead of building a backlog.
 - **Compact state.** Kubernetes objects become small reference-counted display rows immediately.
+- **Compact CRD tables.** Dynamic lists request metadata-only Table rows in bounded 5,000-row
+  pages and expose initial pages progressively instead of downloading full CRD objects up front.
 - **Generation safety.** Results from cancelled views cannot overwrite the active dataset.
 - **Viewport rendering.** Widgets are created only for rows visible in the terminal.
 - **Independent enrichment.** Metrics, node pod counts, YAML, logs, and actions do not block input.

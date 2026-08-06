@@ -43,9 +43,12 @@ map. Publication is rate-limited, and the `tokio::watch` channel retains only it
 Kux requests Kubernetes streaming lists for its optimized built-in views by default. They avoid a
 separate, potentially huge list response when supported by the server. `--legacy-list` uses
 500-object pages for compatibility and bounded response memory. Dynamically discovered watchable
-resources use paginated list-then-watch, since some aggregated API servers do not implement
-streaming initial events. Resources that advertise list but not watch use paginated polling with a
-five-second minimum interval.
+resources use Kubernetes Table responses with metadata-only embedded objects and bounded
+5,000-row pages before starting the watch. This avoids transferring large CRD specs and statuses
+just to render a list; full objects are fetched only for on-demand actions such as YAML. During the
+first load, cumulative snapshots are published at exponentially increasing row counts so a large
+view becomes usable before its final page arrives. Relists remain atomic. Resources that advertise
+list but not watch use the same compact Table pages with a five-second minimum polling interval.
 
 Pod and node views run a separate five-second Metrics API task. Metric results contain only compact
 CPU and memory numbers and are merged into display rows before publication. Node pod counts come

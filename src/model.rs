@@ -695,7 +695,7 @@ impl ResourceRow {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceState {
-    Loading,
+    Loading { loaded: usize },
     Ready,
     Error(Arc<str>),
 }
@@ -775,7 +775,7 @@ impl ResourceSnapshot {
             kind: kind.into(),
             rows: Arc::new(Vec::new()),
             table_columns: Arc::from([]),
-            state: SourceState::Loading,
+            state: SourceState::Loading { loaded: 0 },
             revision: 0,
             emitted_at: Instant::now(),
         }

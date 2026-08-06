@@ -976,7 +976,7 @@ fn generic_columns(wide: bool) -> Vec<ViewColumn> {
 }
 
 fn draw_resources(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
-    let show_header = !matches!(app.snapshot.state, SourceState::Loading);
+    let show_header = !matches!(app.snapshot.state, SourceState::Loading { loaded: 0 });
     let viewport_height = usize::from(area.height.saturating_sub(if show_header { 3 } else { 2 }));
     app.set_viewport_height(viewport_height);
     let columns = columns_for_view(app, area.width);
@@ -1047,7 +1047,8 @@ fn draw_resources(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 
     if app.filtered.is_empty() {
         let message = match &app.snapshot.state {
-            SourceState::Loading => "Waiting for resources…",
+            SourceState::Loading { loaded: 0 } => "Waiting for resources…",
+            SourceState::Loading { .. } => "Loading more resources…",
             SourceState::Error(error) => error.as_ref(),
             SourceState::Ready if app.filter_error.is_some() => "Invalid regular expression",
             SourceState::Ready if app.query.is_empty() => "No resources found",
@@ -3990,6 +3991,54 @@ mod tests {
         assert!(!rendered.contains("STATUS"));
         assert!(!rendered.contains("READY"));
         assert!(!rendered.contains("AGE"));
+    }
+
+    #[test]
+    fn progressively_loaded_resources_are_immediately_visible() {
+        let mut app = App::new(
+            "demo",
+            None,
+            ResourceKind::Pods,
+            false,
+            vec!["demo".to_owned()],
+        );
+        let kind = ResourceDescriptor::new(
+            "argoproj.io",
+            "v1alpha1",
+            "argoproj.io/v1alpha1",
+            "Application",
+            "applications",
+            true,
+            ResourceOperations::all(),
+        );
+        app.kind = kind.clone();
+        app.apply_snapshot(ResourceSnapshot {
+            generation: app.generation,
+            kind,
+            rows: Arc::new(vec![Arc::new(ResourceRow::new(
+                "argo",
+                "production-api",
+                "Synced",
+                "Healthy",
+                "-",
+                0,
+            ))]),
+            table_columns: Arc::from([]),
+            state: SourceState::Loading { loaded: 1 },
+            revision: 1,
+            emitted_at: Instant::now(),
+        });
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).expect("progress terminal");
+        terminal
+            .draw(|frame| draw_resources(frame, &mut app, frame.area()))
+            .expect("draw progressive resource");
+        let rendered = rendered_lines(&terminal, 120).join("\n");
+        assert!(rendered.contains("applications(all)[1]"));
+        assert!(rendered.contains("production-api"));
+        assert!(rendered.contains("NAMESPACE"));
+        assert!(!rendered.contains("Waiting for resources"));
     }
 
     #[test]
