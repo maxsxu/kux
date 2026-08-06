@@ -1959,16 +1959,17 @@ fn draw_content(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let block = notice_block(popup_block(&title).title_alignment(Alignment::Center), app);
     let inner = block.inner(area);
     let wrap = app.ui.wrap();
-    let content_height = paragraph_content_height(&lines, inner.width, wrap);
-    app.set_content_scroll_extent(content_height, inner.height);
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .scroll((app.content_scroll, app.content_horizontal_scroll));
+    let paragraph = Paragraph::new(lines);
     let paragraph = if wrap {
         paragraph.wrap(Wrap { trim: false })
     } else {
         paragraph
     };
+    let content_height = paragraph.line_count(inner.width);
+    app.set_content_scroll_extent(content_height, inner.height);
+    let paragraph = paragraph
+        .block(block)
+        .scroll((app.content_scroll, app.content_horizontal_scroll));
     frame.render_widget(paragraph, area);
 }
 
@@ -2031,17 +2032,6 @@ fn log_message_style(line: &str) -> Style {
 fn contains_log_level(line: &str, levels: &[&str]) -> bool {
     line.split(|character: char| !character.is_ascii_alphanumeric())
         .any(|word| levels.contains(&word))
-}
-
-fn paragraph_content_height(lines: &[Line<'_>], width: u16, wrap: bool) -> usize {
-    if !wrap {
-        return lines.len();
-    }
-    let width = usize::from(width.max(1));
-    lines
-        .iter()
-        .map(|line| line.width().max(1).div_ceil(width))
-        .sum()
 }
 
 fn highlight_yaml(body: &str) -> Vec<Line<'static>> {
@@ -4388,6 +4378,44 @@ mod tests {
         let rendered = rendered_lines(&terminal, 80).join("\n");
         assert!(app.content_scroll > 0);
         assert!(rendered.contains("key099: value"));
+    }
+
+    #[test]
+    fn wrapping_yaml_at_the_bottom_keeps_the_last_visual_line_visible() {
+        let mut app = App::new(
+            "demo",
+            Some("default".to_owned()),
+            ResourceKind::Pods,
+            false,
+            vec!["demo".to_owned()],
+        );
+        let mut yaml = (0..30)
+            .map(|index| format!("key{index:03}: value"))
+            .collect::<Vec<_>>();
+        yaml.push("message: 12345678901234567890 12345678901234567890 FINAL_TOKEN".to_owned());
+        app.show_content(
+            "YAML(default/api-0)",
+            yaml.join("\n"),
+            None,
+            None,
+            None,
+            ContentKind::Yaml,
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        let backend = TestBackend::new(30, 12);
+        let mut terminal = Terminal::new(backend).expect("wrapped YAML terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw unwrapped YAML");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT));
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw wrapped YAML bottom");
+
+        let rendered = rendered_lines(&terminal, 30).join("\n");
+        assert!(rendered.contains("FINAL_TOKEN"), "rendered:\n{rendered}");
     }
 
     #[test]

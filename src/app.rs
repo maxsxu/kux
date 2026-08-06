@@ -2009,7 +2009,7 @@ impl App {
                 AppCommand::None
             }
             KeyCode::Char('w') => {
-                self.ui.toggle(UiFlags::WRAP);
+                self.toggle_content_wrap();
                 AppCommand::None
             }
             KeyCode::Char('t') => {
@@ -2123,6 +2123,15 @@ impl App {
         self.content_horizontal_scroll = 0;
         self.content_max_scroll = 0;
         self.content_match_cursor = None;
+    }
+
+    fn toggle_content_wrap(&mut self) {
+        let keep_bottom =
+            self.content_max_scroll > 0 && self.content_scroll == self.content_max_scroll;
+        self.ui.toggle(UiFlags::WRAP);
+        if keep_bottom {
+            self.content_scroll = u16::MAX;
+        }
     }
 
     pub(crate) fn set_content_scroll_extent(
@@ -4095,6 +4104,27 @@ mod tests {
             [(8, 16)]
         );
         assert!(FilterMatcher::new("!api").match_ranges("worker").is_empty());
+    }
+
+    #[test]
+    fn wrap_toggle_preserves_a_scrolled_bottom_anchor() {
+        let mut app = app_with_rows();
+        app.show_content(
+            "YAML(prod/api-0)",
+            "key: value",
+            None,
+            None,
+            None,
+            ContentKind::Yaml,
+        );
+        app.set_content_scroll_extent(100, 10);
+        app.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT));
+        assert_eq!(app.content_scroll, 90);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert_eq!(app.content_scroll, u16::MAX);
+        app.set_content_scroll_extent(140, 10);
+        assert_eq!(app.content_scroll, 130);
     }
 
     #[test]
