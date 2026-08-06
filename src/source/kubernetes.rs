@@ -1968,22 +1968,14 @@ async fn watch_api<K, F>(
         spawn_enrichment_tasks(client, &request, &settings, enrichment_sender.clone());
     let _enrichment_sender = enrichment_sender;
     let mut enrichment = EnrichmentState::default();
-    let mut watcher_config = if settings.streaming_lists && request.kind.known_kind().is_some() {
-        watcher::Config::default().streaming_lists()
-    } else {
-        watcher::Config::default().page_size(500)
-    };
-    if let Some(selector) = &request.field_selector {
-        watcher_config = watcher_config.fields(selector);
-    }
-    if let Some(selector) = &request.label_selector {
-        watcher_config = watcher_config.labels(selector);
-    }
+    let watcher_config = resource_watcher_config(&settings, &request);
     let stream = watcher::watcher(api, watcher_config).default_backoff();
     tokio::pin!(stream);
 
     let mut rows: FxHashMap<Arc<str>, Arc<ResourceRow>> = FxHashMap::default();
     let mut initializing: Option<FxHashMap<Arc<str>, Arc<ResourceRow>>> = None;
+    let mut initial_load_complete = false;
+    let mut initial_progress = InitialListProgress::default();
     let mut revision = 0_u64;
     let mut dirty = false;
     let mut ticker = tokio::time::interval(settings.publish_interval);
@@ -1995,17 +1987,26 @@ async fn watch_api<K, F>(
                 match event {
                     Some(Ok(watcher::Event::Init)) => {
                         initializing = Some(FxHashMap::default());
+                        initial_progress = InitialListProgress::default();
                     }
                     Some(Ok(watcher::Event::InitApply(object))) => {
                         let mut row = map_row(&object);
                         enrichment.apply(&mut row);
-                        let row = Arc::new(row);
-                        initializing.get_or_insert_with(FxHashMap::default).insert(Arc::clone(&row.key), row);
+                        apply_initial_row(
+                            &mut initializing,
+                            Arc::new(row),
+                            initial_load_complete,
+                            &mut initial_progress,
+                            &snapshots,
+                            &request,
+                            &mut revision,
+                        );
                     }
                     Some(Ok(watcher::Event::InitDone)) => {
                         if let Some(initial) = initializing.take() {
                             rows = initial;
                         }
+                        initial_load_complete = true;
                         revision = revision.wrapping_add(1);
                         publish(&snapshots, &request, &rows, SourceState::Ready, revision);
                         dirty = false;
@@ -2023,23 +2024,25 @@ async fn watch_api<K, F>(
                         dirty = true;
                     }
                     Some(Err(error)) => {
-                        revision = revision.wrapping_add(1);
-                        publish(
+                        publish_watch_error(
                             &snapshots,
                             &request,
                             &rows,
-                            SourceState::Error(Arc::from(error.to_string())),
-                            revision,
+                            initializing.as_ref(),
+                            initial_load_complete,
+                            Arc::from(error.to_string()),
+                            &mut revision,
                         );
                     }
                     None => {
-                        revision = revision.wrapping_add(1);
-                        publish(
+                        publish_watch_error(
                             &snapshots,
                             &request,
                             &rows,
-                            SourceState::Error(Arc::from("Kubernetes watch ended")),
-                            revision,
+                            initializing.as_ref(),
+                            initial_load_complete,
+                            Arc::from("Kubernetes watch ended"),
+                            &mut revision,
                         );
                         return;
                     }
@@ -2059,6 +2062,100 @@ async fn watch_api<K, F>(
                 dirty = false;
             }
         }
+    }
+}
+
+fn resource_watcher_config(
+    settings: &KubernetesSettings,
+    request: &WatchRequest,
+) -> watcher::Config {
+    let mut config = if settings.streaming_lists && request.kind.known_kind().is_some() {
+        watcher::Config::default().streaming_lists()
+    } else {
+        watcher::Config::default().page_size(500)
+    };
+    if let Some(selector) = &request.field_selector {
+        config = config.fields(selector);
+    }
+    if let Some(selector) = &request.label_selector {
+        config = config.labels(selector);
+    }
+    config
+}
+
+fn apply_initial_row(
+    initializing: &mut Option<FxHashMap<Arc<str>, Arc<ResourceRow>>>,
+    row: Arc<ResourceRow>,
+    initial_load_complete: bool,
+    progress: &mut InitialListProgress,
+    snapshots: &watch::Sender<ResourceSnapshot>,
+    request: &WatchRequest,
+    revision: &mut u64,
+) {
+    let initial = initializing.get_or_insert_with(FxHashMap::default);
+    initial.insert(Arc::clone(&row.key), row);
+    if initial_load_complete || !progress.should_publish(initial.len()) {
+        return;
+    }
+    *revision = revision.wrapping_add(1);
+    publish(
+        snapshots,
+        request,
+        initial,
+        SourceState::Loading {
+            loaded: initial.len(),
+        },
+        *revision,
+    );
+}
+
+fn publish_watch_error(
+    snapshots: &watch::Sender<ResourceSnapshot>,
+    request: &WatchRequest,
+    rows: &FxHashMap<Arc<str>, Arc<ResourceRow>>,
+    initializing: Option<&FxHashMap<Arc<str>, Arc<ResourceRow>>>,
+    initial_load_complete: bool,
+    error: Arc<str>,
+    revision: &mut u64,
+) {
+    *revision = revision.wrapping_add(1);
+    let visible = if initial_load_complete {
+        rows
+    } else {
+        initializing.unwrap_or(rows)
+    };
+    publish(
+        snapshots,
+        request,
+        visible,
+        SourceState::Error(error),
+        *revision,
+    );
+}
+
+const INITIAL_LIST_PROGRESS_ROWS: usize = 250;
+const LIST_PROGRESS_BATCH_ROWS: usize = 5_000;
+
+#[derive(Debug)]
+struct InitialListProgress {
+    next_rows: usize,
+}
+
+impl Default for InitialListProgress {
+    fn default() -> Self {
+        Self {
+            next_rows: INITIAL_LIST_PROGRESS_ROWS,
+        }
+    }
+}
+
+impl InitialListProgress {
+    fn should_publish(&mut self, loaded: usize) -> bool {
+        if loaded < self.next_rows {
+            return false;
+        }
+        self.next_rows = loaded.saturating_add(LIST_PROGRESS_BATCH_ROWS);
+        true
     }
 }
 
@@ -2136,19 +2233,20 @@ async fn watch_table_api(
     snapshots: watch::Sender<ResourceSnapshot>,
 ) {
     let mut revision = 0_u64;
+    let mut initial_load_complete = false;
     let mut retry_delay = Duration::from_secs(1);
     loop {
-        let progressive_initial_list = revision == 0;
+        let mut initial_progress = InitialListProgress::default();
         let mut partial_columns: Arc<[TableColumn]> = Arc::from([]);
         let mut partial_rows = FxHashMap::default();
-        let mut next_progress_rows = 1_usize;
         match list_table_pages_with_progress(
             &api,
             &client,
             request.field_selector.as_deref(),
             request.label_selector.as_deref(),
             |columns, rows, complete| {
-                if !progressive_initial_list || complete || rows.len() < next_progress_rows {
+                if initial_load_complete || complete || !initial_progress.should_publish(rows.len())
+                {
                     return;
                 }
                 partial_columns = Arc::clone(columns);
@@ -2162,7 +2260,6 @@ async fn watch_table_api(
                     SourceState::Loading { loaded: rows.len() },
                     revision,
                 );
-                next_progress_rows = rows.len().saturating_mul(2).max(rows.len() + 1);
             },
         )
         .await
@@ -2170,6 +2267,7 @@ async fn watch_table_api(
             Ok(mut listing) => {
                 drop(partial_rows);
                 drop(partial_columns);
+                initial_load_complete = true;
                 revision = revision.wrapping_add(1);
                 publish_table(
                     &snapshots,
@@ -2323,20 +2421,42 @@ async fn poll_table_api(
     snapshots: watch::Sender<ResourceSnapshot>,
 ) {
     let mut revision = 0_u64;
+    let mut initial_load_complete = false;
     let poll_interval = settings.publish_interval.max(Duration::from_secs(5));
     let mut ticker = tokio::time::interval(poll_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
-        match list_table_pages(
+        let mut initial_progress = InitialListProgress::default();
+        let mut partial_columns: Arc<[TableColumn]> = Arc::from([]);
+        let mut partial_rows = FxHashMap::default();
+        match list_table_pages_with_progress(
             &api,
             &client,
             request.field_selector.as_deref(),
             request.label_selector.as_deref(),
+            |columns, rows, complete| {
+                if initial_load_complete || complete || !initial_progress.should_publish(rows.len())
+                {
+                    return;
+                }
+                partial_columns = Arc::clone(columns);
+                partial_rows.clone_from(rows);
+                revision = revision.wrapping_add(1);
+                publish_table(
+                    &snapshots,
+                    &request,
+                    rows,
+                    Arc::clone(columns),
+                    SourceState::Loading { loaded: rows.len() },
+                    revision,
+                );
+            },
         )
         .await
         {
             Ok(listing) => {
+                initial_load_complete = true;
                 revision = revision.wrapping_add(1);
                 publish_table(
                     &snapshots,
@@ -2352,23 +2472,14 @@ async fn poll_table_api(
                 publish_table(
                     &snapshots,
                     &request,
-                    &FxHashMap::default(),
-                    Arc::from([]),
+                    &partial_rows,
+                    partial_columns,
                     SourceState::Error(Arc::from(error)),
                     revision,
                 );
             }
         }
     }
-}
-
-async fn list_table_pages(
-    api: &Api<DynamicObject>,
-    client: &Client,
-    field_selector: Option<&str>,
-    label_selector: Option<&str>,
-) -> Result<TableListing, String> {
-    list_table_pages_with_progress(api, client, field_selector, label_selector, |_, _, _| {}).await
 }
 
 async fn list_table_pages_with_progress<F>(
@@ -4539,6 +4650,62 @@ mod tests {
     }
 
     #[test]
+    fn initial_list_progress_publishes_at_250_then_every_5000_rows() {
+        let mut progress = InitialListProgress::default();
+        let published = [1, 249, 250, 251, 5_249, 5_250, 5_251, 10_249, 10_250]
+            .into_iter()
+            .filter(|loaded| progress.should_publish(*loaded))
+            .collect::<Vec<_>>();
+        assert_eq!(published, [250, 5_250, 10_250]);
+    }
+
+    #[test]
+    fn typed_initial_list_publishes_rows_before_init_done() {
+        let kind: ResourceDescriptor = ResourceKind::Pods.into();
+        let request = WatchRequest {
+            generation: 7,
+            context: "demo".to_owned(),
+            kind: kind.clone(),
+            namespace: None,
+            field_selector: None,
+            label_selector: None,
+        };
+        let (snapshots, receiver) = watch::channel(ResourceSnapshot::loading(7, kind));
+        let mut initializing = None;
+        let mut progress = InitialListProgress::default();
+        let mut revision = 0;
+
+        for index in 0..INITIAL_LIST_PROGRESS_ROWS {
+            apply_initial_row(
+                &mut initializing,
+                Arc::new(ResourceRow::new(
+                    "prod",
+                    format!("pod-{index}"),
+                    "Running",
+                    "1/1",
+                    "0",
+                    0,
+                )),
+                false,
+                &mut progress,
+                &snapshots,
+                &request,
+                &mut revision,
+            );
+        }
+
+        let snapshot = receiver.borrow();
+        assert_eq!(snapshot.rows.len(), INITIAL_LIST_PROGRESS_ROWS);
+        assert_eq!(
+            snapshot.state,
+            SourceState::Loading {
+                loaded: INITIAL_LIST_PROGRESS_ROWS
+            }
+        );
+        assert_eq!(snapshot.revision, 1);
+    }
+
+    #[test]
     fn decodes_server_printer_columns_cells_and_dates() {
         let page = decode_table_list(serde_json::json!({
             "apiVersion": "meta.k8s.io/v1",
@@ -4677,7 +4844,7 @@ mod tests {
                 .find(|resource| resource.qualified_name() == qualified_name)
                 .unwrap_or_else(|| panic!("missing {qualified_name}"));
             let api = dynamic_api(client.clone(), resource, None);
-            let listing = list_table_pages(&api, &client, None, None)
+            let listing = list_table_pages_with_progress(&api, &client, None, None, |_, _, _| {})
                 .await
                 .unwrap_or_else(|error| panic!("table list {qualified_name}: {error}"));
             assert!(

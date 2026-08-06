@@ -531,7 +531,7 @@ fn action_hints(app: &App) -> Vec<HeaderHint> {
         hints.retain(|hint| hint.key != "n");
         hints.extend([
             action_hint("n", "Next Match"),
-            action_hint("shift-x", "Previous Match"),
+            action_hint("shift-n", "Previous Match"),
         ]);
     }
     hints
@@ -1498,7 +1498,7 @@ const HELP_CATEGORIES: &[HelpCategory] = &[
             ("[", "History back"),
             ("-", "History back"),
             ("]", "History forward"),
-            ("n / Shift-X", "Next / previous filter match"),
+            ("n / Shift-N", "Next / previous filter match"),
         ],
     ),
     (
@@ -1539,7 +1539,7 @@ const HELP_CATEGORIES: &[HelpCategory] = &[
             ("Ctrl-W", "Toggle wide columns"),
             ("Shift-← / Shift-→", "Select column"),
             ("Shift-O", "Sort selected column"),
-            ("Shift-N / A", "Sort name / age"),
+            ("Shift-N / A", "Sort name / age outside filter"),
             ("Shift-P / S", "Sort namespace / status"),
             ("Mouse", "Click header to sort"),
         ],

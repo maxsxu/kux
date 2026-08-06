@@ -1205,6 +1205,9 @@ impl App {
                 self.selected_column = (self.selected_column + 1).min(SortField::ALL.len() - 1);
             }
             KeyCode::Char('O') => self.set_sort(SortField::ALL[self.selected_column]),
+            KeyCode::Char('N') if !self.query.is_empty() => {
+                self.cycle_filtered_selection(false);
+            }
             KeyCode::Char('N') => self.set_sort(SortField::Name),
             KeyCode::Char('A') => self.set_sort(SortField::Age),
             KeyCode::Char('P') => self.set_sort(SortField::Namespace),
@@ -1219,9 +1222,6 @@ impl App {
             }
             KeyCode::Char('J') => {
                 return self.open_owner_resource();
-            }
-            KeyCode::Char('X') if !self.query.is_empty() => {
-                self.cycle_filtered_selection(false);
             }
             _ => return AppCommand::None,
         }
@@ -1504,7 +1504,7 @@ impl App {
             KeyCode::Char('n') if !self.body_query.is_empty() => {
                 self.cycle_chooser_selection(visible, true);
             }
-            KeyCode::Char('X')
+            KeyCode::Char('N')
                 if !self.body_query.is_empty() && key.modifiers.contains(KeyModifiers::SHIFT) =>
             {
                 self.cycle_chooser_selection(visible, false);
@@ -2059,7 +2059,7 @@ impl App {
             {
                 self.scroll_to_content_match(true);
             }
-            KeyCode::Char('X')
+            KeyCode::Char('N')
                 if self.overlay == Overlay::Content
                     && !self.body_query.is_empty()
                     && key.modifiers.contains(KeyModifiers::SHIFT) =>
@@ -4035,7 +4035,7 @@ mod tests {
             list.selected_row().map(|row| row.name.as_ref()),
             Some("api-0")
         );
-        list.handle_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT));
+        list.handle_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT));
         assert_eq!(
             list.selected_row().map(|row| row.name.as_ref()),
             Some("worker-0")
@@ -4056,7 +4056,7 @@ mod tests {
         let first = chooser.overlay_selected;
         chooser.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         assert_ne!(chooser.overlay_selected, first);
-        chooser.handle_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT));
+        chooser.handle_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT));
         assert_eq!(chooser.overlay_selected, first);
         assert!(visible.len() > 1);
 
@@ -4076,7 +4076,7 @@ mod tests {
         assert_eq!(content.content_scroll, 1, "viewport clamps the last match");
         content.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         assert_eq!(content.content_scroll, 0);
-        content.handle_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT));
+        content.handle_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT));
         assert_eq!(content.content_scroll, 2);
     }
 
