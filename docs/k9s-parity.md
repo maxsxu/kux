@@ -16,6 +16,7 @@ K9s key and reports that its backend is pending, and **planned** is not yet expo
 | CustomResourceDefinition command | `:crd`, `:crds` | Implemented as exact aliases for the CRD resource |
 | Resource in namespace | `:pod ns-x` | Implemented |
 | Regex, inverse, fuzzy, label filter | `/x`, `/!x`, `/-f x`, `/-l k=v` | Implemented |
+| Highlight and navigate filter matches | `n`, `Shift-X` | Implemented across resource lists, choosers, and content; navigation wraps at both ends |
 | Command/filter in in-place views | `:`, `/` | Implemented for resource, resource chooser, namespace chooser, context, details, YAML, describe, logs, container, and policy bodies |
 | Restore previous/clear filter input | `Tab`, `Ctrl-U` | Implemented with muted history hint |
 | Cancel mode | `Esc` | Implemented |
@@ -56,7 +57,7 @@ K9s key and reports that its backend is pending, and **planned** is not yet expo
 | --- | --- | --- |
 | Pod/container logs/previous logs | `l`, `p` | Implemented, last 500 lines; Pod actions resolve and pass the selected default container for both current and previous requests, and timestamps/severity levels are colorized without changing the raw content |
 | Copy YAML/toggle managed fields | `c`, `m` in YAML | Implemented; copy uses the visible variant |
-| Search YAML without hiding context | `/query` in YAML | Implemented; keeps the full document and scrolls to the first matching line |
+| Search YAML without hiding context | `/query`, then `n`/`Shift-X` in YAML | Implemented; keeps the full document, highlights matches, and scrolls between matching lines |
 | Copy decoded Secret data | `c` in Secret data view | Implemented; copies the data-only body |
 | Wrap/timestamps/fullscreen | `w`, `t`, `f` in content view | Implemented UI toggles |
 | Delete marked resources, current resource, or inactive context with Tab + Enter confirmation | `Ctrl-D` | Implemented; all marked resources are deleted as one bounded batch, while active/synthetic contexts and resources without delete capability remain protected |

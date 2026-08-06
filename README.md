@@ -78,6 +78,9 @@ Filters update as you type:
 /-l app=api,env=prod       Label match
 ```
 
+Matches are highlighted in tables and content. After applying a filter, `n` selects or scrolls to
+the next match and `Shift-X` moves to the previous match, wrapping at either end.
+
 Navigation stays in place instead of stacking popups:
 
 ```text
@@ -93,7 +96,7 @@ Resource ──y / d / e──▶ Formatted YAML / kubectl describe / interactiv
 
 Command and filter mode remain available from resource tables, contexts, details, YAML, describe,
 logs, containers, and authorization policy views. In YAML, `/` keeps the complete document visible
-and scrolls directly to the first matching line.
+and scrolls directly to the first matching line; `n` and `Shift-X` continue through the document.
 
 ## Purpose-built Kubernetes views
 
@@ -124,8 +127,8 @@ flowchart LR
 - **Atomic relists.** A new list is assembled off-screen and swapped in only when complete.
 - **Bounded delivery.** `tokio::watch` retains the newest snapshot instead of building a backlog.
 - **Compact state.** Kubernetes objects become small reference-counted display rows immediately.
-- **Compact CRD tables.** Dynamic lists request metadata-only Table rows in bounded 5,000-row
-  pages and expose initial pages progressively instead of downloading full CRD objects up front.
+- **Compact CRD tables.** Dynamic lists request metadata-only Table rows, expose the first 250 rows
+  immediately, then fetch bounded 5,000-row pages instead of downloading full CRD objects up front.
 - **Generation safety.** Results from cancelled views cannot overwrite the active dataset.
 - **Viewport rendering.** Widgets are created only for rows visible in the terminal.
 - **Independent enrichment.** Metrics, node pod counts, YAML, logs, and actions do not block input.

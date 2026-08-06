@@ -2065,7 +2065,8 @@ async fn watch_api<K, F>(
 const TABLE_ACCEPT: &str = "application/json;as=Table;v=v1;g=meta.k8s.io,\
                            application/json;as=Table;v=v1beta1;g=meta.k8s.io,\
                            application/json";
-const TABLE_PAGE_SIZE: u32 = 5_000;
+const TABLE_INITIAL_PAGE_SIZE: u32 = 250;
+const TABLE_MAX_PAGE_SIZE: u32 = 5_000;
 const TABLE_INCLUDE_OBJECT: &str = "Metadata";
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -2384,8 +2385,9 @@ where
     let mut rows = FxHashMap::default();
     let mut resource_version = String::new();
     let mut continue_token: Option<String> = None;
+    let mut page_size = TABLE_INITIAL_PAGE_SIZE;
     loop {
-        let mut params = ListParams::default().limit(TABLE_PAGE_SIZE);
+        let mut params = ListParams::default().limit(page_size);
         if let Some(selector) = field_selector {
             params = params.fields(selector);
         }
@@ -2423,6 +2425,15 @@ where
                 resource_version,
             });
         }
+        page_size = next_table_page_size(page_size);
+    }
+}
+
+fn next_table_page_size(current: u32) -> u32 {
+    if current < TABLE_MAX_PAGE_SIZE {
+        TABLE_MAX_PAGE_SIZE
+    } else {
+        current
     }
 }
 
@@ -4496,9 +4507,9 @@ mod tests {
     }
 
     #[test]
-    fn requests_large_kubectl_table_pages_with_metadata_only() {
+    fn requests_kubectl_table_pages_with_metadata_only() {
         let request = Request::new("/apis/example.io/v1/widgets")
-            .list(&ListParams::default().limit(TABLE_PAGE_SIZE))
+            .list(&ListParams::default().limit(TABLE_INITIAL_PAGE_SIZE))
             .expect("list request");
         let request = table_request(request).expect("table request");
 
@@ -4507,9 +4518,24 @@ mod tests {
             TABLE_ACCEPT
         );
         let query = request.uri().query().expect("query");
-        assert!(query.contains("limit=5000"));
+        assert!(query.contains("limit=250"));
         assert!(query.contains("includeObject=Metadata"));
         assert!(!query.contains("includeObject=Object"));
+    }
+
+    #[test]
+    fn grows_dynamic_table_pages_to_a_bounded_maximum_after_first_paint() {
+        let mut size = TABLE_INITIAL_PAGE_SIZE;
+        let mut sizes = vec![size];
+        for _ in 0..2 {
+            size = next_table_page_size(size);
+            sizes.push(size);
+        }
+        assert_eq!(sizes, [250, 5_000, 5_000]);
+        assert_eq!(
+            next_table_page_size(TABLE_MAX_PAGE_SIZE),
+            TABLE_MAX_PAGE_SIZE
+        );
     }
 
     #[test]
@@ -4683,7 +4709,7 @@ mod tests {
         let mut progress = Vec::new();
         let listing =
             list_table_pages_with_progress(&api, &client, None, None, |_, rows, complete| {
-                progress.push((rows.len(), complete));
+                progress.push((rows.len(), complete, started.elapsed()));
             })
             .await
             .unwrap_or_else(|error| panic!("table list {qualified_name}: {error}"));
@@ -4692,6 +4718,7 @@ mod tests {
             listing.rows.len(),
             started.elapsed()
         );
+        eprintln!("progressive pages: {progress:?}");
         assert!(!listing.columns.is_empty(), "no Table columns");
         assert!(!listing.rows.is_empty(), "no {qualified_name} rows");
         assert!(
@@ -4700,7 +4727,7 @@ mod tests {
                 .values()
                 .any(|row| row.namespace.as_ref() != "-")
         );
-        assert!(progress.first().is_some_and(|(loaded, _)| *loaded > 0));
-        assert!(progress.last().is_some_and(|(_, complete)| *complete));
+        assert!(progress.first().is_some_and(|(loaded, _, _)| *loaded > 0));
+        assert!(progress.last().is_some_and(|(_, complete, _)| *complete));
     }
 }

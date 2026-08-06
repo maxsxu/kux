@@ -11,9 +11,9 @@ use crate::{
         App, ColumnHitbox, ContentKind, DRAIN_CANCEL_FIELD, DRAIN_DELETE_EMPTYDIR_DATA_FIELD,
         DRAIN_DISABLE_EVICTION_FIELD, DRAIN_FORCE_FIELD, DRAIN_GRACE_PERIOD_FIELD,
         DRAIN_IGNORE_DAEMON_SETS_FIELD, DRAIN_OK_FIELD, DRAIN_TIMEOUT_FIELD, DrainDialog,
-        InputMode, ListMode, Overlay, PORT_FORWARD_ADDRESS_FIELD, PORT_FORWARD_CANCEL_FIELD,
-        PORT_FORWARD_LOCAL_FIELD, PORT_FORWARD_OK_FIELD, PORT_FORWARD_REMOTE_FIELD, PendingDelete,
-        PortForwardDialog, SortField,
+        FilterMatcher, InputMode, ListMode, Overlay, PORT_FORWARD_ADDRESS_FIELD,
+        PORT_FORWARD_CANCEL_FIELD, PORT_FORWARD_LOCAL_FIELD, PORT_FORWARD_OK_FIELD,
+        PORT_FORWARD_REMOTE_FIELD, PendingDelete, PortForwardDialog, SortField,
     },
     model::{ResourceKind, SourceState, format_age},
 };
@@ -527,6 +527,13 @@ fn action_hints(app: &App) -> Vec<HeaderHint> {
         _ if app.is_container_view() => hints.extend(container_action_hints(app)),
         _ => hints.extend(resource_action_hints(app)),
     }
+    if app.filter_navigation_active() {
+        hints.retain(|hint| hint.key != "n");
+        hints.extend([
+            action_hint("n", "Next Match"),
+            action_hint("shift-x", "Previous Match"),
+        ]);
+    }
     hints
 }
 
@@ -980,23 +987,31 @@ fn draw_resources(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let viewport_height = usize::from(area.height.saturating_sub(if show_header { 3 } else { 2 }));
     app.set_viewport_height(viewport_height);
     let columns = columns_for_view(app, area.width);
-
-    let rows = app.visible_rows().map(|(position, item)| {
-        let selected = position == app.selected;
-        let marked = app.marks.contains(&item.key);
-        let style = resource_row_style(position, selected);
-        let cells = columns
-            .iter()
-            .map(|column| resource_cell(column, item, selected, marked, app.now_unix));
-        Row::new(cells).style(style)
-    });
-
-    let widths: Vec<_> = columns.iter().map(|column| column.width).collect();
     let filter = if app.input_mode == InputMode::Filter && !app.input.is_empty() {
         &app.input
     } else {
         &app.query
     };
+    let filter_matcher = FilterMatcher::new(filter);
+
+    let rows = app.visible_rows().map(|(position, item)| {
+        let selected = position == app.selected;
+        let marked = app.marks.contains(&item.key);
+        let style = resource_row_style(position, selected);
+        let cells = columns.iter().map(|column| {
+            resource_cell(
+                column,
+                item,
+                selected,
+                marked,
+                app.now_unix,
+                &filter_matcher,
+            )
+        });
+        Row::new(cells).style(style)
+    });
+
+    let widths: Vec<_> = columns.iter().map(|column| column.width).collect();
     let filter_suffix = if filter.is_empty() {
         String::new()
     } else {
@@ -1069,6 +1084,7 @@ fn resource_cell(
     selected: bool,
     marked: bool,
     now_unix: i64,
+    filter_matcher: &FilterMatcher,
 ) -> Cell<'static> {
     let value = if let Some(index) = column.table_index {
         table_column_value(row, index, column.table_age, now_unix)
@@ -1082,7 +1098,7 @@ fn resource_cell(
         });
     };
 
-    let cell = Cell::from(value.clone());
+    let cell = highlighted_cell(value.clone(), filter_matcher);
     let Some(field) = column.field else {
         return cell;
     };
@@ -1097,6 +1113,58 @@ fn resource_cell(
     } else {
         cell.style(resource_value_style(field, row, &value, now_unix))
     }
+}
+
+fn filter_match_style() -> Style {
+    Style::default().fg(SELECTED).bg(YELLOW).bold()
+}
+
+fn highlighted_cell(value: String, matcher: &FilterMatcher) -> Cell<'static> {
+    Cell::from(highlight_line_matches(Line::raw(value), matcher))
+}
+
+fn highlight_line_matches(line: Line<'static>, matcher: &FilterMatcher) -> Line<'static> {
+    let text = line.to_string();
+    let ranges = matcher.match_ranges(&text);
+    if ranges.is_empty() {
+        return line;
+    }
+    let mut offset = 0_usize;
+    let mut highlighted = Vec::new();
+    for span in line.spans {
+        let content = span.content.into_owned();
+        let end = offset + content.len();
+        let mut boundaries = vec![offset, end];
+        for (start, finish) in &ranges {
+            if *start < end && *finish > offset {
+                boundaries.push((*start).max(offset));
+                boundaries.push((*finish).min(end));
+            }
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        for pair in boundaries.windows(2) {
+            let start = pair[0];
+            let finish = pair[1];
+            if start == finish {
+                continue;
+            }
+            let is_match = ranges
+                .iter()
+                .any(|(match_start, match_end)| *match_start <= start && *match_end >= finish);
+            let style = if is_match {
+                span.style.patch(filter_match_style())
+            } else {
+                span.style
+            };
+            highlighted.push(Span::styled(
+                content[start - offset..finish - offset].to_owned(),
+                style,
+            ));
+        }
+        offset = end;
+    }
+    Line::from(highlighted)
 }
 
 fn resource_row_style(position: usize, selected: bool) -> Style {
@@ -1430,6 +1498,7 @@ const HELP_CATEGORIES: &[HelpCategory] = &[
             ("[", "History back"),
             ("-", "History back"),
             ("]", "History forward"),
+            ("n / Shift-X", "Next / previous filter match"),
         ],
     ),
     (
@@ -1594,6 +1663,7 @@ fn record_chooser_rows(app: &mut App, area: Rect, indices: Vec<usize>) {
 
 fn draw_aliases(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let visible = app.visible_resource_indices();
+    let matcher = FilterMatcher::new(app.body_filter());
     let title = chooser_title("resources", visible.len(), app.body_filter(), "open");
     if visible.is_empty() {
         draw_empty_chooser(frame, app, area, &title, "resources");
@@ -1613,8 +1683,8 @@ fn draw_aliases(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         })
         .map(|(index, resource)| {
             Row::new([
-                Cell::from(resource.qualified_name()),
-                Cell::from(resource.command_aliases().join(" ")),
+                highlighted_cell(resource.qualified_name(), &matcher),
+                highlighted_cell(resource.command_aliases().join(" "), &matcher),
             ])
             .style(if index == app.overlay_selected {
                 Style::default().fg(Color::White).bg(SELECTED).bold()
@@ -1640,6 +1710,7 @@ fn draw_aliases(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 
 fn draw_namespaces(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let visible = app.visible_namespace_indices();
+    let matcher = FilterMatcher::new(app.body_filter());
     let title = chooser_title("namespaces", visible.len(), app.body_filter(), "switch");
     if visible.is_empty() {
         draw_empty_chooser(frame, app, area, &title, "namespaces");
@@ -1662,9 +1733,9 @@ fn draw_namespaces(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 .age_seconds(app.now_unix)
                 .map_or_else(|| "-".to_owned(), format_age);
             Row::new([
-                Cell::from(namespace.name.clone()),
-                Cell::from(namespace.status.clone()),
-                Cell::from(age),
+                highlighted_cell(namespace.name.clone(), &matcher),
+                highlighted_cell(namespace.status.clone(), &matcher),
+                highlighted_cell(age, &matcher),
             ])
             .style(if index == app.overlay_selected {
                 Style::default().fg(Color::White).bg(SELECTED).bold()
@@ -1747,6 +1818,7 @@ fn context_columns(app: &App, area_width: u16) -> Vec<(ContextColumn, u16)> {
 
 fn draw_contexts(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let visible = app.visible_context_indices();
+    let matcher = FilterMatcher::new(app.body_filter());
     let title = chooser_title("contexts", visible.len(), app.body_filter(), "switch");
     if visible.is_empty() {
         draw_empty_chooser(frame, app, area, &title, "contexts");
@@ -1774,10 +1846,16 @@ fn draw_contexts(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     } else {
                         " "
                     }),
-                    ContextColumn::Name => Cell::from(context.name.clone()),
-                    ContextColumn::Cluster => Cell::from(context.cluster_display().to_owned()),
-                    ContextColumn::User => Cell::from(context.user_display().to_owned()),
-                    ContextColumn::Namespace => Cell::from(context.namespace_display().to_owned()),
+                    ContextColumn::Name => highlighted_cell(context.name.clone(), &matcher),
+                    ContextColumn::Cluster => {
+                        highlighted_cell(context.cluster_display().to_owned(), &matcher)
+                    }
+                    ContextColumn::User => {
+                        highlighted_cell(context.user_display().to_owned(), &matcher)
+                    }
+                    ContextColumn::Namespace => {
+                        highlighted_cell(context.namespace_display().to_owned(), &matcher)
+                    }
                 })
                 .collect::<Vec<_>>();
             Row::new(cells).style(if index == app.overlay_selected {
@@ -1817,6 +1895,7 @@ fn draw_details(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         return;
     };
     let age = format_age(row.age_seconds(app.now_unix));
+    let matcher = FilterMatcher::new(app.body_filter());
     let lines = vec![
         detail_line("Kind", app.kind.label()),
         detail_line("Namespace", row.namespace.as_ref()),
@@ -1829,6 +1908,7 @@ fn draw_details(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     ]
     .into_iter()
     .filter(|line| app.body_line_matches(&line.to_string()))
+    .map(|line| highlight_line_matches(line, &matcher))
     .collect::<Vec<_>>();
     let filter = if app.body_filter().is_empty() {
         String::new()
@@ -1857,6 +1937,7 @@ fn draw_content(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let matcher = FilterMatcher::new(app.body_filter());
     let lines = match app.content_kind {
         Some(ContentKind::Yaml | ContentKind::SecretData) => highlight_yaml(&filtered),
         Some(ContentKind::Describe) => highlight_describe(&filtered),
@@ -1865,7 +1946,10 @@ fn draw_content(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .lines()
             .map(|line| Line::raw(line.to_owned()))
             .collect(),
-    };
+    }
+    .into_iter()
+    .map(|line| highlight_line_matches(line, &matcher))
+    .collect::<Vec<_>>();
     let filter = if app.body_filter().is_empty() {
         String::new()
     } else {
@@ -4341,6 +4425,29 @@ mod tests {
         assert!(app.content_scroll > 0);
         assert!(rendered.contains("key040: value"));
         assert!(rendered.contains("key041: value"));
+    }
+
+    #[test]
+    fn filter_highlighting_preserves_existing_styles_and_marks_every_match() {
+        let line = Line::from(vec![
+            Span::styled("prod-", Style::default().fg(PURPLE)),
+            Span::styled("api-api", Style::default().fg(CYAN)),
+        ]);
+        let highlighted = highlight_line_matches(line, &FilterMatcher::new("api"));
+        assert_eq!(highlighted.to_string(), "prod-api-api");
+        let matched = highlighted
+            .spans
+            .iter()
+            .filter(|span| span.style.bg == Some(YELLOW))
+            .collect::<Vec<_>>();
+        assert_eq!(matched.len(), 2);
+        assert!(matched.iter().all(|span| span.style.fg == Some(SELECTED)));
+        assert!(
+            highlighted
+                .spans
+                .iter()
+                .any(|span| span.content.as_ref() == "prod-" && span.style.fg == Some(PURPLE))
+        );
     }
 
     #[test]

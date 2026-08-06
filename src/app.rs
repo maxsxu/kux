@@ -667,6 +667,7 @@ pub struct App {
     pub port_forwards: Vec<PortForwardInfo>,
     pub read_only: bool,
     content_max_scroll: u16,
+    content_match_cursor: Option<usize>,
     content_target: Option<ResourceTarget>,
     saved_resource_list: Option<SavedResourceList>,
     pending_containers: Option<ResourceTarget>,
@@ -766,6 +767,7 @@ impl App {
             port_forwards: Vec::new(),
             read_only,
             content_max_scroll: 0,
+            content_match_cursor: None,
             content_target: None,
             saved_resource_list: None,
             pending_containers: None,
@@ -1082,6 +1084,10 @@ impl App {
                 self.select(self.filtered.len().saturating_sub(1));
                 AppCommand::None
             }
+            KeyCode::Char('n') if !self.query.is_empty() => {
+                self.cycle_filtered_selection(true);
+                AppCommand::None
+            }
             KeyCode::Char(' ') => {
                 self.toggle_mark();
                 AppCommand::None
@@ -1213,6 +1219,9 @@ impl App {
             }
             KeyCode::Char('J') => {
                 return self.open_owner_resource();
+            }
+            KeyCode::Char('X') if !self.query.is_empty() => {
+                self.cycle_filtered_selection(false);
             }
             _ => return AppCommand::None,
         }
@@ -1492,6 +1501,14 @@ impl App {
 
     fn handle_chooser_navigation(&mut self, key: &KeyEvent, visible: &[usize]) -> bool {
         match key.code {
+            KeyCode::Char('n') if !self.body_query.is_empty() => {
+                self.cycle_chooser_selection(visible, true);
+            }
+            KeyCode::Char('X')
+                if !self.body_query.is_empty() && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                self.cycle_chooser_selection(visible, false);
+            }
             KeyCode::Down | KeyCode::Char('j') => self.move_chooser_selection(visible, 1, true),
             KeyCode::Up | KeyCode::Char('k') => self.move_chooser_selection(visible, 1, false),
             KeyCode::PageDown => {
@@ -1515,6 +1532,23 @@ impl App {
             _ => return false,
         }
         true
+    }
+
+    fn cycle_chooser_selection(&mut self, visible: &[usize], forward: bool) {
+        if visible.is_empty() {
+            self.overlay_selected = NO_CHOOSER_SELECTION;
+            return;
+        }
+        let position = visible
+            .iter()
+            .position(|index| *index == self.overlay_selected)
+            .unwrap_or(0);
+        let next = if forward {
+            (position + 1) % visible.len()
+        } else {
+            position.checked_sub(1).unwrap_or(visible.len() - 1)
+        };
+        self.overlay_selected = visible[next];
     }
 
     fn handle_alias_overlay(&mut self, key: KeyEvent) -> AppCommand {
@@ -2020,37 +2054,57 @@ impl App {
 
     fn handle_body_navigation(&mut self, key: &KeyEvent) -> bool {
         match key.code {
+            KeyCode::Char('n')
+                if self.overlay == Overlay::Content && !self.body_query.is_empty() =>
+            {
+                self.scroll_to_content_match(true);
+            }
+            KeyCode::Char('X')
+                if self.overlay == Overlay::Content
+                    && !self.body_query.is_empty()
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                self.scroll_to_content_match(false);
+            }
             KeyCode::Down | KeyCode::Char('j') => {
+                self.content_match_cursor = None;
                 self.content_scroll = self
                     .content_scroll
                     .saturating_add(1)
                     .min(self.content_max_scroll);
             }
             KeyCode::Up | KeyCode::Char('k') => {
+                self.content_match_cursor = None;
                 self.content_scroll = self.content_scroll.saturating_sub(1);
             }
             KeyCode::PageDown => {
+                self.content_match_cursor = None;
                 self.content_scroll = self
                     .content_scroll
                     .saturating_add(20)
                     .min(self.content_max_scroll);
             }
             KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.content_match_cursor = None;
                 self.content_scroll = self
                     .content_scroll
                     .saturating_add(20)
                     .min(self.content_max_scroll);
             }
             KeyCode::PageUp => {
+                self.content_match_cursor = None;
                 self.content_scroll = self.content_scroll.saturating_sub(20);
             }
             KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.content_match_cursor = None;
                 self.content_scroll = self.content_scroll.saturating_sub(20);
             }
             KeyCode::Home | KeyCode::Char('g') => {
+                self.content_match_cursor = None;
                 self.content_scroll = 0;
             }
             KeyCode::End | KeyCode::Char('G') => {
+                self.content_match_cursor = None;
                 self.content_scroll = self.content_max_scroll;
             }
             KeyCode::Left | KeyCode::Char('h') => {
@@ -2068,6 +2122,7 @@ impl App {
         self.content_scroll = 0;
         self.content_horizontal_scroll = 0;
         self.content_max_scroll = 0;
+        self.content_match_cursor = None;
     }
 
     pub(crate) fn set_content_scroll_extent(
@@ -2133,6 +2188,7 @@ impl App {
     fn set_active_filter(&mut self, filter: String) {
         if self.body_filter_active() {
             self.body_query = filter;
+            self.content_match_cursor = None;
             let matcher = FilterMatcher::new(&self.body_query);
             self.filter_error = matcher.error().map(str::to_owned);
             if self.overlay == Overlay::Content && self.content_kind == Some(ContentKind::Yaml) {
@@ -2161,7 +2217,54 @@ impl App {
             .position(|line| matcher.matches_text(line));
         if let Some(line) = match_line {
             self.content_scroll = u16::try_from(line).unwrap_or(u16::MAX);
+            self.content_match_cursor = Some(0);
         }
+    }
+
+    fn scroll_to_content_match(&mut self, forward: bool) {
+        let matcher = FilterMatcher::new(&self.body_query);
+        let positions = if self.content_kind == Some(ContentKind::Yaml) {
+            self.active_content_body()
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| matcher.matches_text(line))
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>()
+        } else {
+            (0..self
+                .active_content_body()
+                .lines()
+                .filter(|line| matcher.matches_text(line))
+                .count())
+                .collect::<Vec<_>>()
+        };
+        if positions.is_empty() {
+            return;
+        }
+        let current = usize::from(self.content_scroll);
+        let target_index = if let Some(cursor) = self
+            .content_match_cursor
+            .filter(|cursor| *cursor < positions.len())
+        {
+            if forward {
+                (cursor + 1) % positions.len()
+            } else {
+                cursor.checked_sub(1).unwrap_or(positions.len() - 1)
+            }
+        } else if forward {
+            positions
+                .iter()
+                .position(|position| *position > current)
+                .unwrap_or(0)
+        } else {
+            positions
+                .iter()
+                .rposition(|position| *position < current)
+                .unwrap_or(positions.len() - 1)
+        };
+        let target = positions[target_index];
+        self.content_match_cursor = Some(target_index);
+        self.content_scroll = u16::try_from(target).unwrap_or(u16::MAX);
     }
 
     fn execute_command(&mut self) -> AppCommand {
@@ -2722,6 +2825,20 @@ impl App {
         if !self.filtered.is_empty() {
             self.select(self.selected.saturating_sub(amount));
         }
+    }
+
+    fn cycle_filtered_selection(&mut self, forward: bool) {
+        if self.filtered.is_empty() {
+            return;
+        }
+        let selected = if forward {
+            (self.selected + 1) % self.filtered.len()
+        } else {
+            self.selected
+                .checked_sub(1)
+                .unwrap_or(self.filtered.len() - 1)
+        };
+        self.select(selected);
     }
 
     fn select(&mut self, selected: usize) {
@@ -3373,9 +3490,18 @@ impl App {
             SourceState::Error(_) => "degraded",
         }
     }
+
+    #[must_use]
+    pub fn filter_navigation_active(&self) -> bool {
+        if self.body_filter_active() {
+            !self.body_query.is_empty()
+        } else {
+            !self.query.is_empty()
+        }
+    }
 }
 
-enum FilterMatcher {
+pub(crate) enum FilterMatcher {
     All,
     Regex(regex::Regex),
     Inverse(regex::Regex),
@@ -3385,7 +3511,7 @@ enum FilterMatcher {
 }
 
 impl FilterMatcher {
-    fn new(query: &str) -> Self {
+    pub(crate) fn new(query: &str) -> Self {
         let query = query.trim();
         if query.is_empty() {
             return Self::All;
@@ -3449,6 +3575,56 @@ impl FilterMatcher {
             None
         }
     }
+
+    pub(crate) fn match_ranges(&self, text: &str) -> Vec<(usize, usize)> {
+        match self {
+            Self::Regex(regex) => regex
+                .find_iter(text)
+                .filter(|matched| !matched.is_empty())
+                .map(|matched| (matched.start(), matched.end()))
+                .collect(),
+            Self::Fuzzy(needle) => fuzzy_match_ranges(text, needle),
+            Self::Labels(selectors) => {
+                let mut ranges = selectors
+                    .iter()
+                    .flat_map(|selector| literal_match_ranges(text, selector))
+                    .collect::<Vec<_>>();
+                ranges.sort_unstable();
+                ranges.dedup();
+                ranges
+            }
+            Self::All | Self::Inverse(_) | Self::Invalid(_) => Vec::new(),
+        }
+    }
+}
+
+fn literal_match_ranges(text: &str, needle: &str) -> Vec<(usize, usize)> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    text.to_ascii_lowercase()
+        .match_indices(needle)
+        .map(|(start, value)| (start, start + value.len()))
+        .collect()
+}
+
+fn fuzzy_match_ranges(text: &str, needle: &str) -> Vec<(usize, usize)> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut expected = needle.chars();
+    let mut current = expected.next();
+    let mut ranges = Vec::new();
+    for (start, character) in text.char_indices() {
+        if current.is_some_and(|expected| character.eq_ignore_ascii_case(&expected)) {
+            ranges.push((start, start + character.len_utf8()));
+            current = expected.next();
+            if current.is_none() {
+                return ranges;
+            }
+        }
+    }
+    Vec::new()
 }
 
 fn fuzzy_match(haystack: &str, needle: &str) -> bool {
@@ -3842,6 +4018,83 @@ mod tests {
         chooser.open_aliases();
         chooser.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
         assert_eq!(chooser.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn filter_match_navigation_wraps_lists_choosers_and_content() {
+        let mut list = app_with_rows();
+        list.query = ".".to_owned();
+        list.rebuild_filter(None);
+        list.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert_eq!(
+            list.selected_row().map(|row| row.name.as_ref()),
+            Some("worker-0")
+        );
+        list.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert_eq!(
+            list.selected_row().map(|row| row.name.as_ref()),
+            Some("api-0")
+        );
+        list.handle_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT));
+        assert_eq!(
+            list.selected_row().map(|row| row.name.as_ref()),
+            Some("worker-0")
+        );
+
+        list.query.clear();
+        list.rebuild_filter(None);
+        assert_eq!(
+            list.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+            AppCommand::Copy("prod".to_owned()),
+            "n keeps its normal binding when no filter is active"
+        );
+
+        let mut chooser = app_with_rows();
+        chooser.open_aliases();
+        chooser.body_query = ".".to_owned();
+        let visible = chooser.visible_resource_indices();
+        let first = chooser.overlay_selected;
+        chooser.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert_ne!(chooser.overlay_selected, first);
+        chooser.handle_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT));
+        assert_eq!(chooser.overlay_selected, first);
+        assert!(visible.len() > 1);
+
+        let mut content = app_with_rows();
+        content.show_content(
+            "YAML(prod/api-0)",
+            "match: first\nskip: value\nmatch: second",
+            None,
+            None,
+            None,
+            ContentKind::Yaml,
+        );
+        content.body_query = "match".to_owned();
+        content.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert_eq!(content.content_scroll, 2);
+        content.set_content_scroll_extent(3, 2);
+        assert_eq!(content.content_scroll, 1, "viewport clamps the last match");
+        content.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert_eq!(content.content_scroll, 0);
+        content.handle_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT));
+        assert_eq!(content.content_scroll, 2);
+    }
+
+    #[test]
+    fn filter_matcher_reports_regex_fuzzy_and_label_highlight_ranges() {
+        assert_eq!(
+            FilterMatcher::new("api").match_ranges("prod-api-api"),
+            [(5, 8), (9, 12)]
+        );
+        assert_eq!(
+            FilterMatcher::new("-f pi").match_ranges("API"),
+            [(1, 2), (2, 3)]
+        );
+        assert_eq!(
+            FilterMatcher::new("-l env=prod").match_ranges("app=api,ENV=PROD"),
+            [(8, 16)]
+        );
+        assert!(FilterMatcher::new("!api").match_ranges("worker").is_empty());
     }
 
     #[test]
