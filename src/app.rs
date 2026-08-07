@@ -152,6 +152,23 @@ impl ColumnHitbox {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ResourceRowsHitbox {
+    x: u16,
+    y: u16,
+    width: u16,
+    first: usize,
+    count: usize,
+}
+
+impl ResourceRowsHitbox {
+    fn index_at(self, column: u16, row: u16) -> Option<usize> {
+        let row_offset = usize::from(row.checked_sub(self.y)?);
+        (column >= self.x && column < self.x.saturating_add(self.width) && row_offset < self.count)
+            .then(|| self.first.saturating_add(row_offset))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentKind {
     Yaml,
@@ -686,6 +703,7 @@ pub struct App {
     pending_containers: Option<ResourceTarget>,
     pending_policy: Option<ResourceTarget>,
     column_hitboxes: Vec<ColumnHitbox>,
+    resource_rows_hitbox: ResourceRowsHitbox,
     chooser_hitbox: ChooserHitbox,
     completion_seed: Option<String>,
     completion_index: usize,
@@ -786,6 +804,7 @@ impl App {
             pending_containers: None,
             pending_policy: None,
             column_hitboxes: Vec::new(),
+            resource_rows_hitbox: ResourceRowsHitbox::default(),
             chooser_hitbox: ChooserHitbox::default(),
             completion_seed: None,
             completion_index: 0,
@@ -1033,6 +1052,10 @@ impl App {
         if self.overlay != Overlay::None {
             return false;
         }
+        if let Some(selected) = self.resource_rows_hitbox.index_at(event.column, event.row) {
+            self.select(selected);
+            return true;
+        }
         let Some(hitbox) = self
             .column_hitboxes
             .iter()
@@ -1051,6 +1074,23 @@ impl App {
 
     pub(crate) fn set_column_hitboxes(&mut self, hitboxes: Vec<ColumnHitbox>) {
         self.column_hitboxes = hitboxes;
+    }
+
+    pub(crate) fn set_resource_rows_hitbox(
+        &mut self,
+        x: u16,
+        y: u16,
+        width: u16,
+        first: usize,
+        count: usize,
+    ) {
+        self.resource_rows_hitbox = ResourceRowsHitbox {
+            x,
+            y,
+            width,
+            first,
+            count,
+        };
     }
 
     pub(crate) fn set_chooser_hitbox(&mut self, x: u16, y: u16, width: u16, indices: Vec<usize>) {
@@ -5181,6 +5221,27 @@ mod tests {
         assert!(app.handle_mouse(click));
         assert!(app.sort_descending);
         assert!(!app.handle_mouse(MouseEvent { row: 8, ..click }));
+    }
+
+    #[test]
+    fn clicking_a_resource_row_moves_the_cursor_without_changing_marks() {
+        let mut app = app_with_rows();
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        app.set_resource_rows_hitbox(10, 8, 80, 1, 1);
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 24,
+            row: 8,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert!(app.handle_mouse(click));
+        assert_eq!(
+            app.selected_row().map(|row| row.name.as_ref()),
+            Some("worker-0")
+        );
+        assert_eq!(app.marks.len(), 1, "clicking does not alter marked rows");
+        assert!(!app.handle_mouse(MouseEvent { row: 9, ..click }));
     }
 
     #[test]

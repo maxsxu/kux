@@ -37,6 +37,7 @@ K9s key and reports that its backend is pending, and **planned** is not yet expo
 | Faults, wide, header, logo | `Ctrl-Z/W/E/L` | Implemented |
 | Select column | `Shift-Left`, `Shift-Right` | Implemented |
 | Sort selected/name/age/namespace/status | `Shift-O/N/A/P/S` | Implemented |
+| Select resource by mouse | Left-click a resource row | Implemented; changes the active row without changing marks |
 | Sort by mouse | Left-click a column header | Implemented; repeated clicks reverse direction |
 | Copy name/namespace | `c`, `n` | Implemented with native clipboard commands and OSC 52 fallback |
 | Decode Secret data | `x` | Implemented for exact core/v1 Secrets; list rows open decoded data only, while full YAML toggles encoded/decoded values |

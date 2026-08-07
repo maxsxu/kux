@@ -163,6 +163,7 @@ The header always shows the actions available in the current view. These are the
 | `c`, `n` | Copy resource name or namespace |
 | `x` on Secret | Open decoded data only; in YAML, toggle decoded values |
 | `Space`, `Ctrl-Space`, `Ctrl-\` | Mark one, mark a range, clear marks |
+| Left-click a row | Select that resource without changing marked resources |
 | Left-click a column | Sort; click again to reverse |
 | `Ctrl-R` | Restart the active watch |
 | `Ctrl-D` | Delete all marked resources, the current resource when none are marked, or an inactive context—with confirmation |

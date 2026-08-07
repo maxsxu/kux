@@ -1059,6 +1059,7 @@ fn draw_resources(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     } else {
         app.set_column_hitboxes(Vec::new());
     }
+    update_resource_rows_hitbox(app, area, show_header);
 
     if app.filtered.is_empty() {
         let message = match &app.snapshot.state {
@@ -1275,6 +1276,31 @@ fn update_column_hitboxes(
         })
         .collect();
     app.set_column_hitboxes(hitboxes);
+}
+
+fn update_resource_rows_hitbox(app: &mut App, area: Rect, show_header: bool) {
+    if area.width <= 2 || area.height <= 2 {
+        app.set_resource_rows_hitbox(0, 0, 0, 0, 0);
+        return;
+    }
+    let y = area
+        .y
+        .saturating_add(1)
+        .saturating_add(if show_header { 2 } else { 0 });
+    let bottom_border = area.bottom().saturating_sub(1);
+    let available_rows = usize::from(bottom_border.saturating_sub(y));
+    let count = app
+        .filtered
+        .len()
+        .saturating_sub(app.offset)
+        .min(available_rows);
+    app.set_resource_rows_hitbox(
+        area.x.saturating_add(1),
+        y,
+        area.width.saturating_sub(2),
+        app.offset,
+        count,
+    );
 }
 
 fn column_value(row: &crate::model::ResourceRow, field: SortField, now_unix: i64) -> String {
@@ -1529,6 +1555,7 @@ const HELP_CATEGORIES: &[HelpCategory] = &[
             ("Shift-F", "Start Pod/Service port forward"),
             ("s on Pods", "Open an interactive pod shell"),
             ("Shift-J", "Open controller owner"),
+            ("Mouse", "Click row to select"),
         ],
     ),
     (
@@ -1541,7 +1568,7 @@ const HELP_CATEGORIES: &[HelpCategory] = &[
             ("Shift-O", "Sort selected column"),
             ("Shift-N / A", "Sort name / age outside filter"),
             ("Shift-P / S", "Sort namespace / status"),
-            ("Mouse", "Click header to sort"),
+            ("Mouse", "Click column header to sort"),
         ],
     ),
     (
@@ -2921,6 +2948,59 @@ mod tests {
             .expect("nested name line");
         assert_eq!(name_column, metadata_column + 2);
         assert!(!lines.iter().any(|line| line.contains("NAME       STATUS")));
+    }
+
+    #[test]
+    fn rendered_resource_rows_can_be_selected_with_the_mouse() {
+        let mut app = app_with_rendered_pod();
+        app.apply_snapshot(ResourceSnapshot {
+            generation: app.generation,
+            kind: ResourceKind::Pods.into(),
+            rows: Arc::new(vec![
+                Arc::new(ResourceRow::new(
+                    "default",
+                    "api-0",
+                    "Running",
+                    "1/1",
+                    "0",
+                    app.now_unix - 60,
+                )),
+                Arc::new(ResourceRow::new(
+                    "default",
+                    "worker-0",
+                    "Pending",
+                    "0/1",
+                    "0",
+                    app.now_unix - 30,
+                )),
+            ]),
+            table_columns: Arc::from([]),
+            state: SourceState::Ready,
+            revision: 2,
+            emitted_at: Instant::now(),
+        });
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("resource mouse terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw resource rows");
+        let lines = rendered_lines(&terminal, 120);
+        let (row, column) = lines
+            .iter()
+            .enumerate()
+            .find_map(|(row, line)| line.find("worker-0").map(|column| (row, column)))
+            .expect("worker row");
+
+        assert!(app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: u16::try_from(column).expect("column fits u16"),
+            row: u16::try_from(row).expect("row fits u16"),
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(
+            app.selected_row().map(|item| item.name.as_ref()),
+            Some("worker-0")
+        );
     }
 
     #[test]
