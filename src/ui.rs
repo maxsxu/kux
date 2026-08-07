@@ -1515,8 +1515,9 @@ const HELP_CATEGORIES: &[HelpCategory] = &[
         &[
             ("j", "Down"),
             ("k", "Up"),
-            ("h", "Left / Back"),
-            ("l", "Right / Open"),
+            ("h", "Back / scroll left in text"),
+            ("l", "Open / scroll right in text"),
+            ("← / →", "Horizontal text scroll only"),
             ("g / Home", "Go to top"),
             ("Shift-G / End", "Go to bottom"),
             ("Ctrl-B / PgUp", "Page up"),

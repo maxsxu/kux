@@ -153,7 +153,9 @@ The header always shows the actions available in the current view. These are the
 | --- | --- |
 | `:`, `/` | Command mode and filter mode |
 | `0`, `1`…`9` | All namespaces, then the nine most recent named namespaces |
-| `h`/`j`/`k`/`l`, arrows, `Ctrl-B`/`Ctrl-F`, `PgUp`/`PgDn`, `g`/`G` | Navigate, go back, or open contextually |
+| `j`/`k`, Up/Down, `Ctrl-B`/`Ctrl-F`, `PgUp`/`PgDn`, `g`/`G` | Navigate vertically |
+| `h`/`l` | Go back or open contextually |
+| Left/Right | Scroll text views horizontally; never open, close, or activate an item |
 | `Enter` | Drill into the selected resource |
 | `Shift-J` | Jump to the selected resource's controller owner |
 | `y`, `d` | YAML and `kubectl describe` |

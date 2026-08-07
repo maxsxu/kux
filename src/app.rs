@@ -1111,8 +1111,9 @@ impl App {
             KeyCode::Char('?') => self.open_overlay(Overlay::Help),
             KeyCode::Char(':') => self.start_input(InputMode::Command),
             KeyCode::Char('/') => self.start_input(InputMode::Filter),
-            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => self.escape_view(),
-            KeyCode::Enter | KeyCode::Right => self.open_selected(),
+            KeyCode::Esc | KeyCode::Char('h') => self.escape_view(),
+            KeyCode::Enter => self.open_selected(),
+            KeyCode::Left | KeyCode::Right => AppCommand::None,
             KeyCode::Down | KeyCode::Char('j') => {
                 self.move_selection_down(1);
                 AppCommand::None
@@ -1381,11 +1382,11 @@ impl App {
     fn handle_port_forward_dialog(&mut self, key: KeyEvent) -> AppCommand {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q' | '?') => self.cancel_port_forward_dialog(),
-            KeyCode::Tab | KeyCode::Down | KeyCode::Right => {
+            KeyCode::Tab | KeyCode::Down => {
                 self.move_port_forward_field(1);
                 AppCommand::None
             }
-            KeyCode::BackTab | KeyCode::Up | KeyCode::Left => {
+            KeyCode::BackTab | KeyCode::Up => {
                 self.move_port_forward_field(-1);
                 AppCommand::None
             }
@@ -1610,7 +1611,7 @@ impl App {
             return AppCommand::None;
         }
         match key.code {
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+            KeyCode::Enter | KeyCode::Char('l') => {
                 let Some(index) = visible
                     .iter()
                     .copied()
@@ -1649,7 +1650,7 @@ impl App {
         match key.code {
             KeyCode::Char('y') => self.namespace_content_action(&visible),
             KeyCode::Char('e') => self.namespace_edit_action(&visible),
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+            KeyCode::Enter | KeyCode::Char('l') => {
                 let Some(index) = visible
                     .iter()
                     .copied()
@@ -1749,7 +1750,7 @@ impl App {
                 .map_or(AppCommand::None, |context| {
                     AppCommand::Copy(context.name.clone())
                 }),
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+            KeyCode::Enter | KeyCode::Char('l') => {
                 let Some(index) = visible
                     .iter()
                     .copied()
@@ -1785,11 +1786,11 @@ impl App {
             return self.handle_drain_confirmation(key);
         }
         match key.code {
-            KeyCode::Left | KeyCode::Char('h') => {
+            KeyCode::Char('h') => {
                 self.confirm_armed = false;
                 AppCommand::None
             }
-            KeyCode::Right | KeyCode::Char('l') => {
+            KeyCode::Char('l') => {
                 self.confirm_armed = true;
                 AppCommand::None
             }
@@ -1854,11 +1855,11 @@ impl App {
     fn handle_drain_confirmation(&mut self, key: KeyEvent) -> AppCommand {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q' | '?') => self.cancel_drain_confirmation(),
-            KeyCode::Tab | KeyCode::Down | KeyCode::Right => {
+            KeyCode::Tab | KeyCode::Down => {
                 self.move_drain_field(1);
                 AppCommand::None
             }
-            KeyCode::BackTab | KeyCode::Up | KeyCode::Left => {
+            KeyCode::BackTab | KeyCode::Up => {
                 self.move_drain_field(-1);
                 AppCommand::None
             }
@@ -2198,10 +2199,7 @@ impl App {
     }
 
     fn close_overlay_on(&mut self, key: KeyEvent) -> AppCommand {
-        if matches!(
-            key.code,
-            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h' | 'q' | '?')
-        ) {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('h' | 'q' | '?')) {
             self.overlay = Overlay::None;
             self.pending_delete = None;
             self.confirm_armed = false;
@@ -4080,6 +4078,43 @@ mod tests {
         chooser.open_aliases();
         chooser.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
         assert_eq!(chooser.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn unmodified_horizontal_arrows_never_activate_or_leave_non_text_views() {
+        let mut list = app_with_rows();
+        list.query = "api".to_owned();
+        list.rebuild_filter(None);
+        assert_eq!(
+            list.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            AppCommand::None
+        );
+        assert_eq!(list.overlay, Overlay::None);
+        assert_eq!(
+            list.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            AppCommand::None
+        );
+        assert_eq!(list.query, "api", "Left does not clear or leave the view");
+
+        let mut chooser = app_with_rows();
+        chooser.open_aliases();
+        let selected = chooser.overlay_selected;
+        assert_eq!(
+            chooser.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            AppCommand::None
+        );
+        assert_eq!(chooser.overlay, Overlay::Aliases);
+        assert_eq!(chooser.overlay_selected, selected);
+        chooser.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(chooser.overlay, Overlay::Aliases);
+
+        let mut confirmation = app_with_rows();
+        confirmation.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(confirmation.overlay, Overlay::ConfirmDelete);
+        confirmation.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(!confirmation.confirm_armed);
+        confirmation.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(confirmation.overlay, Overlay::ConfirmDelete);
     }
 
     #[test]
