@@ -40,16 +40,21 @@ The watcher handles `Init`, `InitApply`, and `InitDone` explicitly. A relist goe
 map and replaces the live cache only at `InitDone`. Normal apply/delete events update the active
 map. Publication is rate-limited, and the `tokio::watch` channel retains only its newest value.
 
-Kux requests Kubernetes streaming lists for its optimized built-in views by default. They avoid a
-separate, potentially huge list response when supported by the server. `--legacy-list` uses
-500-object pages for compatibility and bounded response memory. Every resource kind publishes its
-first 250 decoded rows during the initial list and then publishes each additional 5,000-row batch,
-so even large built-in and dynamic views become interactive before `InitDone`. Dynamically
-discovered resources use Kubernetes Table responses with metadata-only embedded objects and bounded
-pages, avoiding transfers of large CRD specs and statuses just to render a list; full objects are
-fetched only for on-demand actions such as YAML. Relists remain atomic. Resources that advertise
-list but not watch use the same compact Table pages and initial progress snapshots with a five-second
-minimum polling interval.
+Before starting a built-in view's typed watch and enrichment traffic, Kux gives a compact Kubernetes
+Table request a bounded head start. The first 250 metadata-only rows are projected into the normal
+built-in layout and published immediately; larger results continue in 5,000-row pages. The typed
+watch then catches up in the background and atomically replaces the bootstrap rows at `InitDone`, so
+full status, selectors, resource requests, ports, and owner data remain available without delaying
+the first useful screen. A partial typed initialization never replaces a larger bootstrap snapshot.
+
+Kux requests Kubernetes streaming lists for those typed built-in watches by default. They avoid a
+separate, potentially huge typed list response when supported by the server. `--legacy-list` uses
+500-object pages for compatibility and bounded response memory. Dynamically discovered resources
+use Kubernetes Table responses with metadata-only embedded objects and bounded pages, avoiding
+transfers of large CRD specs and statuses just to render a list; full objects are fetched only for
+on-demand actions such as YAML. Relists remain atomic. Resources that advertise list but not watch
+use the same compact Table pages and initial progress snapshots with a five-second minimum polling
+interval.
 
 Pod and node views run a separate five-second Metrics API task. Metric results contain only compact
 CPU and memory numbers and are merged into display rows before publication. Node pod counts come

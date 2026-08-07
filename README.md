@@ -127,8 +127,11 @@ flowchart LR
 - **Atomic relists.** A new list is assembled off-screen and swapped in only when complete.
 - **Bounded delivery.** `tokio::watch` retains the newest snapshot instead of building a backlog.
 - **Compact state.** Kubernetes objects become small reference-counted display rows immediately.
-- **Progressive first paint.** Every resource kind exposes its first 250 rows during the initial
-  list, followed by 5,000-row batches, while later relists remain atomic.
+- **Compact first paint.** Built-in views first request Kubernetes' metadata-only Table form and
+  expose its first 250 rows before starting the richer typed watch and metrics enrichment. The
+  typed cache replaces that bootstrap atomically once synchronized.
+- **Progressive large lists.** Table-backed views expose another snapshot after each bounded
+  5,000-row page, while later relists remain atomic.
 - **Compact CRD tables.** Dynamic lists request metadata-only Table rows in bounded 5,000-row pages
   instead of downloading full CRD objects up front.
 - **Generation safety.** List snapshots and read-action results from cancelled views cannot

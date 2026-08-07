@@ -1065,6 +1065,135 @@ impl Drop for AbortOnDrop {
     }
 }
 
+struct FastInitialList {
+    columns: Arc<[TableColumn]>,
+    rows: FxHashMap<Arc<str>, Arc<ResourceRow>>,
+    complete: bool,
+}
+
+const FAST_INITIAL_LIST_HEAD_START: Duration = Duration::from_secs(5);
+
+fn spawn_fast_initial_list(
+    client: Client,
+    request: &WatchRequest,
+) -> (mpsc::UnboundedReceiver<FastInitialList>, AbortOnDrop) {
+    let (updates, receiver) = mpsc::unbounded_channel();
+    let api = dynamic_api(client.clone(), &request.kind, request.namespace.as_deref());
+    let field_selector = request.field_selector.clone();
+    let label_selector = request.label_selector.clone();
+    let task = tokio::spawn(async move {
+        let mut sent_first = false;
+        let _ = list_table_pages_with_progress(
+            &api,
+            &client,
+            field_selector.as_deref(),
+            label_selector.as_deref(),
+            |columns, rows, complete| {
+                if sent_first && !complete {
+                    return;
+                }
+                sent_first = true;
+                let _ = updates.send(FastInitialList {
+                    columns: Arc::clone(columns),
+                    rows: rows.clone(),
+                    complete,
+                });
+            },
+        )
+        .await;
+    });
+    (receiver, AbortOnDrop(task))
+}
+
+fn hydrate_fast_initial_rows(
+    kind: &ResourceDescriptor,
+    columns: &[TableColumn],
+    rows: &mut FxHashMap<Arc<str>, Arc<ResourceRow>>,
+) {
+    for row in rows.values_mut() {
+        *row = Arc::new(hydrate_fast_initial_row(
+            kind,
+            columns,
+            row.as_ref().clone(),
+        ));
+    }
+}
+
+fn hydrate_fast_initial_row(
+    kind: &ResourceDescriptor,
+    columns: &[TableColumn],
+    mut row: ResourceRow,
+) -> ResourceRow {
+    match kind.known_kind() {
+        Some(ResourceKind::Pods) => {
+            let restarts = table_cell_text(columns, &row, "restarts")
+                .and_then(|value| value.split_whitespace().next())
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            let node =
+                table_cell_text(columns, &row, "node").map_or_else(|| Arc::from("-"), Arc::from);
+            row.with_pod_data(PodData {
+                restarts,
+                node,
+                ..PodData::default()
+            })
+        }
+        Some(ResourceKind::Nodes) => {
+            let status = row.status.replace("SchedulingDisabled", "Unschedulable");
+            let unschedulable = status.contains("Unschedulable");
+            let version =
+                table_cell_text(columns, &row, "version").map_or_else(|| Arc::from("-"), Arc::from);
+            row.status = Arc::from(status);
+            row.with_node_data(NodeData {
+                unschedulable,
+                taints: Arc::from("<none>"),
+                version,
+                ..NodeData::default()
+            })
+        }
+        Some(ResourceKind::Deployments) => {
+            if let Some(selector) = table_selector(columns, &row) {
+                with_child_resource(row, replica_set_descriptor(), selector)
+            } else {
+                row
+            }
+        }
+        Some(ResourceKind::StatefulSets | ResourceKind::DaemonSets | ResourceKind::Services) => {
+            if let Some(selector) = table_selector(columns, &row) {
+                with_child_resource(row, ResourceKind::Pods.into(), selector)
+            } else {
+                row
+            }
+        }
+        None if kind.is_apps_v1_replica_set() => {
+            if let Some(selector) = table_selector(columns, &row) {
+                with_child_resource(row, ResourceKind::Pods.into(), selector)
+            } else {
+                row
+            }
+        }
+        _ => row,
+    }
+}
+
+fn table_cell_text<'a>(
+    columns: &[TableColumn],
+    row: &'a ResourceRow,
+    name: &str,
+) -> Option<&'a str> {
+    columns
+        .iter()
+        .position(|column| column.name.eq_ignore_ascii_case(name))
+        .and_then(|index| row.table_cells.get(index))
+        .map(|cell| cell.text.as_ref())
+}
+
+fn table_selector(columns: &[TableColumn], row: &ResourceRow) -> Option<String> {
+    table_cell_text(columns, row, "selector")
+        .filter(|selector| !selector.is_empty() && *selector != "<none>")
+        .map(str::to_owned)
+}
+
 fn spawn_enrichment_tasks(
     client: Client,
     request: &WatchRequest,
@@ -1991,6 +2120,150 @@ fn decoded_secret_value(bytes: &[u8]) -> String {
     value
 }
 
+#[derive(Default)]
+struct TypedWatchState {
+    rows: FxHashMap<Arc<str>, Arc<ResourceRow>>,
+    initializing: Option<FxHashMap<Arc<str>, Arc<ResourceRow>>>,
+    initial_load_complete: bool,
+    initial_progress: InitialListProgress,
+    revision: u64,
+    dirty: bool,
+    fast_initial_published: bool,
+    fast_initial_rows: Option<FxHashMap<Arc<str>, Arc<ResourceRow>>>,
+}
+
+impl TypedWatchState {
+    fn apply_fast_initial(
+        &mut self,
+        mut update: FastInitialList,
+        snapshots: &watch::Sender<ResourceSnapshot>,
+        request: &WatchRequest,
+    ) {
+        if self.initial_load_complete {
+            return;
+        }
+        hydrate_fast_initial_rows(&request.kind, &update.columns, &mut update.rows);
+        self.fast_initial_published = true;
+        self.revision = self.revision.wrapping_add(1);
+        let state = if update.complete {
+            SourceState::Ready
+        } else {
+            SourceState::Loading {
+                loaded: update.rows.len(),
+            }
+        };
+        publish(snapshots, request, &update.rows, state, self.revision);
+        self.fast_initial_rows = Some(update.rows);
+    }
+
+    fn apply_event<K, F>(
+        &mut self,
+        event: watcher::Event<K>,
+        map_row: F,
+        enrichment: &EnrichmentState,
+        snapshots: &watch::Sender<ResourceSnapshot>,
+        request: &WatchRequest,
+    ) where
+        F: Fn(&K) -> ResourceRow,
+    {
+        match event {
+            watcher::Event::Init => {
+                self.initializing = Some(FxHashMap::default());
+                self.initial_progress = InitialListProgress::default();
+            }
+            watcher::Event::InitApply(object) => {
+                let mut row = map_row(&object);
+                enrichment.apply(&mut row);
+                apply_initial_row(
+                    &mut self.initializing,
+                    Arc::new(row),
+                    self.initial_load_complete || self.fast_initial_published,
+                    &mut self.initial_progress,
+                    snapshots,
+                    request,
+                    &mut self.revision,
+                );
+            }
+            watcher::Event::InitDone => {
+                if let Some(initial) = self.initializing.take() {
+                    self.rows = initial;
+                }
+                self.initial_load_complete = true;
+                self.fast_initial_rows = None;
+                self.revision = self.revision.wrapping_add(1);
+                publish(
+                    snapshots,
+                    request,
+                    &self.rows,
+                    SourceState::Ready,
+                    self.revision,
+                );
+                self.dirty = false;
+            }
+            watcher::Event::Apply(object) => {
+                let mut row = map_row(&object);
+                enrichment.apply(&mut row);
+                let row = Arc::new(row);
+                self.rows.insert(Arc::clone(&row.key), row);
+                self.dirty = true;
+            }
+            watcher::Event::Delete(object) => {
+                let row = map_row(&object);
+                self.rows.remove(&row.key);
+                self.dirty = true;
+            }
+        }
+    }
+
+    fn apply_enrichment(&mut self, enrichment: &EnrichmentState) {
+        enrichment.apply_all(&mut self.rows);
+        if let Some(initializing) = &mut self.initializing {
+            enrichment.apply_all(initializing);
+        }
+        self.dirty = true;
+    }
+
+    fn publish_ready(
+        &mut self,
+        snapshots: &watch::Sender<ResourceSnapshot>,
+        request: &WatchRequest,
+    ) {
+        self.revision = self.revision.wrapping_add(1);
+        publish(
+            snapshots,
+            request,
+            &self.rows,
+            SourceState::Ready,
+            self.revision,
+        );
+        self.dirty = false;
+    }
+
+    fn publish_error(
+        &mut self,
+        snapshots: &watch::Sender<ResourceSnapshot>,
+        request: &WatchRequest,
+        error: Arc<str>,
+    ) {
+        self.revision = self.revision.wrapping_add(1);
+        let visible = if self.initial_load_complete {
+            &self.rows
+        } else {
+            self.fast_initial_rows
+                .as_ref()
+                .or(self.initializing.as_ref())
+                .unwrap_or(&self.rows)
+        };
+        publish(
+            snapshots,
+            request,
+            visible,
+            SourceState::Error(error),
+            self.revision,
+        );
+    }
+}
+
 async fn watch_api<K, F>(
     api: Api<K>,
     client: Client,
@@ -2002,21 +2275,32 @@ async fn watch_api<K, F>(
     K: Clone + Resource + DeserializeOwned + Debug + Send + 'static,
     F: Fn(&K) -> ResourceRow + Copy + Send + 'static,
 {
+    let (mut fast_initial_updates, _fast_initial_task) =
+        spawn_fast_initial_list(client.clone(), &request);
+    let mut state = TypedWatchState::default();
+    let mut fast_initial_finished = false;
+    if let Ok(update) =
+        tokio::time::timeout(FAST_INITIAL_LIST_HEAD_START, fast_initial_updates.recv()).await
+    {
+        match update {
+            Some(update) => state.apply_fast_initial(update, &snapshots, &request),
+            None => fast_initial_finished = true,
+        }
+    }
+
     let (enrichment_sender, mut enrichment_updates) = mpsc::channel(8);
-    let _enrichment_tasks =
-        spawn_enrichment_tasks(client, &request, &settings, enrichment_sender.clone());
+    let _enrichment_tasks = spawn_enrichment_tasks(
+        client.clone(),
+        &request,
+        &settings,
+        enrichment_sender.clone(),
+    );
     let _enrichment_sender = enrichment_sender;
     let mut enrichment = EnrichmentState::default();
     let watcher_config = resource_watcher_config(&settings, &request);
     let stream = watcher::watcher(api, watcher_config).default_backoff();
     tokio::pin!(stream);
 
-    let mut rows: FxHashMap<Arc<str>, Arc<ResourceRow>> = FxHashMap::default();
-    let mut initializing: Option<FxHashMap<Arc<str>, Arc<ResourceRow>>> = None;
-    let mut initial_load_complete = false;
-    let mut initial_progress = InitialListProgress::default();
-    let mut revision = 0_u64;
-    let mut dirty = false;
     let mut ticker = tokio::time::interval(settings.publish_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -2024,81 +2308,40 @@ async fn watch_api<K, F>(
         tokio::select! {
             event = stream.next() => {
                 match event {
-                    Some(Ok(watcher::Event::Init)) => {
-                        initializing = Some(FxHashMap::default());
-                        initial_progress = InitialListProgress::default();
-                    }
-                    Some(Ok(watcher::Event::InitApply(object))) => {
-                        let mut row = map_row(&object);
-                        enrichment.apply(&mut row);
-                        apply_initial_row(
-                            &mut initializing,
-                            Arc::new(row),
-                            initial_load_complete,
-                            &mut initial_progress,
-                            &snapshots,
-                            &request,
-                            &mut revision,
-                        );
-                    }
-                    Some(Ok(watcher::Event::InitDone)) => {
-                        if let Some(initial) = initializing.take() {
-                            rows = initial;
-                        }
-                        initial_load_complete = true;
-                        revision = revision.wrapping_add(1);
-                        publish(&snapshots, &request, &rows, SourceState::Ready, revision);
-                        dirty = false;
-                    }
-                    Some(Ok(watcher::Event::Apply(object))) => {
-                        let mut row = map_row(&object);
-                        enrichment.apply(&mut row);
-                        let row = Arc::new(row);
-                        rows.insert(Arc::clone(&row.key), row);
-                        dirty = true;
-                    }
-                    Some(Ok(watcher::Event::Delete(object))) => {
-                        let row = map_row(&object);
-                        rows.remove(&row.key);
-                        dirty = true;
-                    }
-                    Some(Err(error)) => {
-                        publish_watch_error(
-                            &snapshots,
-                            &request,
-                            &rows,
-                            initializing.as_ref(),
-                            initial_load_complete,
-                            Arc::from(error.to_string()),
-                            &mut revision,
-                        );
-                    }
+                    Some(Ok(event)) => state.apply_event(
+                        event,
+                        map_row,
+                        &enrichment,
+                        &snapshots,
+                        &request,
+                    ),
+                    Some(Err(error)) => state.publish_error(
+                        &snapshots,
+                        &request,
+                        Arc::from(error.to_string()),
+                    ),
                     None => {
-                        publish_watch_error(
+                        state.publish_error(
                             &snapshots,
                             &request,
-                            &rows,
-                            initializing.as_ref(),
-                            initial_load_complete,
                             Arc::from("Kubernetes watch ended"),
-                            &mut revision,
                         );
                         return;
                     }
                 }
             }
+            update = fast_initial_updates.recv(), if !fast_initial_finished => {
+                match update {
+                    Some(update) => state.apply_fast_initial(update, &snapshots, &request),
+                    None => fast_initial_finished = true,
+                }
+            }
             Some(update) = enrichment_updates.recv() => {
                 enrichment.update(update);
-                enrichment.apply_all(&mut rows);
-                if let Some(initializing) = &mut initializing {
-                    enrichment.apply_all(initializing);
-                }
-                dirty = true;
+                state.apply_enrichment(&enrichment);
             }
-            _ = ticker.tick(), if dirty && initializing.is_none() => {
-                revision = revision.wrapping_add(1);
-                publish(&snapshots, &request, &rows, SourceState::Ready, revision);
-                dirty = false;
+            _ = ticker.tick(), if state.dirty && state.initializing.is_none() => {
+                state.publish_ready(&snapshots, &request);
             }
         }
     }
@@ -2125,7 +2368,7 @@ fn resource_watcher_config(
 fn apply_initial_row(
     initializing: &mut Option<FxHashMap<Arc<str>, Arc<ResourceRow>>>,
     row: Arc<ResourceRow>,
-    initial_load_complete: bool,
+    suppress_progress: bool,
     progress: &mut InitialListProgress,
     snapshots: &watch::Sender<ResourceSnapshot>,
     request: &WatchRequest,
@@ -2133,7 +2376,7 @@ fn apply_initial_row(
 ) {
     let initial = initializing.get_or_insert_with(FxHashMap::default);
     initial.insert(Arc::clone(&row.key), row);
-    if initial_load_complete || !progress.should_publish(initial.len()) {
+    if suppress_progress || !progress.should_publish(initial.len()) {
         return;
     }
     *revision = revision.wrapping_add(1);
@@ -2144,30 +2387,6 @@ fn apply_initial_row(
         SourceState::Loading {
             loaded: initial.len(),
         },
-        *revision,
-    );
-}
-
-fn publish_watch_error(
-    snapshots: &watch::Sender<ResourceSnapshot>,
-    request: &WatchRequest,
-    rows: &FxHashMap<Arc<str>, Arc<ResourceRow>>,
-    initializing: Option<&FxHashMap<Arc<str>, Arc<ResourceRow>>>,
-    initial_load_complete: bool,
-    error: Arc<str>,
-    revision: &mut u64,
-) {
-    *revision = revision.wrapping_add(1);
-    let visible = if initial_load_complete {
-        rows
-    } else {
-        initializing.unwrap_or(rows)
-    };
-    publish(
-        snapshots,
-        request,
-        visible,
-        SourceState::Error(error),
         *revision,
     );
 }
@@ -4774,6 +4993,65 @@ mod tests {
     }
 
     #[test]
+    fn complete_fast_initial_list_is_ready_and_suppresses_typed_partial_rows() {
+        let kind: ResourceDescriptor = ResourceKind::Pods.into();
+        let request = WatchRequest {
+            generation: 8,
+            context: "demo".to_owned(),
+            kind: kind.clone(),
+            namespace: None,
+            field_selector: None,
+            label_selector: None,
+        };
+        let (snapshots, receiver) = watch::channel(ResourceSnapshot::loading(8, kind));
+        let mut state = TypedWatchState::default();
+        let rows = (0..3)
+            .map(|index| {
+                let row = Arc::new(ResourceRow::new(
+                    "prod",
+                    format!("pod-{index}"),
+                    "Running",
+                    "1/1",
+                    "",
+                    0,
+                ));
+                (Arc::clone(&row.key), row)
+            })
+            .collect();
+
+        state.apply_fast_initial(
+            FastInitialList {
+                columns: Arc::from([]),
+                rows,
+                complete: true,
+            },
+            &snapshots,
+            &request,
+        );
+        apply_initial_row(
+            &mut state.initializing,
+            Arc::new(ResourceRow::new(
+                "prod",
+                "typed-partial",
+                "Running",
+                "1/1",
+                "",
+                0,
+            )),
+            state.fast_initial_published,
+            &mut state.initial_progress,
+            &snapshots,
+            &request,
+            &mut state.revision,
+        );
+
+        let snapshot = receiver.borrow();
+        assert_eq!(snapshot.rows.len(), 3);
+        assert_eq!(snapshot.state, SourceState::Ready);
+        assert_eq!(snapshot.revision, 1);
+    }
+
+    #[test]
     fn decodes_server_printer_columns_cells_and_dates() {
         let page = decode_table_list(serde_json::json!({
             "apiVersion": "meta.k8s.io/v1",
@@ -4821,6 +5099,82 @@ mod tests {
         assert_eq!(page.rows[0].name.as_ref(), "example");
         assert_eq!(page.rows[0].table_cells[1].text.as_ref(), "us-west-1");
         assert_eq!(page.rows[0].table_cells[3].timestamp_unix, Some(3_600));
+    }
+
+    #[test]
+    fn hydrates_fast_pod_rows_for_the_regular_list_layout() {
+        let columns = vec![
+            TableColumn {
+                name: Arc::from("Name"),
+                format: Arc::from("name"),
+                priority: 0,
+            },
+            TableColumn {
+                name: Arc::from("Restarts"),
+                format: Arc::from(""),
+                priority: 0,
+            },
+            TableColumn {
+                name: Arc::from("Node"),
+                format: Arc::from(""),
+                priority: 1,
+            },
+        ];
+        let mut row = ResourceRow::new("prod", "api-0", "Running", "1/1", "", 0);
+        row.table_cells = Arc::from([
+            TableCell {
+                text: Arc::from("api-0"),
+                timestamp_unix: None,
+            },
+            TableCell {
+                text: Arc::from("3 (2m ago)"),
+                timestamp_unix: None,
+            },
+            TableCell {
+                text: Arc::from("worker-1"),
+                timestamp_unix: None,
+            },
+        ]);
+
+        let row = hydrate_fast_initial_row(&ResourceKind::Pods.into(), &columns, row);
+
+        let pod = row.pod_data().expect("fast row has Pod data");
+        assert_eq!(pod.restarts, 3);
+        assert_eq!(pod.node.as_ref(), "worker-1");
+    }
+
+    #[test]
+    fn hydrates_fast_node_status_and_version_like_the_typed_row() {
+        let columns = vec![
+            TableColumn {
+                name: Arc::from("Name"),
+                format: Arc::from("name"),
+                priority: 0,
+            },
+            TableColumn {
+                name: Arc::from("Version"),
+                format: Arc::from(""),
+                priority: 0,
+            },
+        ];
+        let mut row = ResourceRow::new("", "worker-1", "NotReady,SchedulingDisabled", "", "", 0);
+        row.table_cells = Arc::from([
+            TableCell {
+                text: Arc::from("worker-1"),
+                timestamp_unix: None,
+            },
+            TableCell {
+                text: Arc::from("v1.34.8"),
+                timestamp_unix: None,
+            },
+        ]);
+
+        let row = hydrate_fast_initial_row(&ResourceKind::Nodes.into(), &columns, row);
+
+        assert_eq!(row.status.as_ref(), "NotReady,Unschedulable");
+        let node = row.node_data().expect("fast row has Node data");
+        assert!(node.unschedulable);
+        assert_eq!(node.version.as_ref(), "v1.34.8");
     }
 
     #[test]
@@ -4964,6 +5318,65 @@ mod tests {
         );
         assert!(progress.first().is_some_and(|(loaded, _, _)| *loaded > 0));
         assert!(progress.last().is_some_and(|(_, complete, _)| *complete));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires KUX_LIVE_CONTEXT and access to a Kubernetes cluster"]
+    async fn live_all_namespace_pod_watch_reports_first_rows_and_ready_time() {
+        let context = std::env::var("KUX_LIVE_CONTEXT").expect("KUX_LIVE_CONTEXT");
+        let client = client_for_context(&context)
+            .await
+            .expect("Kubernetes client");
+        let request = WatchRequest {
+            generation: 1,
+            context: context.clone(),
+            kind: ResourceKind::Pods.into(),
+            namespace: None,
+            field_selector: None,
+            label_selector: None,
+        };
+        let (snapshots, mut receiver) = watch::channel(ResourceSnapshot::loading(
+            request.generation,
+            request.kind.clone(),
+        ));
+        let started = Instant::now();
+        let task = tokio::spawn(run_watch(
+            client,
+            KubernetesSettings {
+                initial_context: context,
+                publish_interval: Duration::from_millis(100),
+                streaming_lists: true,
+            },
+            request,
+            snapshots,
+        ));
+        let mut first_rows = None;
+        let mut largest_loading = None;
+        let (ready, rows) = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                receiver.changed().await.expect("Pod watch remains active");
+                let snapshot = receiver.borrow_and_update().clone();
+                if first_rows.is_none() && !snapshot.rows.is_empty() {
+                    first_rows = Some(started.elapsed());
+                }
+                if matches!(snapshot.state, SourceState::Loading { .. })
+                    && largest_loading
+                        .as_ref()
+                        .is_none_or(|(rows, _)| snapshot.rows.len() > *rows)
+                {
+                    largest_loading = Some((snapshot.rows.len(), started.elapsed()));
+                }
+                if snapshot.state == SourceState::Ready {
+                    break (started.elapsed(), snapshot.rows.len());
+                }
+            }
+        })
+        .await
+        .expect("Pod watch becomes ready within 30 seconds");
+        task.abort();
+        eprintln!(
+            "first_rows={first_rows:?}, largest_loading={largest_loading:?}, ready={ready:?}, rows={rows}"
+        );
     }
 
     #[tokio::test]
