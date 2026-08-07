@@ -25,6 +25,12 @@ pub struct WatchRequest {
     pub label_selector: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionRequest {
+    pub generation: u64,
+    pub intent: ActionIntent,
+}
+
 #[derive(Debug, Clone)]
 pub struct KubernetesSettings {
     pub initial_context: String,
@@ -34,6 +40,10 @@ pub struct KubernetesSettings {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionResult {
+    Scoped {
+        generation: u64,
+        result: Box<ActionResult>,
+    },
     Notice(String),
     Content {
         title: String,
@@ -75,7 +85,7 @@ pub fn spawn_kubernetes(
     settings: KubernetesSettings,
     requests: mpsc::Receiver<WatchRequest>,
     snapshots: watch::Sender<ResourceSnapshot>,
-    actions: mpsc::Receiver<ActionIntent>,
+    actions: mpsc::Receiver<ActionRequest>,
     action_results: mpsc::Sender<ActionResult>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(kubernetes::run_manager(
@@ -93,7 +103,7 @@ pub fn spawn_demo(
     item_count: usize,
     requests: mpsc::Receiver<WatchRequest>,
     snapshots: watch::Sender<ResourceSnapshot>,
-    actions: mpsc::Receiver<ActionIntent>,
+    actions: mpsc::Receiver<ActionRequest>,
     action_results: mpsc::Sender<ActionResult>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(demo::run_manager(

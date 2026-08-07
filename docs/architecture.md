@@ -77,9 +77,12 @@ policy resolution, resource/context deletion, and kill use a separate bounded ch
 subprocess work runs in the source manager rather than the render loop. Content replaces the table
 inside the existing header/body layout and is retained only while that view is open. YAML fetches
 produce a compact object plus an optional managed-fields variant, allowing an instant local toggle
-without another API request. Describe invokes `kubectl describe` with explicit context, resource,
-and namespace arguments. Server version and namespace metadata refresh when contexts change. A
-normal resource delete uses background propagation after a Tab + Enter confirmation. The same
+without another API request; serialization runs on the blocking pool. Read actions carry the view
+generation and are cancelled when resource navigation changes, so a late YAML, log, container, or
+policy result cannot replace a newer resource view. Describe invokes `kubectl describe` with explicit
+context, resource, and namespace arguments. Server version and namespace metadata refresh when
+contexts change. A normal resource delete uses background propagation after a Tab + Enter
+confirmation. The same
 confirmation deletes only inactive, persisted contexts by running `kubectl config delete-context`
 with explicit arguments and reloading kubeconfig metadata after success. Kill uses a zero-second
 grace period without a confirmation, matching the intentionally sharp K9s binding. `--read-only`

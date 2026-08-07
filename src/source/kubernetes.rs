@@ -46,14 +46,16 @@ use crate::{
     },
 };
 
-use super::{ActionResult, KubernetesSettings, WatchRequest, discovery::discover_resources};
+use super::{
+    ActionRequest, ActionResult, KubernetesSettings, WatchRequest, discovery::discover_resources,
+};
 
 pub async fn run_manager(
     client: Client,
     settings: KubernetesSettings,
     mut requests: mpsc::Receiver<WatchRequest>,
     snapshots: watch::Sender<ResourceSnapshot>,
-    mut actions: mpsc::Receiver<ActionIntent>,
+    mut actions: mpsc::Receiver<ActionRequest>,
     action_results: mpsc::Sender<ActionResult>,
 ) {
     let mut client = client;
@@ -64,9 +66,13 @@ pub async fn run_manager(
         action_results.clone(),
     );
     let mut running: Option<tokio::task::JoinHandle<()>> = None;
+    let mut running_read_action: Option<tokio::task::JoinHandle<()>> = None;
     loop {
         tokio::select! {
             Some(request) = requests.recv() => {
+                if let Some(task) = running_read_action.take() {
+                    task.abort();
+                }
                 if request.context != active_context {
                     match client_for_context(&request.context).await {
                         Ok(next_client) => {
@@ -95,13 +101,19 @@ pub async fn run_manager(
                 }));
             }
             Some(action) = actions.recv() => {
-                let client = client.clone();
-                let context = active_context.clone();
-                let action_results = action_results.clone();
-                tokio::spawn(async move {
-                    let result = handle_action(client, &context, action).await;
-                    let _ = action_results.send(result).await;
-                });
+                let cancelable = action.intent.cancelable_read();
+                let task = spawn_action_task(
+                    client.clone(),
+                    active_context.clone(),
+                    action,
+                    action_results.clone(),
+                    cancelable,
+                );
+                if cancelable
+                    && let Some(previous) = running_read_action.replace(task)
+                {
+                    previous.abort();
+                }
             }
             else => break,
         }
@@ -109,6 +121,30 @@ pub async fn run_manager(
     if let Some(task) = running {
         task.abort();
     }
+    if let Some(task) = running_read_action {
+        task.abort();
+    }
+}
+
+fn spawn_action_task(
+    client: Client,
+    context: String,
+    action: ActionRequest,
+    action_results: mpsc::Sender<ActionResult>,
+    scoped: bool,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let result = handle_action(client, &context, action.intent).await;
+        let result = if scoped {
+            ActionResult::Scoped {
+                generation: action.generation,
+                result: Box::new(result),
+            }
+        } else {
+            result
+        };
+        let _ = action_results.send(result).await;
+    })
 }
 
 fn refresh_cluster_metadata(
@@ -1849,7 +1885,10 @@ async fn yaml_from(
         .get(&target.name)
         .await
         .map_err(|error| error.to_string())?;
-    yaml_content_from_object(object, target)
+    let target = target.clone();
+    tokio::task::spawn_blocking(move || yaml_content_from_object(object, &target))
+        .await
+        .map_err(|error| format!("Unable to format YAML: {error}"))?
 }
 
 fn yaml_content_from_object(
@@ -4660,6 +4699,35 @@ mod tests {
     }
 
     #[test]
+    fn only_obsolete_read_actions_are_safe_to_cancel() {
+        let target = ResourceTarget {
+            kind: ResourceKind::Pods.into(),
+            namespace: Some("prod".to_owned()),
+            name: "api-0".to_owned(),
+        };
+        assert!(
+            ActionIntent::Content {
+                target: target.clone(),
+                content: ContentKind::Yaml,
+            }
+            .cancelable_read()
+        );
+        assert!(
+            ActionIntent::Containers {
+                target: target.clone(),
+            }
+            .cancelable_read()
+        );
+        assert!(
+            !ActionIntent::Delete {
+                targets: vec![target],
+                immediate: false,
+            }
+            .cancelable_read()
+        );
+    }
+
+    #[test]
     fn typed_initial_list_publishes_rows_before_init_done() {
         let kind: ResourceDescriptor = ResourceKind::Pods.into();
         let request = WatchRequest {
@@ -4896,5 +4964,43 @@ mod tests {
         );
         assert!(progress.first().is_some_and(|(loaded, _, _)| *loaded > 0));
         assert!(progress.last().is_some_and(|(_, complete, _)| *complete));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires KUX_LIVE_CONTEXT and access to a Kubernetes cluster"]
+    async fn live_dynamic_yaml_fetch_completes_without_blocking_the_async_worker() {
+        let context = std::env::var("KUX_LIVE_CONTEXT").expect("KUX_LIVE_CONTEXT");
+        let qualified_name = std::env::var("KUX_LIVE_RESOURCE")
+            .unwrap_or_else(|_| "applications.argoproj.io".to_owned());
+        let namespace = std::env::var("KUX_LIVE_NAMESPACE").unwrap_or_else(|_| "argo".to_owned());
+        let name = std::env::var("KUX_LIVE_NAME")
+            .unwrap_or_else(|_| "cloud-controlplane-resources".to_owned());
+        let client = client_for_context(&context)
+            .await
+            .expect("Kubernetes client");
+        let resources = discover_resources(client.clone())
+            .await
+            .expect("API discovery");
+        let kind = resources
+            .iter()
+            .find(|resource| resource.qualified_name() == qualified_name)
+            .cloned()
+            .unwrap_or_else(|| panic!("missing {qualified_name}"));
+        let target = ResourceTarget {
+            kind,
+            namespace: Some(namespace),
+            name,
+        };
+        let started = Instant::now();
+        let result = fetch_content(client, &context, &target, ContentKind::Yaml)
+            .await
+            .expect("YAML content");
+        let elapsed = started.elapsed();
+        let ActionResult::Content { body, .. } = result else {
+            panic!("expected YAML content");
+        };
+        eprintln!("fetched {} YAML bytes in {elapsed:?}", body.len());
+        assert!(body.contains("kind: Application"));
+        assert!(elapsed < Duration::from_secs(30), "YAML took {elapsed:?}");
     }
 }

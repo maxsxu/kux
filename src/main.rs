@@ -11,7 +11,7 @@ use kux::{
     kubeconfig::{ContextCatalog, ContextInfo, fallback_contexts},
     model::ResourceSnapshot,
     port_forward::PortForwardManager,
-    source::{self, ActionResult, KubernetesSettings, WatchRequest},
+    source::{self, ActionRequest, ActionResult, KubernetesSettings, WatchRequest},
     terminal::TerminalGuard,
     ui,
 };
@@ -131,7 +131,7 @@ async fn run(
     mut app: App,
     requests: mpsc::Sender<WatchRequest>,
     mut snapshots: watch::Receiver<ResourceSnapshot>,
-    actions: mpsc::Sender<kux::app::ActionIntent>,
+    actions: mpsc::Sender<ActionRequest>,
     mut action_results: mpsc::Receiver<ActionResult>,
     frame_interval: Duration,
 ) -> Result<()> {
@@ -212,7 +212,7 @@ async fn handle_app_command(
     app: &mut App,
     terminal: &mut TerminalGuard,
     requests: &mpsc::Sender<WatchRequest>,
-    actions: &mpsc::Sender<kux::app::ActionIntent>,
+    actions: &mpsc::Sender<ActionRequest>,
     port_forwards: &mut PortForwardManager,
 ) -> Result<bool> {
     match command {
@@ -277,7 +277,10 @@ async fn handle_app_command(
         }
         AppCommand::Action(action) => {
             actions
-                .send(action)
+                .send(ActionRequest {
+                    generation: app.generation,
+                    intent: action,
+                })
                 .await
                 .context("action worker stopped")?;
             app.show_notice("Working…");
@@ -294,6 +297,11 @@ fn refresh_visible_port_forwards(app: &mut App, manager: &PortForwardManager) {
 
 fn apply_action_result(app: &mut App, result: ActionResult) {
     match result {
+        ActionResult::Scoped { generation, result } => {
+            if app.generation == generation {
+                apply_action_result(app, *result);
+            }
+        }
         ActionResult::Notice(notice) | ActionResult::Error(notice) => app.show_notice(notice),
         ActionResult::Content {
             title,
@@ -448,11 +456,12 @@ fn report_shell_result(
 #[cfg(test)]
 mod tests {
     use kux::{
-        app::{PodShellTarget, ResourceTarget},
-        model::{ResourceDescriptor, ResourceOperations},
+        app::{App, ContentKind, Overlay, PodShellTarget, ResourceTarget},
+        model::{ResourceDescriptor, ResourceKind, ResourceOperations},
+        source::ActionResult,
     };
 
-    use super::{edit_args, pod_shell_args, pod_shell_banner};
+    use super::{apply_action_result, edit_args, pod_shell_args, pod_shell_banner};
 
     fn target(group: &str, kind: &str, plural: &str, namespace: Option<&str>) -> ResourceTarget {
         ResourceTarget {
@@ -472,6 +481,39 @@ mod tests {
             namespace: namespace.map(str::to_owned),
             name: "selected".to_owned(),
         }
+    }
+
+    fn yaml_result(generation: u64) -> ActionResult {
+        ActionResult::Scoped {
+            generation,
+            result: Box::new(ActionResult::Content {
+                title: "YAML(argo/example)".to_owned(),
+                body: "kind: Application".to_owned(),
+                managed_fields: None,
+                decoded_body: None,
+                decoded_managed_fields: None,
+                content: ContentKind::Yaml,
+            }),
+        }
+    }
+
+    #[test]
+    fn stale_content_results_cannot_open_after_the_view_generation_changes() {
+        let mut app = App::new(
+            "production",
+            None,
+            ResourceKind::Pods,
+            false,
+            vec!["production".to_owned()],
+        );
+        app.generation = 2;
+
+        apply_action_result(&mut app, yaml_result(1));
+        assert_eq!(app.overlay, Overlay::None);
+
+        apply_action_result(&mut app, yaml_result(2));
+        assert_eq!(app.overlay, Overlay::Content);
+        assert_eq!(app.content_body, "kind: Application");
     }
 
     #[test]

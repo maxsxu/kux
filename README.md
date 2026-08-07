@@ -131,7 +131,8 @@ flowchart LR
   list, followed by 5,000-row batches, while later relists remain atomic.
 - **Compact CRD tables.** Dynamic lists request metadata-only Table rows in bounded 5,000-row pages
   instead of downloading full CRD objects up front.
-- **Generation safety.** Results from cancelled views cannot overwrite the active dataset.
+- **Generation safety.** List snapshots and read-action results from cancelled views cannot
+  overwrite the active dataset; obsolete YAML/log requests are aborted when navigation changes.
 - **Viewport rendering.** Widgets are created only for rows visible in the terminal.
 - **Independent enrichment.** Metrics, node pod counts, YAML, logs, and actions do not block input.
 - **Graceful API coverage.** Watchable resources stream; list-only APIs use bounded pagination.

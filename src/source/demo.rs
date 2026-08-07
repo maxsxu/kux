@@ -11,13 +11,13 @@ use crate::{
     },
 };
 
-use super::{ActionResult, WatchRequest};
+use super::{ActionRequest, ActionResult, WatchRequest};
 
 pub async fn run_manager(
     item_count: usize,
     mut requests: mpsc::Receiver<WatchRequest>,
     snapshots: watch::Sender<ResourceSnapshot>,
-    mut actions: mpsc::Receiver<ActionIntent>,
+    mut actions: mpsc::Receiver<ActionRequest>,
     action_results: mpsc::Sender<ActionResult>,
 ) {
     let _ = action_results
@@ -61,7 +61,16 @@ pub async fn run_manager(
                 }));
             }
             Some(action) = actions.recv() => {
-                let result = demo_action(action);
+                let scoped = action.intent.cancelable_read();
+                let result = demo_action(action.intent);
+                let result = if scoped {
+                    ActionResult::Scoped {
+                        generation: action.generation,
+                        result: Box::new(result),
+                    }
+                } else {
+                    result
+                };
                 let _ = action_results.send(result).await;
             }
             else => break,

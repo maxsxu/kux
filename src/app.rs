@@ -325,6 +325,19 @@ pub enum ActionIntent {
     },
 }
 
+impl ActionIntent {
+    #[must_use]
+    pub(crate) const fn cancelable_read(&self) -> bool {
+        matches!(
+            self,
+            Self::Content { .. }
+                | Self::Containers { .. }
+                | Self::ContainerLogs { .. }
+                | Self::AuthorizationPolicy { .. }
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeDrainOptions {
     pub grace_period_seconds: Option<u32>,
