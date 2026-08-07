@@ -124,6 +124,10 @@ async fn kubernetes_client(context: Option<&str>) -> Result<(Client, String)> {
     };
     let namespace = config.default_namespace.clone();
     let client = Client::try_from(config).context("create Kubernetes client")?;
+    client
+        .apiserver_version()
+        .await
+        .context("authenticate Kubernetes client")?;
     Ok((client, namespace))
 }
 

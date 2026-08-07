@@ -10,7 +10,7 @@ by the active resource dataset rather than by queued events.
 
 ```text
 Kubernetes API
-    │ discover + list/watch (one active GVR)
+    │ discover + list/watch (active GVR + warm all-namespace Pods)
     ▼
 watch task ── recovery + atomic relist
     │ compact to ResourceRow
@@ -25,8 +25,11 @@ Ratatui diff renderer
 ```
 
 The terminal task never performs network I/O. Switching context, namespace, or resource type
-aborts the old watcher and starts a new generation. Context changes create a new `kube::Client`;
-subsequent watches and actions share that client. Background discovery builds descriptors for all
+aborts the old active-view watcher and starts a new generation. A separate all-namespace Pod watch
+stays live so opening the common `pods(all)` view can reuse its current snapshot immediately.
+Context changes replace both watches and create a new `kube::Client`; Kux authenticates that client
+before making it visible to a resource view, and subsequent watches and actions share it. Background
+discovery builds descriptors for all
 listable core, CRD, and aggregated resources. Runtime views carry the exact group, version,
 plural, scope, and supported operations rather than guessing from a Kind name. Every snapshot
 carries its generation, so even a result already in flight cannot overwrite the current view.
@@ -40,8 +43,8 @@ The watcher handles `Init`, `InitApply`, and `InitDone` explicitly. A relist goe
 map and replaces the live cache only at `InitDone`. Normal apply/delete events update the active
 map. Publication is rate-limited, and the `tokio::watch` channel retains only its newest value.
 
-Before starting a built-in view's typed watch and enrichment traffic, Kux gives a compact Kubernetes
-Table request a bounded head start. The first 250 metadata-only rows are projected into the normal
+Before starting a built-in view's typed watch and enrichment traffic, Kux gives a gzip-compressed
+Kubernetes Table request a bounded head start. The first 250 compact rows are projected into the normal
 built-in layout and published immediately; larger results continue in 5,000-row pages. The typed
 watch then catches up in the background and atomically replaces the bootstrap rows at `InitDone`, so
 full status, selectors, resource requests, ports, and owner data remain available without delaying
@@ -55,6 +58,12 @@ transfers of large CRD specs and statuses just to render a list; full objects ar
 on-demand actions such as YAML. Relists remain atomic. Resources that advertise list but not watch
 use the same compact Table pages and initial progress snapshots with a five-second minimum polling
 interval.
+
+The all-namespace Pod cache starts when the source manager starts, uses the same progressive Table
+bootstrap and typed watch, and remains current while another resource kind is active. Selecting
+`pods(all)` retargets the cached snapshot to the new view generation synchronously, then continues
+forwarding its live updates. The cache is memory-only, is replaced on context changes, and is
+discarded when Kux exits.
 
 Pod and node views run a separate five-second Metrics API task. Metric results contain only compact
 CPU and memory numbers and are merged into display rows before publication. Node pod counts come
@@ -72,8 +81,9 @@ state dirty.
 
 Each Kubernetes object is converted to an `Arc<ResourceRow>` and then dropped. Strings inside a
 row use `Arc<str>`, and publishing a snapshot clones only one row pointer per object while an older
-snapshot is still being rendered. The source cache, current immutable snapshot, and filtered
-integer indices are the principal live allocations.
+snapshot is still being rendered. The active source cache, warm all-namespace Pod cache, current
+immutable snapshot, and filtered integer indices are the principal live allocations. Kux does not
+persist resource snapshots to disk.
 
 ## On-demand actions
 

@@ -50,6 +50,61 @@ use super::{
     ActionRequest, ActionResult, KubernetesSettings, WatchRequest, discovery::discover_resources,
 };
 
+struct PodWatchCache {
+    context: String,
+    receiver: watch::Receiver<ResourceSnapshot>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl PodWatchCache {
+    fn spawn(client: Client, settings: KubernetesSettings, context: String) -> Self {
+        let request = WatchRequest {
+            generation: 0,
+            context: context.clone(),
+            kind: ResourceKind::Pods.into(),
+            namespace: None,
+            field_selector: None,
+            label_selector: None,
+        };
+        let (sender, receiver) = watch::channel(ResourceSnapshot::loading(
+            request.generation,
+            request.kind.clone(),
+        ));
+        let task = tokio::spawn(run_watch(client, settings, request, sender));
+        Self {
+            context,
+            receiver,
+            task,
+        }
+    }
+
+    fn matches(&self, request: &WatchRequest) -> bool {
+        is_all_namespace_pod_request(request, &self.context)
+    }
+
+    fn publish_current(&self, request: &WatchRequest, snapshots: &watch::Sender<ResourceSnapshot>) {
+        let mut snapshot = self.receiver.borrow().clone();
+        snapshot.generation = request.generation;
+        snapshot.kind.clone_from(&request.kind);
+        snapshot.emitted_at = Instant::now();
+        let _ = snapshots.send(snapshot);
+    }
+}
+
+fn is_all_namespace_pod_request(request: &WatchRequest, context: &str) -> bool {
+    request.context == context
+        && request.kind.known_kind() == Some(ResourceKind::Pods)
+        && request.namespace.is_none()
+        && request.field_selector.is_none()
+        && request.label_selector.is_none()
+}
+
+impl Drop for PodWatchCache {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 pub async fn run_manager(
     client: Client,
     settings: KubernetesSettings,
@@ -65,6 +120,9 @@ pub async fn run_manager(
         active_context.clone(),
         action_results.clone(),
     );
+    let mut pod_cache =
+        PodWatchCache::spawn(client.clone(), settings.clone(), active_context.clone());
+    let mut active_request: Option<WatchRequest> = None;
     let mut running: Option<tokio::task::JoinHandle<()>> = None;
     let mut running_read_action: Option<tokio::task::JoinHandle<()>> = None;
     loop {
@@ -78,6 +136,11 @@ pub async fn run_manager(
                         Ok(next_client) => {
                             client = next_client;
                             active_context.clone_from(&request.context);
+                            pod_cache = PodWatchCache::spawn(
+                                client.clone(),
+                                settings.clone(),
+                                active_context.clone(),
+                            );
                             refresh_cluster_metadata(
                                 client.clone(),
                                 active_context.clone(),
@@ -93,12 +156,31 @@ pub async fn run_manager(
                 if let Some(task) = running.take() {
                     task.abort();
                 }
-                let client = client.clone();
-                let settings = settings.clone();
-                let snapshots = snapshots.clone();
-                running = Some(tokio::spawn(async move {
-                    run_watch(client, settings, request, snapshots).await;
-                }));
+                active_request = Some(request.clone());
+                if pod_cache.matches(&request) {
+                    pod_cache.publish_current(&request, &snapshots);
+                } else {
+                    let client = client.clone();
+                    let settings = settings.clone();
+                    let snapshots = snapshots.clone();
+                    running = Some(tokio::spawn(async move {
+                        run_watch(client, settings, request, snapshots).await;
+                    }));
+                }
+            }
+            changed = pod_cache.receiver.changed() => {
+                if changed.is_err() {
+                    pod_cache = PodWatchCache::spawn(
+                        client.clone(),
+                        settings.clone(),
+                        active_context.clone(),
+                    );
+                } else if let Some(request) = active_request
+                    .as_ref()
+                    .filter(|request| pod_cache.matches(request))
+                {
+                    pod_cache.publish_current(request, &snapshots);
+                }
             }
             Some(action) = actions.recv() => {
                 let cancelable = action.intent.cancelable_read();
@@ -115,6 +197,7 @@ pub async fn run_manager(
                     previous.abort();
                 }
             }
+            () = snapshots.closed() => break,
             else => break,
         }
     }
@@ -208,8 +291,13 @@ async fn client_for_context(context: &str) -> Result<Client, String> {
     })
     .await
     .map_err(|error| format!("Unable to load context {context:?}: {error}"))?;
-    Client::try_from(config)
-        .map_err(|error| format!("Unable to create client for context {context:?}: {error}"))
+    let client = Client::try_from(config)
+        .map_err(|error| format!("Unable to create client for context {context:?}: {error}"))?;
+    client
+        .apiserver_version()
+        .await
+        .map_err(|error| format!("Unable to authenticate context {context:?}: {error}"))?;
+    Ok(client)
 }
 
 async fn run_watch(
@@ -1081,13 +1169,20 @@ fn spawn_fast_initial_list(
     let api = dynamic_api(client.clone(), &request.kind, request.namespace.as_deref());
     let field_selector = request.field_selector.clone();
     let label_selector = request.label_selector.clone();
+    let include_object =
+        if request.namespace.is_none() && request.kind.known_kind() == Some(ResourceKind::Pods) {
+            TABLE_FAST_INCLUDE_OBJECT
+        } else {
+            TABLE_INCLUDE_OBJECT
+        };
     let task = tokio::spawn(async move {
         let mut sent_first = false;
-        let _ = list_table_pages_with_progress(
+        let _ = list_table_pages_with_include(
             &api,
             &client,
             field_selector.as_deref(),
             label_selector.as_deref(),
+            include_object,
             |columns, rows, complete| {
                 if sent_first && !complete {
                     return;
@@ -1124,6 +1219,12 @@ fn hydrate_fast_initial_row(
     columns: &[TableColumn],
     mut row: ResourceRow,
 ) -> ResourceRow {
+    if row.created_unix == 0
+        && let Some(age_seconds) = table_cell_text(columns, &row, "age").and_then(parse_table_age)
+    {
+        row.created_unix =
+            crate::model::unix_now().saturating_sub(i64::try_from(age_seconds).unwrap_or(i64::MAX));
+    }
     match kind.known_kind() {
         Some(ResourceKind::Pods) => {
             let restarts = table_cell_text(columns, &row, "restarts")
@@ -1174,6 +1275,21 @@ fn hydrate_fast_initial_row(
         }
         _ => row,
     }
+}
+
+fn parse_table_age(value: &str) -> Option<u64> {
+    let split = value.find(|character: char| !character.is_ascii_digit())?;
+    let amount = value[..split].parse::<u64>().ok()?;
+    let unit = value[split..].chars().next()?;
+    let multiplier = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 60 * 60,
+        'd' => 24 * 60 * 60,
+        'y' => 365 * 24 * 60 * 60,
+        _ => return None,
+    };
+    amount.checked_mul(multiplier)
 }
 
 fn table_cell_text<'a>(
@@ -2423,6 +2539,7 @@ const TABLE_ACCEPT: &str = "application/json;as=Table;v=v1;g=meta.k8s.io,\
 const TABLE_INITIAL_PAGE_SIZE: u32 = 250;
 const TABLE_MAX_PAGE_SIZE: u32 = 5_000;
 const TABLE_INCLUDE_OBJECT: &str = "Metadata";
+const TABLE_FAST_INCLUDE_OBJECT: &str = "None";
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2745,6 +2862,28 @@ async fn list_table_pages_with_progress<F>(
     client: &Client,
     field_selector: Option<&str>,
     label_selector: Option<&str>,
+    on_page: F,
+) -> Result<TableListing, String>
+where
+    F: FnMut(&Arc<[TableColumn]>, &FxHashMap<Arc<str>, Arc<ResourceRow>>, bool),
+{
+    list_table_pages_with_include(
+        api,
+        client,
+        field_selector,
+        label_selector,
+        TABLE_INCLUDE_OBJECT,
+        on_page,
+    )
+    .await
+}
+
+async fn list_table_pages_with_include<F>(
+    api: &Api<DynamicObject>,
+    client: &Client,
+    field_selector: Option<&str>,
+    label_selector: Option<&str>,
+    include_object: &str,
     mut on_page: F,
 ) -> Result<TableListing, String>
 where
@@ -2769,7 +2908,7 @@ where
         let raw = Request::new(api.resource_url())
             .list(&params)
             .map_err(|error| format!("Unable to build Kubernetes Table request: {error}"))?;
-        let raw = table_request(raw)?;
+        let raw = table_request_with_include(raw, include_object)?;
         let value = client
             .request::<serde_json::Value>(raw)
             .await
@@ -2806,7 +2945,14 @@ fn next_table_page_size(current: u32) -> u32 {
     }
 }
 
-fn table_request(mut request: HttpRequest<Vec<u8>>) -> Result<HttpRequest<Vec<u8>>, String> {
+fn table_request(request: HttpRequest<Vec<u8>>) -> Result<HttpRequest<Vec<u8>>, String> {
+    table_request_with_include(request, TABLE_INCLUDE_OBJECT)
+}
+
+fn table_request_with_include(
+    mut request: HttpRequest<Vec<u8>>,
+    include_object: &str,
+) -> Result<HttpRequest<Vec<u8>>, String> {
     request
         .headers_mut()
         .insert(ACCEPT, HeaderValue::from_static(TABLE_ACCEPT));
@@ -2819,12 +2965,9 @@ fn table_request(mut request: HttpRequest<Vec<u8>>) -> Result<HttpRequest<Vec<u8
     } else {
         "?"
     };
-    let uri = format!(
-        "{}{separator}includeObject={TABLE_INCLUDE_OBJECT}",
-        request.uri()
-    )
-    .parse()
-    .map_err(|error| format!("Unable to add Kubernetes Table options: {error}"))?;
+    let uri = format!("{}{separator}includeObject={include_object}", request.uri())
+        .parse()
+        .map_err(|error| format!("Unable to add Kubernetes Table options: {error}"))?;
     *request.uri_mut() = uri;
     Ok(request)
 }
@@ -5052,6 +5195,28 @@ mod tests {
     }
 
     #[test]
+    fn pod_cache_matches_only_unfiltered_all_namespace_pod_views() {
+        let request = WatchRequest {
+            generation: 1,
+            context: "test".to_owned(),
+            kind: ResourceKind::Pods.into(),
+            namespace: None,
+            field_selector: None,
+            label_selector: None,
+        };
+        assert!(is_all_namespace_pod_request(&request, "test"));
+
+        let mut scoped = request.clone();
+        scoped.namespace = Some("default".to_owned());
+        assert!(!is_all_namespace_pod_request(&scoped, "test"));
+
+        let mut filtered = request.clone();
+        filtered.label_selector = Some("app=api".to_owned());
+        assert!(!is_all_namespace_pod_request(&filtered, "test"));
+        assert!(!is_all_namespace_pod_request(&request, "production"));
+    }
+
+    #[test]
     fn decodes_server_printer_columns_cells_and_dates() {
         let page = decode_table_list(serde_json::json!({
             "apiVersion": "meta.k8s.io/v1",
@@ -5141,6 +5306,16 @@ mod tests {
         let pod = row.pod_data().expect("fast row has Pod data");
         assert_eq!(pod.restarts, 3);
         assert_eq!(pod.node.as_ref(), "worker-1");
+    }
+
+    #[test]
+    fn parses_server_table_age_units_for_metadata_free_rows() {
+        assert_eq!(parse_table_age("42s"), Some(42));
+        assert_eq!(parse_table_age("7m"), Some(420));
+        assert_eq!(parse_table_age("3h"), Some(10_800));
+        assert_eq!(parse_table_age("2d"), Some(172_800));
+        assert_eq!(parse_table_age("1y"), Some(31_536_000));
+        assert_eq!(parse_table_age("<unknown>"), None);
     }
 
     #[test]
@@ -5322,6 +5497,29 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires KUX_LIVE_CONTEXT and access to a Kubernetes cluster"]
+    async fn live_unpaged_compact_table_list_reports_elapsed_time() {
+        let context = std::env::var("KUX_LIVE_CONTEXT").expect("KUX_LIVE_CONTEXT");
+        let client = client_for_context(&context)
+            .await
+            .expect("Kubernetes client");
+        let api = dynamic_api(client.clone(), &ResourceKind::Pods.into(), None);
+        let raw = Request::new(api.resource_url())
+            .list(&ListParams::default())
+            .expect("Table list request");
+        let raw =
+            table_request_with_include(raw, TABLE_FAST_INCLUDE_OBJECT).expect("Table request");
+        let started = Instant::now();
+        let value = client
+            .request::<serde_json::Value>(raw)
+            .await
+            .expect("Table response");
+        let elapsed = started.elapsed();
+        let page = decode_table_list(value).expect("decoded Table response");
+        eprintln!("compact table rows={} elapsed={elapsed:?}", page.rows.len());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires KUX_LIVE_CONTEXT and access to a Kubernetes cluster"]
     async fn live_all_namespace_pod_watch_reports_first_rows_and_ready_time() {
         let context = std::env::var("KUX_LIVE_CONTEXT").expect("KUX_LIVE_CONTEXT");
         let client = client_for_context(&context)
@@ -5377,6 +5575,123 @@ mod tests {
         eprintln!(
             "first_rows={first_rows:?}, largest_loading={largest_loading:?}, ready={ready:?}, rows={rows}"
         );
+        assert!(
+            first_rows.is_some_and(|elapsed| elapsed < Duration::from_secs(1)),
+            "the first Pod page must appear within one second"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires KUX_LIVE_CONTEXT and access to a Kubernetes cluster"]
+    async fn live_warm_pod_cache_publishes_250_rows_within_one_second() {
+        let context = std::env::var("KUX_LIVE_CONTEXT").expect("KUX_LIVE_CONTEXT");
+        let client = client_for_context(&context)
+            .await
+            .expect("Kubernetes client");
+        let mut cache = PodWatchCache::spawn(
+            client,
+            KubernetesSettings {
+                initial_context: context.clone(),
+                publish_interval: Duration::from_millis(100),
+                streaming_lists: true,
+            },
+            context.clone(),
+        );
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let snapshot = cache.receiver.borrow_and_update().clone();
+                if snapshot.rows.len() >= 250 && snapshot.state == SourceState::Ready {
+                    break;
+                }
+                cache
+                    .receiver
+                    .changed()
+                    .await
+                    .expect("Pod cache remains active");
+            }
+        })
+        .await
+        .expect("Pod cache warms within 15 seconds");
+
+        let request = WatchRequest {
+            generation: 42,
+            context,
+            kind: ResourceKind::Pods.into(),
+            namespace: None,
+            field_selector: None,
+            label_selector: None,
+        };
+        let (sender, receiver) = watch::channel(ResourceSnapshot::loading(
+            request.generation,
+            request.kind.clone(),
+        ));
+        let started = Instant::now();
+        cache.publish_current(&request, &sender);
+        let elapsed = started.elapsed();
+        let snapshot = receiver.borrow();
+        eprintln!(
+            "warm-cache rows={} elapsed={elapsed:?}",
+            snapshot.rows.len()
+        );
+        assert!(snapshot.rows.len() >= 250);
+        assert_eq!(snapshot.generation, request.generation);
+        assert!(elapsed < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires KUX_LIVE_CONTEXT and access to a Kubernetes cluster"]
+    async fn live_manager_opens_prewarmed_pods_within_one_second() {
+        let context = std::env::var("KUX_LIVE_CONTEXT").expect("KUX_LIVE_CONTEXT");
+        let client = client_for_context(&context)
+            .await
+            .expect("Kubernetes client");
+        let (requests, request_rx) = mpsc::channel(2);
+        let kind: ResourceDescriptor = ResourceKind::Pods.into();
+        let (snapshot_tx, mut snapshots) =
+            watch::channel(ResourceSnapshot::loading(1, kind.clone()));
+        let (_actions, action_rx) = mpsc::channel(1);
+        let (action_results, _action_result_rx) = mpsc::channel(8);
+        let manager = tokio::spawn(run_manager(
+            client,
+            KubernetesSettings {
+                initial_context: context.clone(),
+                publish_interval: Duration::from_millis(100),
+                streaming_lists: true,
+            },
+            request_rx,
+            snapshot_tx,
+            action_rx,
+            action_results,
+        ));
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        let request = WatchRequest {
+            generation: 77,
+            context,
+            kind,
+            namespace: None,
+            field_selector: None,
+            label_selector: None,
+        };
+        let started = Instant::now();
+        requests.send(request).await.expect("manager is active");
+        let rows = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                snapshots
+                    .changed()
+                    .await
+                    .expect("snapshot stream is active");
+                let snapshot = snapshots.borrow_and_update();
+                if snapshot.generation == 77 && snapshot.rows.len() >= 250 {
+                    break snapshot.rows.len();
+                }
+            }
+        })
+        .await
+        .expect("prewarmed Pods appear within one second");
+        let elapsed = started.elapsed();
+        manager.abort();
+        eprintln!("manager-cache rows={rows} elapsed={elapsed:?}");
     }
 
     #[tokio::test]

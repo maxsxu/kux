@@ -28,8 +28,8 @@
 | K9s-style commands, filters, hotkeys, namespace shortcuts, and in-place views. | Discovers built-ins, Secrets, CRDs, and aggregated APIs directly from Kubernetes. | Compact rows, atomic relists, coalesced watches, latest-value delivery, and viewport-only rendering. |
 
 Kux keeps the workflow experienced Kubernetes operators already know, then rebuilds the data path
-for large datasets. It loads one active resource view, never queues an unbounded stream of frames,
-and does not require a hard-coded resource catalog.
+for large datasets. It loads one active resource view plus a compact live all-namespace Pod cache,
+never queues an unbounded stream of frames, and does not require a hard-coded resource catalog.
 
 ## Try it in 10 seconds
 
@@ -117,7 +117,7 @@ aggregated API server.
 
 ```mermaid
 flowchart LR
-    A["Kubernetes API"] --> B["One active list / watch"]
+    A["Kubernetes API"] --> B["Active view + warm Pod watch"]
     B --> C["Compact ResourceRow cache"]
     C --> D["Coalesced latest-value snapshot"]
     D --> E["Index-only filter and sort"]
@@ -127,9 +127,12 @@ flowchart LR
 - **Atomic relists.** A new list is assembled off-screen and swapped in only when complete.
 - **Bounded delivery.** `tokio::watch` retains the newest snapshot instead of building a backlog.
 - **Compact state.** Kubernetes objects become small reference-counted display rows immediately.
-- **Compact first paint.** Built-in views first request Kubernetes' metadata-only Table form and
-  expose its first 250 rows before starting the richer typed watch and metrics enrichment. The
-  typed cache replaces that bootstrap atomically once synchronized.
+- **Compact first paint.** Kubernetes clients authenticate before entering a resource view. Built-in
+  views then request gzip-compressed Table rows without full objects and expose the first 250 before
+  starting the richer typed watch and metrics enrichment. The typed cache replaces that bootstrap
+  atomically once synchronized.
+- **Warm Pod navigation.** A live, in-memory all-namespace Pod watch starts with Kux and remains
+  current while other resources are viewed, so opening `pods(all)` reuses an existing snapshot.
 - **Progressive large lists.** Table-backed views expose another snapshot after each bounded
   5,000-row page, while later relists remain atomic.
 - **Compact CRD tables.** Dynamic lists request metadata-only Table rows in bounded 5,000-row pages
