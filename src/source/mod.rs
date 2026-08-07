@@ -66,6 +66,14 @@ pub enum ActionResult {
         context: String,
         resources: Vec<ResourceDescriptor>,
     },
+    ChildResource {
+        parent: crate::app::ResourceTarget,
+        kind: ResourceDescriptor,
+        owner_uid: String,
+    },
+    NoChildResource {
+        parent: crate::app::ResourceTarget,
+    },
     Containers {
         target: ResourceTarget,
         rows: Vec<std::sync::Arc<ResourceRow>>,

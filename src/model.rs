@@ -426,6 +426,7 @@ pub struct OwnerReferenceData {
     pub api_version: Arc<str>,
     pub kind: Arc<str>,
     pub name: Arc<str>,
+    pub uid: Arc<str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

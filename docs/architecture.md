@@ -44,11 +44,12 @@ map and replaces the live cache only at `InitDone`. Normal apply/delete events u
 map. Publication is rate-limited, and the `tokio::watch` channel retains only its newest value.
 
 Before starting a built-in view's typed watch and enrichment traffic, Kux gives a gzip-compressed
-Kubernetes Table request a bounded head start. The first 250 compact rows are projected into the normal
-built-in layout and published immediately; larger results continue in 5,000-row pages. The typed
-watch then catches up in the background and atomically replaces the bootstrap rows at `InitDone`, so
-full status, selectors, resource requests, ports, and owner data remain available without delaying
-the first useful screen. A partial typed initialization never replaces a larger bootstrap snapshot.
+Kubernetes Table request a bounded head start. For all-namespace Pods, the first 250 rows omit
+embedded objects for the fastest possible paint; a paged typed Pod snapshot then restores namespace,
+labels, timestamps, owner references, container defaults, resource requests/limits, ports, selectors,
+and full status while the typed watch initializes in parallel. Both typed sources overlay complete
+Pod rows without shrinking the visible bootstrap set. Larger Table and typed results continue in
+5,000-row pages. Other built-in resources begin with metadata Table rows.
 
 Kux requests Kubernetes streaming lists for those typed built-in watches by default. They avoid a
 separate, potentially huge typed list response when supported by the server. `--legacy-list` uses
@@ -93,8 +94,9 @@ subprocess work runs in the source manager rather than the render loop. Content 
 inside the existing header/body layout and is retained only while that view is open. YAML fetches
 produce a compact object plus an optional managed-fields variant, allowing an instant local toggle
 without another API request; serialization runs on the blocking pool. Read actions carry the view
-generation and are cancelled when resource navigation changes, so a late YAML, log, container, or
-policy result cannot replace a newer resource view. Describe invokes `kubectl describe` with explicit
+generation and are cancelled when resource navigation changes, so a late YAML, log, container,
+policy, or child-discovery result cannot replace a newer resource view. Describe invokes
+`kubectl describe` with explicit
 context, resource, and namespace arguments. Server version and namespace metadata refresh when
 contexts change. A normal resource delete uses background propagation after a Tab + Enter
 confirmation. The same
@@ -115,6 +117,11 @@ selector. The
 workload drilldown contract stores the discovered child kind and compact Kubernetes label selector
 on the parent row. Deployment watches open ReplicaSets, while ReplicaSet, StatefulSet, DaemonSet,
 and selector-backed Service watches open Pods; the next watch applies that selector server-side.
+Selecting a CRD resolves its `plural.group` name against API discovery and opens the preferred served
+custom-resource version across its scope. For other resources without a predefined relationship,
+Kux looks for dependents using lightweight `PartialObjectMetadata` lists, then opens the discovered
+kind with an exact client-side controller-UID filter. If no dependent exists, Enter retains its
+normal details behavior.
 
 Secret list decoding fetches the selected core/v1 Secret on demand and builds a transient body from
 its decoded `data` map only; the regular list cache never retains Secret values. Authorization

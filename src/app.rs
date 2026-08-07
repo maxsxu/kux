@@ -329,6 +329,10 @@ pub enum ActionIntent {
     AuthorizationPolicy {
         target: ResourceTarget,
     },
+    FindChildResource {
+        target: ResourceTarget,
+        resources: Vec<ResourceDescriptor>,
+    },
     Restart {
         targets: Vec<ResourceTarget>,
     },
@@ -351,6 +355,7 @@ impl ActionIntent {
                 | Self::Containers { .. }
                 | Self::ContainerLogs { .. }
                 | Self::AuthorizationPolicy { .. }
+                | Self::FindChildResource { .. }
         )
     }
 }
@@ -702,6 +707,7 @@ pub struct App {
     saved_resource_list: Option<SavedResourceList>,
     pending_containers: Option<ResourceTarget>,
     pending_policy: Option<ResourceTarget>,
+    pending_child: Option<(ResourceTarget, ResourceRow)>,
     column_hitboxes: Vec<ColumnHitbox>,
     resource_rows_hitbox: ResourceRowsHitbox,
     chooser_hitbox: ChooserHitbox,
@@ -803,6 +809,7 @@ impl App {
             saved_resource_list: None,
             pending_containers: None,
             pending_policy: None,
+            pending_child: None,
             column_hitboxes: Vec::new(),
             resource_rows_hitbox: ResourceRowsHitbox::default(),
             chooser_hitbox: ChooserHitbox::default(),
@@ -2461,6 +2468,7 @@ impl App {
         self.saved_resource_list = None;
         self.pending_containers = None;
         self.pending_policy = None;
+        self.pending_child = None;
         self.details_row = None;
         self.body_query.clear();
         if resource_kind_changed {
@@ -2694,7 +2702,10 @@ impl App {
         if !self.is_resource_view() {
             return self.restore_resource_list();
         }
-        if self.pending_containers.take().is_some() || self.pending_policy.take().is_some() {
+        if self.pending_containers.take().is_some()
+            || self.pending_policy.take().is_some()
+            || self.pending_child.take().is_some()
+        {
             self.notice = None;
             return AppCommand::None;
         }
@@ -2993,6 +3004,9 @@ impl App {
         if let Some(command) = self.open_child_resource() {
             return command;
         }
+        if let Some(command) = self.open_custom_resource_definition() {
+            return command;
+        }
         match self.kind.known_kind() {
             Some(ResourceKind::Nodes) => {
                 let Some(node) = self.selected_row().map(|row| row.name.to_string()) else {
@@ -3018,13 +3032,17 @@ impl App {
                 AppCommand::Action(ActionIntent::Containers { target })
             }
             _ => {
-                self.details_row = self.selected_row().cloned();
-                if self.details_row.is_some() {
-                    self.body_query.clear();
-                    self.reset_body_scroll();
-                    self.overlay = Overlay::Details;
-                }
-                AppCommand::None
+                let Some(target) = self.selected_target() else {
+                    return AppCommand::None;
+                };
+                let Some(row) = self.selected_row().cloned() else {
+                    return AppCommand::None;
+                };
+                self.pending_child = Some((target.clone(), row));
+                AppCommand::Action(ActionIntent::FindChildResource {
+                    target,
+                    resources: self.resource_options.clone(),
+                })
             }
         }
     }
@@ -3045,6 +3063,71 @@ impl App {
             },
             true,
         ))
+    }
+
+    fn open_custom_resource_definition(&mut self) -> Option<AppCommand> {
+        if !self.kind.is_custom_resource_definition() {
+            return None;
+        }
+        let crd_name = self.selected_row()?.name.as_ref();
+        let kind = self
+            .resource_options
+            .iter()
+            .find(|resource| {
+                !resource.group.is_empty()
+                    && format!("{}.{}", resource.plural, resource.group) == crd_name
+            })?
+            .clone();
+        Some(self.request_view(
+            ViewState {
+                context: self.context.clone(),
+                kind,
+                namespace: None,
+                field_selector: None,
+                label_selector: None,
+            },
+            true,
+        ))
+    }
+
+    pub fn show_discovered_child(
+        &mut self,
+        parent: &ResourceTarget,
+        kind: ResourceDescriptor,
+        owner_uid: &str,
+    ) -> AppCommand {
+        if self.pending_child.as_ref().map(|pending| &pending.0) != Some(parent) {
+            return AppCommand::None;
+        }
+        self.pending_child = None;
+        let namespace = kind
+            .is_namespaced()
+            .then(|| parent.namespace.clone())
+            .flatten();
+        self.request_view(
+            ViewState {
+                context: self.context.clone(),
+                kind,
+                namespace,
+                field_selector: Some(format!("kux.ownerUID={owner_uid}")),
+                label_selector: None,
+            },
+            true,
+        )
+    }
+
+    pub fn show_no_discovered_child(&mut self, parent: &ResourceTarget) {
+        let Some((pending, row)) = self.pending_child.take() else {
+            return;
+        };
+        if &pending != parent {
+            return;
+        }
+        self.details_row = Some(row);
+        self.body_query.clear();
+        self.reset_body_scroll();
+        self.overlay = Overlay::Details;
+        self.notice = None;
     }
 
     fn open_owner_resource(&mut self) -> AppCommand {
@@ -4049,10 +4132,12 @@ mod tests {
             Some("prod"),
             ResourceRow::new("prod", "selected", "Ready", "1/1", "-", 0),
         );
-        assert_eq!(
-            resource.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)),
-            AppCommand::None
-        );
+        let AppCommand::Action(ActionIntent::FindChildResource { target, .. }) =
+            resource.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+        else {
+            panic!("generic resources should check for owned children");
+        };
+        resource.show_no_discovered_child(&target);
         assert_eq!(resource.overlay, Overlay::Details);
 
         let mut chooser = app_with_rows();
@@ -4518,6 +4603,78 @@ mod tests {
     }
 
     #[test]
+    fn enter_on_a_crd_opens_all_instances_of_its_discovered_resource() {
+        let crd = descriptor(
+            "apiextensions.k8s.io",
+            "v1",
+            "apiextensions.k8s.io/v1",
+            "CustomResourceDefinition",
+            "customresourcedefinitions",
+            false,
+        );
+        let widget = descriptor(
+            "example.io",
+            "v1",
+            "example.io/v1",
+            "Widget",
+            "widgets",
+            true,
+        );
+        let row = ResourceRow::new("-", "widgets.example.io", "Established", "-", "-", 0);
+        let mut app = app_with_descriptor(crd, None, row);
+        app.resource_options.push(widget.clone());
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppCommand::Request(ViewState {
+                context: "demo".to_owned(),
+                kind: widget,
+                namespace: None,
+                field_selector: None,
+                label_selector: None,
+            })
+        );
+    }
+
+    #[test]
+    fn discovered_children_open_with_an_exact_owner_uid_filter() {
+        let widget = descriptor(
+            "example.io",
+            "v1",
+            "example.io/v1",
+            "Widget",
+            "widgets",
+            true,
+        );
+        let gadget = descriptor(
+            "example.io",
+            "v1",
+            "example.io/v1",
+            "Gadget",
+            "gadgets",
+            true,
+        );
+        let row = ResourceRow::new("prod", "selected", "Ready", "1/1", "-", 0);
+        let mut app = app_with_descriptor(widget.clone(), Some("prod"), row);
+        let AppCommand::Action(ActionIntent::FindChildResource { target, .. }) =
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("generic resources should discover owned children");
+        };
+
+        assert_eq!(
+            app.show_discovered_child(&target, gadget.clone(), "parent-uid"),
+            AppCommand::Request(ViewState {
+                context: "demo".to_owned(),
+                kind: gadget,
+                namespace: Some("prod".to_owned()),
+                field_selector: Some("kux.ownerUID=parent-uid".to_owned()),
+                label_selector: None,
+            })
+        );
+    }
+
+    #[test]
     fn shift_j_opens_the_controller_owner_by_name() {
         let replica_set = descriptor("apps", "v1", "apps/v1", "ReplicaSet", "replicasets", true);
         let row = ResourceRow::new("prod", "api-7d9-x2", "Running", "1/1", "0", 0)
@@ -4525,6 +4682,7 @@ mod tests {
                 api_version: Arc::from("apps/v1"),
                 kind: Arc::from("ReplicaSet"),
                 name: Arc::from("api-7d9"),
+                uid: Arc::from("replicaset-api-7d9"),
             });
         let mut app = app_with_descriptor(ResourceKind::Pods.into(), Some("prod"), row);
         app.resource_options.push(replica_set.clone());

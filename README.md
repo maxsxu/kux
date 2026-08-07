@@ -89,6 +89,8 @@ Pod ──s──▶ Interactive shell with the resolved spec container in its i
 Pod ──o──▶ Assigned Node
 Deployment ──Enter──▶ ReplicaSets ──Enter──▶ Pods
 StatefulSet / DaemonSet / selector-backed Service ──Enter──▶ Pods
+CRD ──Enter──▶ Custom resources served by that CRD
+Any other owner ──Enter──▶ Resources whose owner reference matches its UID
 ServiceAccount ──Enter──▶ Effective RBAC policy matrix
 Secret ──x──▶ Decoded data only
 Resource ──y / d / e──▶ Formatted YAML / kubectl describe / interactive kubectl edit
@@ -127,10 +129,10 @@ flowchart LR
 - **Atomic relists.** A new list is assembled off-screen and swapped in only when complete.
 - **Bounded delivery.** `tokio::watch` retains the newest snapshot instead of building a backlog.
 - **Compact state.** Kubernetes objects become small reference-counted display rows immediately.
-- **Compact first paint.** Kubernetes clients authenticate before entering a resource view. Built-in
-  views then request gzip-compressed Table rows without full objects and expose the first 250 before
-  starting the richer typed watch and metrics enrichment. The typed cache replaces that bootstrap
-  atomically once synchronized.
+- **Compact first paint.** Kubernetes clients authenticate before entering a resource view. The
+  all-namespace Pod view exposes 250 gzip-compressed Table rows without embedded objects, follows
+  with a paged typed snapshot, and progressively overlays complete Pods without shrinking the list.
+  Other built-in views start from metadata Table rows before typed enrichment completes.
 - **Warm Pod navigation.** A live, in-memory all-namespace Pod watch starts with Kux and remains
   current while other resources are viewed, so opening `pods(all)` reuses an existing snapshot.
 - **Progressive large lists.** Table-backed views expose another snapshot after each bounded

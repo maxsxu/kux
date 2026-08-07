@@ -188,7 +188,19 @@ async fn run(
                 dirty = true;
             }
             Some(result) = action_results.recv() => {
-                apply_action_result(&mut app, result);
+                let command = apply_action_result(&mut app, result);
+                if handle_app_command(
+                    command,
+                    &mut app,
+                    &mut terminal,
+                    &requests,
+                    &actions,
+                    &mut port_forwards,
+                )
+                .await?
+                {
+                    break;
+                }
                 dirty = true;
             }
             Some(event) = port_forward_events_rx.recv() => {
@@ -299,11 +311,11 @@ fn refresh_visible_port_forwards(app: &mut App, manager: &PortForwardManager) {
     app.refresh_port_forwards(forwards);
 }
 
-fn apply_action_result(app: &mut App, result: ActionResult) {
+fn apply_action_result(app: &mut App, result: ActionResult) -> AppCommand {
     match result {
         ActionResult::Scoped { generation, result } => {
             if app.generation == generation {
-                apply_action_result(app, *result);
+                return apply_action_result(app, *result);
             }
         }
         ActionResult::Notice(notice) | ActionResult::Error(notice) => app.show_notice(notice),
@@ -336,6 +348,12 @@ fn apply_action_result(app: &mut App, result: ActionResult) {
                 app.set_resource_options(resources);
             }
         }
+        ActionResult::ChildResource {
+            parent,
+            kind,
+            owner_uid,
+        } => return app.show_discovered_child(&parent, kind, &owner_uid),
+        ActionResult::NoChildResource { parent } => app.show_no_discovered_child(&parent),
         ActionResult::Containers { target, rows } => app.show_containers(target, rows),
         ActionResult::Policy {
             target,
@@ -344,6 +362,7 @@ fn apply_action_result(app: &mut App, result: ActionResult) {
         } => app.show_policy(&target, title, rows),
         ActionResult::ServerVersion(version) => app.set_server_version(version),
     }
+    AppCommand::None
 }
 
 fn handle_copy(app: &mut App, terminal: &mut TerminalGuard, value: &str) {

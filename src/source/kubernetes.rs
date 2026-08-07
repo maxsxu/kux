@@ -407,6 +407,9 @@ async fn handle_action(client: Client, context: &str, action: ActionIntent) -> A
         ActionIntent::AuthorizationPolicy { target } => {
             load_authorization_policy(client, target).await
         }
+        ActionIntent::FindChildResource { target, resources } => {
+            find_child_resource(client, target, resources).await
+        }
         ActionIntent::Restart { targets } => restart_workloads(client, targets).await,
         ActionIntent::SetNodeUnschedulable {
             name,
@@ -415,6 +418,95 @@ async fn handle_action(client: Client, context: &str, action: ActionIntent) -> A
         ActionIntent::DrainNode { name, options } => drain_node(client, &name, options).await,
     };
     result.unwrap_or_else(ActionResult::Error)
+}
+
+async fn find_child_resource(
+    client: Client,
+    target: ResourceTarget,
+    resources: Vec<ResourceDescriptor>,
+) -> Result<ActionResult, String> {
+    let parent = dynamic_target_api(client.clone(), &target)?
+        .get(&target.name)
+        .await
+        .map_err(|error| format!("Unable to inspect {}: {error}", resource_identity(&target)))?;
+    let Some(owner_uid) = parent.meta().uid.clone() else {
+        return Ok(ActionResult::NoChildResource { parent: target });
+    };
+
+    let namespace = target.namespace.clone();
+    for priority in 0..=2 {
+        let candidates = resources
+            .iter()
+            .filter(|kind| child_candidate_priority(&target.kind, kind) == priority)
+            .cloned()
+            .collect::<Vec<_>>();
+        let tasks = candidates.into_iter().map(|kind| {
+            let client = client.clone();
+            let namespace = namespace.clone();
+            let owner_uid = owner_uid.clone();
+            async move {
+                resource_has_owner(client, &kind, namespace.as_deref(), &owner_uid)
+                    .await
+                    .then_some(kind)
+            }
+        });
+        let mut matches = futures::stream::iter(tasks).buffer_unordered(32);
+        while let Some(kind) = matches.next().await {
+            if let Some(kind) = kind {
+                return Ok(ActionResult::ChildResource {
+                    parent: target,
+                    kind,
+                    owner_uid: owner_uid.clone(),
+                });
+            }
+        }
+    }
+    Ok(ActionResult::NoChildResource { parent: target })
+}
+
+fn child_candidate_priority(parent: &ResourceDescriptor, candidate: &ResourceDescriptor) -> u8 {
+    if candidate.group == parent.group {
+        0
+    } else if matches!(candidate.group.as_ref(), "" | "apps" | "batch") {
+        1
+    } else {
+        2
+    }
+}
+
+async fn resource_has_owner(
+    client: Client,
+    kind: &ResourceDescriptor,
+    parent_namespace: Option<&str>,
+    owner_uid: &str,
+) -> bool {
+    let api = dynamic_api(
+        client,
+        kind,
+        kind.is_namespaced().then_some(parent_namespace).flatten(),
+    );
+    let mut continue_token: Option<String> = None;
+    loop {
+        let mut params = ListParams::default().limit(TABLE_MAX_PAGE_SIZE);
+        if let Some(token) = &continue_token {
+            params = params.continue_token(token);
+        }
+        let Ok(page) = api.list_metadata(&params).await else {
+            return false;
+        };
+        if page.items.iter().any(|item| {
+            item.metadata
+                .owner_references
+                .as_ref()
+                .is_some_and(|owners| owners.iter().any(|owner| owner.uid == owner_uid))
+        }) {
+            return true;
+        }
+        continue_token = page.metadata.continue_;
+        if continue_token.as_deref().is_none_or(str::is_empty) {
+            return false;
+        }
+    }
 }
 
 async fn delete_resources(
@@ -1156,10 +1248,26 @@ impl Drop for AbortOnDrop {
 struct FastInitialList {
     columns: Arc<[TableColumn]>,
     rows: FxHashMap<Arc<str>, Arc<ResourceRow>>,
-    complete: bool,
+    hydrated: bool,
+    quality: u8,
 }
 
 const FAST_INITIAL_LIST_HEAD_START: Duration = Duration::from_secs(5);
+const OWNER_UID_FIELD_SELECTOR_PREFIX: &str = "kux.ownerUID=";
+
+fn owner_uid_filter(request: &WatchRequest) -> Option<&str> {
+    request
+        .field_selector
+        .as_deref()
+        .and_then(|selector| selector.strip_prefix(OWNER_UID_FIELD_SELECTOR_PREFIX))
+}
+
+fn server_field_selector(request: &WatchRequest) -> Option<&str> {
+    request
+        .field_selector
+        .as_deref()
+        .filter(|_| owner_uid_filter(request).is_none())
+}
 
 fn spawn_fast_initial_list(
     client: Client,
@@ -1167,22 +1275,57 @@ fn spawn_fast_initial_list(
 ) -> (mpsc::UnboundedReceiver<FastInitialList>, AbortOnDrop) {
     let (updates, receiver) = mpsc::unbounded_channel();
     let api = dynamic_api(client.clone(), &request.kind, request.namespace.as_deref());
-    let field_selector = request.field_selector.clone();
+    let field_selector = server_field_selector(request).map(str::to_owned);
     let label_selector = request.label_selector.clone();
-    let include_object =
-        if request.namespace.is_none() && request.kind.known_kind() == Some(ResourceKind::Pods) {
-            TABLE_FAST_INCLUDE_OBJECT
-        } else {
-            TABLE_INCLUDE_OBJECT
-        };
+    let metadata_free_head = request.namespace.is_none()
+        && request.kind.known_kind() == Some(ResourceKind::Pods)
+        && owner_uid_filter(request).is_none();
     let task = tokio::spawn(async move {
+        if metadata_free_head {
+            if let Ok(page) = list_table_head(
+                &api,
+                &client,
+                field_selector.as_deref(),
+                label_selector.as_deref(),
+                TABLE_FAST_INCLUDE_OBJECT,
+            )
+            .await
+            {
+                let rows = page
+                    .rows
+                    .into_iter()
+                    .map(|row| (Arc::clone(&row.key), row))
+                    .collect();
+                let _ = updates.send(FastInitialList {
+                    columns: page.columns,
+                    rows,
+                    hydrated: false,
+                    quality: 0,
+                });
+            }
+            list_pod_pages(
+                Api::<Pod>::all(client.clone()),
+                field_selector.as_deref(),
+                label_selector.as_deref(),
+                |rows| {
+                    let _ = updates.send(FastInitialList {
+                        columns: Arc::from([]),
+                        rows: rows.clone(),
+                        hydrated: true,
+                        quality: 1,
+                    });
+                },
+            )
+            .await;
+            return;
+        }
         let mut sent_first = false;
         let _ = list_table_pages_with_include(
             &api,
             &client,
             field_selector.as_deref(),
             label_selector.as_deref(),
-            include_object,
+            TABLE_INCLUDE_OBJECT,
             |columns, rows, complete| {
                 if sent_first && !complete {
                     return;
@@ -1191,13 +1334,77 @@ fn spawn_fast_initial_list(
                 let _ = updates.send(FastInitialList {
                     columns: Arc::clone(columns),
                     rows: rows.clone(),
-                    complete,
+                    hydrated: false,
+                    quality: 1,
                 });
             },
         )
         .await;
     });
     (receiver, AbortOnDrop(task))
+}
+
+async fn list_table_head(
+    api: &Api<DynamicObject>,
+    client: &Client,
+    field_selector: Option<&str>,
+    label_selector: Option<&str>,
+    include_object: &str,
+) -> Result<DecodedTablePage, String> {
+    let mut params = ListParams::default().limit(TABLE_INITIAL_PAGE_SIZE);
+    if let Some(selector) = field_selector {
+        params = params.fields(selector);
+    }
+    if let Some(selector) = label_selector {
+        params = params.labels(selector);
+    }
+    let raw = Request::new(api.resource_url())
+        .list(&params)
+        .map_err(|error| format!("Unable to build Kubernetes Table request: {error}"))?;
+    let raw = table_request_with_include(raw, include_object)?;
+    let value = client
+        .request::<serde_json::Value>(raw)
+        .await
+        .map_err(|error| format!("Unable to list Kubernetes Table rows: {error}"))?;
+    decode_table_list(value)
+}
+
+async fn list_pod_pages<F>(
+    api: Api<Pod>,
+    field_selector: Option<&str>,
+    label_selector: Option<&str>,
+    mut on_page: F,
+) where
+    F: FnMut(&FxHashMap<Arc<str>, Arc<ResourceRow>>),
+{
+    let mut rows = FxHashMap::default();
+    let mut continue_token: Option<String> = None;
+    let mut page_size = TABLE_INITIAL_PAGE_SIZE;
+    loop {
+        let mut params = ListParams::default().limit(page_size);
+        if let Some(selector) = field_selector {
+            params = params.fields(selector);
+        }
+        if let Some(selector) = label_selector {
+            params = params.labels(selector);
+        }
+        if let Some(token) = &continue_token {
+            params = params.continue_token(token);
+        }
+        let Ok(page) = api.list(&params).await else {
+            return;
+        };
+        for pod in &page.items {
+            let row = Arc::new(pod_row(pod));
+            rows.insert(Arc::clone(&row.key), row);
+        }
+        on_page(&rows);
+        continue_token = page.metadata.continue_;
+        if continue_token.as_deref().is_none_or(str::is_empty) {
+            return;
+        }
+        page_size = next_table_page_size(page_size);
+    }
 }
 
 fn hydrate_fast_initial_rows(
@@ -1317,7 +1524,7 @@ fn spawn_enrichment_tasks(
     updates: mpsc::Sender<EnrichmentUpdate>,
 ) -> Vec<AbortOnDrop> {
     match request.kind.known_kind() {
-        Some(ResourceKind::Pods) if request.field_selector.is_none() => vec![AbortOnDrop(
+        Some(ResourceKind::Pods) if server_field_selector(request).is_none() => vec![AbortOnDrop(
             tokio::spawn(pod_metrics_loop(client, request.namespace.clone(), updates)),
         )],
         Some(ResourceKind::Nodes) => vec![
@@ -2246,6 +2453,7 @@ struct TypedWatchState {
     dirty: bool,
     fast_initial_published: bool,
     fast_initial_rows: Option<FxHashMap<Arc<str>, Arc<ResourceRow>>>,
+    fast_initial_quality: u8,
 }
 
 impl TypedWatchState {
@@ -2258,15 +2466,20 @@ impl TypedWatchState {
         if self.initial_load_complete {
             return;
         }
-        hydrate_fast_initial_rows(&request.kind, &update.columns, &mut update.rows);
+        if self.fast_initial_published && update.quality < self.fast_initial_quality {
+            return;
+        }
+        if !update.hydrated {
+            hydrate_fast_initial_rows(&request.kind, &update.columns, &mut update.rows);
+        }
+        if let Some(initializing) = &self.initializing {
+            overlay_typed_rows(&mut update.rows, initializing);
+        }
         self.fast_initial_published = true;
+        self.fast_initial_quality = update.quality;
         self.revision = self.revision.wrapping_add(1);
-        let state = if update.complete {
-            SourceState::Ready
-        } else {
-            SourceState::Loading {
-                loaded: update.rows.len(),
-            }
+        let state = SourceState::Loading {
+            loaded: update.rows.len(),
         };
         publish(snapshots, request, &update.rows, state, self.revision);
         self.fast_initial_rows = Some(update.rows);
@@ -2299,6 +2512,7 @@ impl TypedWatchState {
                     request,
                     &mut self.revision,
                 );
+                self.dirty = true;
             }
             watcher::Event::InitDone => {
                 if let Some(initial) = self.initializing.take() {
@@ -2345,13 +2559,27 @@ impl TypedWatchState {
         request: &WatchRequest,
     ) {
         self.revision = self.revision.wrapping_add(1);
-        publish(
-            snapshots,
-            request,
-            &self.rows,
-            SourceState::Ready,
-            self.revision,
-        );
+        if let Some(initializing) = &self.initializing {
+            let mut visible = self.fast_initial_rows.clone().unwrap_or_default();
+            overlay_typed_rows(&mut visible, initializing);
+            publish(
+                snapshots,
+                request,
+                &visible,
+                SourceState::Loading {
+                    loaded: initializing.len(),
+                },
+                self.revision,
+            );
+        } else {
+            publish(
+                snapshots,
+                request,
+                &self.rows,
+                SourceState::Ready,
+                self.revision,
+            );
+        }
         self.dirty = false;
     }
 
@@ -2456,10 +2684,20 @@ async fn watch_api<K, F>(
                 enrichment.update(update);
                 state.apply_enrichment(&enrichment);
             }
-            _ = ticker.tick(), if state.dirty && state.initializing.is_none() => {
+            _ = ticker.tick(), if state.dirty => {
                 state.publish_ready(&snapshots, &request);
             }
         }
+    }
+}
+
+fn overlay_typed_rows(
+    visible: &mut FxHashMap<Arc<str>, Arc<ResourceRow>>,
+    typed: &FxHashMap<Arc<str>, Arc<ResourceRow>>,
+) {
+    for row in typed.values() {
+        visible.remove(format!("-/{}", row.name).as_str());
+        visible.insert(Arc::clone(&row.key), Arc::clone(row));
     }
 }
 
@@ -2472,7 +2710,7 @@ fn resource_watcher_config(
     } else {
         watcher::Config::default().page_size(500)
     };
-    if let Some(selector) = &request.field_selector {
+    if let Some(selector) = server_field_selector(request) {
         config = config.fields(selector);
     }
     if let Some(selector) = &request.label_selector {
@@ -2617,7 +2855,7 @@ async fn watch_table_api(
         match list_table_pages_with_progress(
             &api,
             &client,
-            request.field_selector.as_deref(),
+            server_field_selector(&request),
             request.label_selector.as_deref(),
             |columns, rows, complete| {
                 if initial_load_complete || complete || !initial_progress.should_publish(rows.len())
@@ -2708,7 +2946,7 @@ async fn stream_table_watch(
         bookmarks: false,
         ..WatchParams::default()
     };
-    if let Some(selector) = &request.field_selector {
+    if let Some(selector) = server_field_selector(request) {
         params = params.fields(selector);
     }
     if let Some(selector) = &request.label_selector {
@@ -2808,7 +3046,7 @@ async fn poll_table_api(
         match list_table_pages_with_progress(
             &api,
             &client,
-            request.field_selector.as_deref(),
+            server_field_selector(&request),
             request.label_selector.as_deref(),
             |columns, rows, complete| {
                 if initial_load_complete || complete || !initial_progress.should_publish(rows.len())
@@ -3173,7 +3411,11 @@ fn publish(
     if snapshots.is_closed() {
         return;
     }
-    let mut compact: Vec<_> = rows.values().cloned().collect();
+    let mut compact: Vec<_> = rows
+        .values()
+        .filter(|row| row_matches_owner_filter(row, request))
+        .cloned()
+        .collect();
     compact.sort_unstable_by(|left, right| {
         left.namespace
             .cmp(&right.namespace)
@@ -3201,7 +3443,11 @@ fn publish_table(
     if snapshots.is_closed() {
         return;
     }
-    let mut compact: Vec<_> = rows.values().cloned().collect();
+    let mut compact: Vec<_> = rows
+        .values()
+        .filter(|row| row_matches_owner_filter(row, request))
+        .cloned()
+        .collect();
     compact.sort_unstable_by(|left, right| {
         left.namespace
             .cmp(&right.namespace)
@@ -3216,6 +3462,14 @@ fn publish_table(
         revision,
         emitted_at: Instant::now(),
     });
+}
+
+fn row_matches_owner_filter(row: &ResourceRow, request: &WatchRequest) -> bool {
+    owner_uid_filter(request).is_none_or(|uid| {
+        row.owner
+            .as_ref()
+            .is_some_and(|owner| owner.uid.as_ref() == uid)
+    })
 }
 
 fn pod_row(pod: &Pod) -> ResourceRow {
@@ -3959,6 +4213,7 @@ fn owner_reference_data(
         api_version: Arc::from(owner.api_version.as_str()),
         kind: Arc::from(owner.kind.as_str()),
         name: Arc::from(owner.name.as_str()),
+        uid: Arc::from(owner.uid.as_str()),
     })
 }
 
@@ -5136,7 +5391,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_fast_initial_list_is_ready_and_suppresses_typed_partial_rows() {
+    fn typed_rows_progressively_replace_fast_rows_during_initialization() {
         let kind: ResourceDescriptor = ResourceKind::Pods.into();
         let request = WatchRequest {
             generation: 8,
@@ -5151,7 +5406,7 @@ mod tests {
         let rows = (0..3)
             .map(|index| {
                 let row = Arc::new(ResourceRow::new(
-                    "prod",
+                    "-",
                     format!("pod-{index}"),
                     "Running",
                     "1/1",
@@ -5166,32 +5421,38 @@ mod tests {
             FastInitialList {
                 columns: Arc::from([]),
                 rows,
-                complete: true,
+                hydrated: false,
+                quality: 0,
             },
             &snapshots,
             &request,
         );
         apply_initial_row(
             &mut state.initializing,
-            Arc::new(ResourceRow::new(
-                "prod",
-                "typed-partial",
-                "Running",
-                "1/1",
-                "",
-                0,
-            )),
+            Arc::new(ResourceRow::new("prod", "pod-0", "Running", "1/1", "", 0)),
             state.fast_initial_published,
             &mut state.initial_progress,
             &snapshots,
             &request,
             &mut state.revision,
         );
+        state.dirty = true;
+        state.publish_ready(&snapshots, &request);
 
         let snapshot = receiver.borrow();
         assert_eq!(snapshot.rows.len(), 3);
-        assert_eq!(snapshot.state, SourceState::Ready);
-        assert_eq!(snapshot.revision, 1);
+        assert_eq!(
+            snapshot
+                .rows
+                .iter()
+                .find(|row| row.name.as_ref() == "pod-0")
+                .expect("typed row")
+                .namespace
+                .as_ref(),
+            "prod"
+        );
+        assert_eq!(snapshot.state, SourceState::Loading { loaded: 1 });
+        assert_eq!(snapshot.revision, 2);
     }
 
     #[test]
@@ -5214,6 +5475,31 @@ mod tests {
         filtered.label_selector = Some("app=api".to_owned());
         assert!(!is_all_namespace_pod_request(&filtered, "test"));
         assert!(!is_all_namespace_pod_request(&request, "production"));
+    }
+
+    #[test]
+    fn owner_uid_filters_are_local_and_match_exact_controller_uids() {
+        let mut request = WatchRequest {
+            generation: 1,
+            context: "test".to_owned(),
+            kind: ResourceKind::Pods.into(),
+            namespace: Some("prod".to_owned()),
+            field_selector: Some("kux.ownerUID=parent-123".to_owned()),
+            label_selector: None,
+        };
+        assert_eq!(server_field_selector(&request), None);
+        let matching = ResourceRow::new("prod", "child", "Running", "1/1", "", 0)
+            .with_owner_reference_data(OwnerReferenceData {
+                api_version: Arc::from("example.io/v1"),
+                kind: Arc::from("Widget"),
+                name: Arc::from("parent"),
+                uid: Arc::from("parent-123"),
+            });
+        assert!(row_matches_owner_filter(&matching, &request));
+
+        request.field_selector = Some("metadata.name=child".to_owned());
+        assert_eq!(server_field_selector(&request), Some("metadata.name=child"));
+        assert!(row_matches_owner_filter(&matching, &request));
     }
 
     #[test]
@@ -5453,6 +5739,40 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires KUX_LIVE_CONTEXT and access to a Kubernetes cluster"]
+    async fn live_generic_child_discovery_finds_a_deployment_replica_set() {
+        let context = std::env::var("KUX_LIVE_CONTEXT").expect("KUX_LIVE_CONTEXT");
+        let client = client_for_context(&context)
+            .await
+            .expect("Kubernetes client");
+        let deployment = Api::<Deployment>::all(client.clone())
+            .list(&ListParams::default().limit(1))
+            .await
+            .expect("Deployment list")
+            .items
+            .into_iter()
+            .next()
+            .expect("at least one Deployment");
+        let target = ResourceTarget {
+            kind: ResourceKind::Deployments.into(),
+            namespace: deployment.namespace(),
+            name: deployment.name_any(),
+        };
+        let resources = discover_resources(client.clone())
+            .await
+            .expect("API discovery");
+
+        let result = find_child_resource(client, target.clone(), resources)
+            .await
+            .expect("child discovery");
+        assert!(matches!(
+            result,
+            ActionResult::ChildResource { parent, kind, .. }
+                if parent == target && kind.is_apps_v1_replica_set()
+        ));
+    }
+
+    #[tokio::test]
     #[ignore = "requires KUX_LIVE_CONTEXT and access to a large Kubernetes cluster"]
     async fn live_large_dynamic_resource_table_list() {
         let context = std::env::var("KUX_LIVE_CONTEXT").expect("KUX_LIVE_CONTEXT");
@@ -5549,36 +5869,60 @@ mod tests {
             snapshots,
         ));
         let mut first_rows = None;
+        let mut complete_columns = None;
         let mut largest_loading = None;
-        let (ready, rows) = tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                receiver.changed().await.expect("Pod watch remains active");
-                let snapshot = receiver.borrow_and_update().clone();
-                if first_rows.is_none() && !snapshot.rows.is_empty() {
-                    first_rows = Some(started.elapsed());
+        let (ready, rows, missing_namespaces) =
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    receiver.changed().await.expect("Pod watch remains active");
+                    let snapshot = receiver.borrow_and_update().clone();
+                    if first_rows.is_none() && !snapshot.rows.is_empty() {
+                        first_rows = Some(started.elapsed());
+                    }
+                    if complete_columns.is_none()
+                        && snapshot.rows.len() > INITIAL_LIST_PROGRESS_ROWS
+                        && snapshot.rows.iter().all(|row| {
+                            !matches!(row.namespace.as_ref(), "" | "-")
+                                && row
+                                    .pod_data()
+                                    .is_some_and(|pod| !pod.default_container.is_empty())
+                        })
+                    {
+                        complete_columns = Some(started.elapsed());
+                    }
+                    if matches!(snapshot.state, SourceState::Loading { .. })
+                        && largest_loading
+                            .as_ref()
+                            .is_none_or(|(rows, _)| snapshot.rows.len() > *rows)
+                    {
+                        largest_loading = Some((snapshot.rows.len(), started.elapsed()));
+                    }
+                    if snapshot.state == SourceState::Ready {
+                        let missing_namespaces = snapshot
+                            .rows
+                            .iter()
+                            .filter(|row| matches!(row.namespace.as_ref(), "" | "-"))
+                            .count();
+                        break (started.elapsed(), snapshot.rows.len(), missing_namespaces);
+                    }
                 }
-                if matches!(snapshot.state, SourceState::Loading { .. })
-                    && largest_loading
-                        .as_ref()
-                        .is_none_or(|(rows, _)| snapshot.rows.len() > *rows)
-                {
-                    largest_loading = Some((snapshot.rows.len(), started.elapsed()));
-                }
-                if snapshot.state == SourceState::Ready {
-                    break (started.elapsed(), snapshot.rows.len());
-                }
-            }
-        })
-        .await
-        .expect("Pod watch becomes ready within 30 seconds");
+            })
+            .await
+            .expect("Pod watch becomes ready within 30 seconds");
         task.abort();
         eprintln!(
-            "first_rows={first_rows:?}, largest_loading={largest_loading:?}, ready={ready:?}, rows={rows}"
+            "first_rows={first_rows:?}, complete_columns={complete_columns:?}, \
+             largest_loading={largest_loading:?}, ready={ready:?}, rows={rows}"
         );
         assert!(
             first_rows.is_some_and(|elapsed| elapsed < Duration::from_secs(1)),
             "the first Pod page must appear within one second"
         );
+        assert!(
+            complete_columns.is_some_and(|elapsed| elapsed < Duration::from_secs(10)),
+            "complete Pod columns must arrive before watch initialization finishes"
+        );
+        assert_eq!(missing_namespaces, 0, "ready Pods retain namespaces");
     }
 
     #[tokio::test]

@@ -594,6 +594,8 @@ fn container_action_hints(app: &App) -> Vec<HeaderHint> {
 fn resource_action_hints(app: &App) -> Vec<HeaderHint> {
     let enter_label = if app.kind.is_authorization_resource() {
         "Policy".to_owned()
+    } else if app.kind.is_custom_resource_definition() {
+        "Custom Resources".to_owned()
     } else if let Some(child) = app
         .selected_row()
         .and_then(crate::model::ResourceRow::child_resource_data)

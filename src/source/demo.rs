@@ -143,6 +143,9 @@ fn demo_action(action: ActionIntent) -> ActionResult {
                 rows: vec![Arc::new(row)],
             }
         }
+        ActionIntent::FindChildResource { target, .. } => {
+            ActionResult::NoChildResource { parent: target }
+        }
     }
 }
 
@@ -414,6 +417,7 @@ fn with_demo_owner(row: ResourceRow, request: &WatchRequest, index: usize) -> Re
             api_version: Arc::from("apps/v1"),
             kind: Arc::from("Deployment"),
             name: Arc::from(format!("deploy-{index:07}")),
+            uid: Arc::from(format!("demo-deployment-{index:07}")),
         })
     } else {
         row
