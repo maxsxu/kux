@@ -1959,27 +1959,8 @@ fn draw_details(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 
 fn draw_content(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let body = app.active_content_body();
-    let filtered = if app.content_kind == Some(ContentKind::Yaml) {
-        body.to_owned()
-    } else {
-        body.lines()
-            .filter(|line| app.body_line_matches(line))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
     let matcher = FilterMatcher::new(app.body_filter());
-    let lines = match app.content_kind {
-        Some(ContentKind::Yaml | ContentKind::SecretData) => highlight_yaml(&filtered),
-        Some(ContentKind::Describe) => highlight_describe(&filtered),
-        Some(ContentKind::Logs | ContentKind::PreviousLogs) => highlight_logs(&filtered),
-        _ => filtered
-            .lines()
-            .map(|line| Line::raw(line.to_owned()))
-            .collect(),
-    }
-    .into_iter()
-    .map(|line| highlight_line_matches(line, &matcher))
-    .collect::<Vec<_>>();
+    let has_filter = !app.body_filter().is_empty();
     let filter = if app.body_filter().is_empty() {
         String::new()
     } else {
@@ -1988,19 +1969,77 @@ fn draw_content(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let title = format!(" {}{filter} ", app.content_title);
     let block = notice_block(popup_block(&title).title_alignment(Alignment::Center), app);
     let inner = block.inner(area);
-    let wrap = app.ui.wrap();
-    let paragraph = Paragraph::new(lines);
-    let paragraph = if wrap {
-        paragraph.wrap(Wrap { trim: false })
+    if !app.ui.wrap() {
+        let start = usize::from(app.content_scroll);
+        let end = start.saturating_add(usize::from(inner.height));
+        let hide_non_matches = app.content_kind != Some(ContentKind::Yaml);
+        let mut total = 0_usize;
+        let mut lines = Vec::with_capacity(usize::from(inner.height));
+        for line in body.lines() {
+            if hide_non_matches && !matcher.matches_text(line) {
+                continue;
+            }
+            if total >= start && total < end {
+                let styled = highlight_content_line(app.content_kind, line);
+                lines.push(if has_filter {
+                    highlight_line_matches(styled, &matcher)
+                } else {
+                    styled
+                });
+            }
+            total = total.saturating_add(1);
+        }
+        app.set_content_scroll_extent(total, inner.height);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .scroll((0, app.content_horizontal_scroll)),
+            area,
+        );
+        return;
+    }
+
+    let filtered = if app.content_kind == Some(ContentKind::Yaml) {
+        body.to_owned()
     } else {
-        paragraph
+        body.lines()
+            .filter(|line| app.body_line_matches(line))
+            .collect::<Vec<_>>()
+            .join("\n")
     };
+    let lines = match app.content_kind {
+        Some(ContentKind::Yaml | ContentKind::SecretData) => highlight_yaml(&filtered),
+        Some(ContentKind::Describe) => highlight_describe(&filtered),
+        Some(ContentKind::Logs | ContentKind::PreviousLogs) => highlight_logs(&filtered),
+        _ => filtered
+            .lines()
+            .map(|line| Line::raw(line.to_owned()))
+            .collect(),
+    };
+    let lines = if has_filter {
+        lines
+            .into_iter()
+            .map(|line| highlight_line_matches(line, &matcher))
+            .collect::<Vec<_>>()
+    } else {
+        lines
+    };
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     let content_height = paragraph.line_count(inner.width);
     app.set_content_scroll_extent(content_height, inner.height);
     let paragraph = paragraph
         .block(block)
         .scroll((app.content_scroll, app.content_horizontal_scroll));
     frame.render_widget(paragraph, area);
+}
+
+fn highlight_content_line(content: Option<ContentKind>, line: &str) -> Line<'static> {
+    match content {
+        Some(ContentKind::Yaml | ContentKind::SecretData) => highlight_yaml_line(line),
+        Some(ContentKind::Describe) => highlight_describe_line(line),
+        Some(ContentKind::Logs | ContentKind::PreviousLogs) => highlight_log_line(line),
+        None => Line::raw(line.to_owned()),
+    }
 }
 
 fn highlight_logs(body: &str) -> Vec<Line<'static>> {

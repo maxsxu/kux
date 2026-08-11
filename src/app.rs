@@ -319,6 +319,9 @@ pub enum ActionIntent {
         target: ResourceTarget,
         content: ContentKind,
     },
+    ManagedYaml {
+        target: ResourceTarget,
+    },
     Containers {
         target: ResourceTarget,
     },
@@ -352,6 +355,7 @@ impl ActionIntent {
         matches!(
             self,
             Self::Content { .. }
+                | Self::ManagedYaml { .. }
                 | Self::Containers { .. }
                 | Self::ContainerLogs { .. }
                 | Self::AuthorizationPolicy { .. }
@@ -2039,14 +2043,22 @@ impl App {
             {
                 AppCommand::Copy(self.active_content_body().to_owned())
             }
-            KeyCode::Char('m')
-                if self.content_kind == Some(ContentKind::Yaml)
-                    && self.content_managed_fields.is_some() =>
-            {
-                self.ui.toggle(UiFlags::MANAGED_FIELDS);
-                self.reset_body_scroll();
-                self.scroll_to_first_content_match();
-                AppCommand::None
+            KeyCode::Char('m') if self.content_kind == Some(ContentKind::Yaml) => {
+                match self.content_managed_fields.as_deref() {
+                    Some("") => {
+                        let Some(target) = self.content_target.clone() else {
+                            return AppCommand::None;
+                        };
+                        AppCommand::Action(ActionIntent::ManagedYaml { target })
+                    }
+                    Some(_) => {
+                        self.ui.toggle(UiFlags::MANAGED_FIELDS);
+                        self.reset_body_scroll();
+                        self.scroll_to_first_content_match();
+                        AppCommand::None
+                    }
+                    None => self.unsupported("Selected resource has no managed fields"),
+                }
             }
             KeyCode::Char('x')
                 if self.content_kind == Some(ContentKind::Yaml)
@@ -3541,6 +3553,28 @@ impl App {
         self.notice = None;
     }
 
+    pub fn show_managed_yaml(
+        &mut self,
+        target: &ResourceTarget,
+        body: String,
+        decoded_body: Option<String>,
+    ) {
+        if self.overlay != Overlay::Content
+            || self.content_kind != Some(ContentKind::Yaml)
+            || self.content_target.as_ref() != Some(target)
+        {
+            return;
+        }
+        self.content_managed_fields = Some(body);
+        self.content_decoded_managed_fields = decoded_body;
+        if !self.ui.managed_fields() {
+            self.ui.toggle(UiFlags::MANAGED_FIELDS);
+        }
+        self.reset_body_scroll();
+        self.scroll_to_first_content_match();
+        self.notice = None;
+    }
+
     #[must_use]
     pub fn active_content_body(&self) -> &str {
         if self.ui.secret_decoded() {
@@ -3697,7 +3731,7 @@ impl FilterMatcher {
         }
     }
 
-    fn matches_text(&self, text: &str) -> bool {
+    pub(crate) fn matches_text(&self, text: &str) -> bool {
         match self {
             Self::All => true,
             Self::Regex(regex) => regex.is_match(text),
@@ -5929,6 +5963,44 @@ mod tests {
         app.show_transient_notice("YAML copied to clipboard");
         assert_eq!(app.overlay, Overlay::Content);
         assert_eq!(app.notice.as_deref(), Some("YAML copied to clipboard"));
+    }
+
+    #[test]
+    fn yaml_managed_fields_load_lazily_and_ignore_stale_results() {
+        let mut app = app_with_rows();
+        let target = match app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)) {
+            AppCommand::Action(ActionIntent::Content { target, .. }) => target,
+            command => panic!("expected YAML action, got {command:?}"),
+        };
+        app.show_content(
+            "YAML(prod/api-0)",
+            "kind: Pod",
+            Some(String::new()),
+            None,
+            None,
+            ContentKind::Yaml,
+        );
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)),
+            AppCommand::Action(ActionIntent::ManagedYaml {
+                target: target.clone()
+            })
+        );
+        assert!(!app.ui.managed_fields());
+
+        let mut stale = target.clone();
+        stale.name.push_str("-stale");
+        app.show_managed_yaml(&stale, "stale".to_owned(), None);
+        assert!(!app.ui.managed_fields());
+
+        app.show_managed_yaml(
+            &target,
+            "metadata:\n  managedFields:\n  - manager: kubelet".to_owned(),
+            None,
+        );
+        assert!(app.ui.managed_fields());
+        assert!(app.active_content_body().contains("managedFields"));
     }
 
     #[test]

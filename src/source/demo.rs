@@ -96,6 +96,11 @@ fn demo_action(action: ActionIntent) -> ActionResult {
         } => demo_set_node_unschedulable(&name, unschedulable),
         ActionIntent::Restart { targets } => demo_restart(&targets),
         ActionIntent::Content { target, content } => demo_content(&target, content),
+        ActionIntent::ManagedYaml { target } => ActionResult::ManagedYaml {
+            target,
+            body: "metadata:\n  managedFields:\n  - manager: demo\n".to_owned(),
+            decoded_body: None,
+        },
         ActionIntent::Containers { target } => demo_containers(target),
         ActionIntent::ContainerLogs { target, previous } => {
             let label = if previous { "Previous Logs" } else { "Logs" };

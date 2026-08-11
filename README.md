@@ -141,7 +141,10 @@ flowchart LR
   instead of downloading full CRD objects up front.
 - **Generation safety.** List snapshots and read-action results from cancelled views cannot
   overwrite the active dataset; obsolete YAML/log requests are aborted when navigation changes.
-- **Viewport rendering.** Widgets are created only for rows visible in the terminal.
+- **Viewport rendering.** Table rows and unwrapped YAML/log/describe lines are styled and allocated
+  only for the visible terminal viewport.
+- **Lazy managed fields.** Initial YAML formatting omits Kubernetes `managedFields`; press `m` to
+  load them on demand, after which toggling remains local and instant.
 - **Independent enrichment.** Metrics, node pod counts, YAML, logs, and actions do not block input.
 - **Graceful API coverage.** Watchable resources stream; list-only APIs use bounded pagination.
 

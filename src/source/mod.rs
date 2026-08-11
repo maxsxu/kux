@@ -53,6 +53,11 @@ pub enum ActionResult {
         decoded_managed_fields: Option<String>,
         content: crate::app::ContentKind,
     },
+    ManagedYaml {
+        target: crate::app::ResourceTarget,
+        body: String,
+        decoded_body: Option<String>,
+    },
     NamespaceOptions {
         context: String,
         namespaces: Vec<NamespaceInfo>,

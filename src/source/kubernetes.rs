@@ -400,6 +400,7 @@ async fn handle_action(client: Client, context: &str, action: ActionIntent) -> A
         ActionIntent::Content { target, content } => {
             fetch_content(client, context, &target, content).await
         }
+        ActionIntent::ManagedYaml { target } => fetch_managed_yaml(client, target).await,
         ActionIntent::Containers { target } => load_containers(client, target).await,
         ActionIntent::ContainerLogs { target, previous } => {
             fetch_container_logs(client, target, previous).await
@@ -1100,6 +1101,43 @@ async fn fetch_content(
         decoded_managed_fields: yaml.decoded_with_managed_fields,
         content: content_kind,
     })
+}
+
+async fn fetch_managed_yaml(
+    client: Client,
+    target: ResourceTarget,
+) -> Result<ActionResult, String> {
+    let object = dynamic_target_api(client, &target)?
+        .get(&target.name)
+        .await
+        .map_err(|error| error.to_string())?;
+    let format_target = target.clone();
+    let (body, decoded_body) = tokio::task::spawn_blocking(move || {
+        managed_yaml_content_from_object(&object, &format_target)
+    })
+    .await
+    .map_err(|error| format!("Unable to format managed-fields YAML: {error}"))??;
+    Ok(ActionResult::ManagedYaml {
+        target,
+        body,
+        decoded_body,
+    })
+}
+
+fn managed_yaml_content_from_object(
+    object: &DynamicObject,
+    target: &ResourceTarget,
+) -> Result<(String, Option<String>), String> {
+    let decoded = is_core_v1_secret(target)
+        .then(|| decode_secret_object(object))
+        .flatten();
+    let body = serde_yaml::to_string(object).map_err(|error| error.to_string())?;
+    let decoded_body = decoded
+        .as_ref()
+        .map(serde_yaml::to_string)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    Ok((body, decoded_body))
 }
 
 async fn fetch_secret_data(
@@ -2355,19 +2393,8 @@ fn yaml_content_from_object(
         .managed_fields
         .as_ref()
         .is_some_and(|fields| !fields.is_empty());
-    let with_managed_fields = has_managed_fields
-        .then(|| serde_yaml::to_string(&object))
-        .transpose()
-        .map_err(|error| error.to_string())?;
-    let decoded_with_managed_fields = if has_managed_fields {
-        decoded
-            .as_ref()
-            .map(serde_yaml::to_string)
-            .transpose()
-            .map_err(|error| error.to_string())?
-    } else {
-        None
-    };
+    let with_managed_fields = has_managed_fields.then(String::new);
+    let decoded_with_managed_fields = (has_managed_fields && decoded.is_some()).then(String::new);
     object.meta_mut().managed_fields = None;
     if let Some(decoded) = &mut decoded {
         decoded.meta_mut().managed_fields = None;
@@ -4965,7 +4992,7 @@ mod tests {
             name: "api-token".to_owned(),
         };
 
-        let yaml = yaml_content_from_object(object, &target).expect("secret yaml");
+        let yaml = yaml_content_from_object(object.clone(), &target).expect("secret yaml");
         assert!(yaml.body.contains("c2VjcmV0Cg=="));
         assert!(!yaml.body.contains("managedFields"));
         let decoded = yaml.decoded_body.expect("decoded body");
@@ -4973,9 +5000,13 @@ mod tests {
             serde_yaml::from_str(&decoded).expect("decoded yaml value");
         assert_eq!(decoded_value["data"]["token"], "secret\n");
         assert_eq!(decoded_value["data"]["binary"], "0x00ff10");
-        let decoded_managed = yaml
-            .decoded_with_managed_fields
-            .expect("decoded managed body");
+        assert_eq!(yaml.with_managed_fields.as_deref(), Some(""));
+        assert_eq!(yaml.decoded_with_managed_fields.as_deref(), Some(""));
+
+        let (managed, decoded_managed) =
+            managed_yaml_content_from_object(&object, &target).expect("managed-fields yaml");
+        assert!(managed.contains("managedFields"));
+        let decoded_managed = decoded_managed.expect("decoded managed body");
         assert!(decoded_managed.contains("managedFields"));
         assert!(decoded_managed.contains("0x00ff10"));
     }

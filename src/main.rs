@@ -6,7 +6,7 @@ use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::StreamExt;
 use kube::{Client, Config, config::KubeConfigOptions};
 use kux::{
-    app::{App, AppCommand, Overlay, PodShellTarget, ResourceTarget},
+    app::{ActionIntent, App, AppCommand, Overlay, PodShellTarget, ResourceTarget},
     cli::Cli,
     kubeconfig::{ContextCatalog, ContextInfo, fallback_contexts},
     model::ResourceSnapshot,
@@ -292,6 +292,7 @@ async fn handle_app_command(
             refresh_visible_port_forwards(app, port_forwards);
         }
         AppCommand::Action(action) => {
+            let keeps_overlay = matches!(&action, ActionIntent::ManagedYaml { .. });
             actions
                 .send(ActionRequest {
                     generation: app.generation,
@@ -299,7 +300,11 @@ async fn handle_app_command(
                 })
                 .await
                 .context("action worker stopped")?;
-            app.show_notice("Working…");
+            if keeps_overlay {
+                app.show_transient_notice("Loading managed fields…");
+            } else {
+                app.show_notice("Working…");
+            }
         }
         AppCommand::None => {}
     }
@@ -334,6 +339,11 @@ fn apply_action_result(app: &mut App, result: ActionResult) -> AppCommand {
             decoded_managed_fields,
             content,
         ),
+        ActionResult::ManagedYaml {
+            target,
+            body,
+            decoded_body,
+        } => app.show_managed_yaml(&target, body, decoded_body),
         ActionResult::NamespaceOptions {
             context,
             namespaces,
