@@ -89,14 +89,14 @@ persist resource snapshots to disk.
 ## On-demand actions
 
 UI intents for YAML, decoded Secret data, describe, logs, container enumeration, authorization
-policy resolution, resource/context deletion, and kill use a separate bounded channel. Network and
+policy and owner resolution, resource/context deletion, and kill use a separate bounded channel. Network and
 subprocess work runs in the source manager rather than the render loop. Content replaces the table
 inside the existing header/body layout and is retained only while that view is open. Initial YAML
 fetches strip managed fields and serialize only the compact object on the blocking pool. The first
 `m` loads and formats the managed-fields variant through a separate cancellable read; later toggles
 are local. Unwrapped content syntax-highlights and allocates only the visible terminal rows. Read
 actions carry the view generation and are cancelled when resource navigation changes, so a late
-YAML, log, container, policy, or child-discovery result cannot replace a newer resource view. Describe invokes
+YAML, log, container, policy, owner, or child-discovery result cannot replace a newer resource view. Describe invokes
 `kubectl describe` with explicit
 context, resource, and namespace arguments. Server version and namespace metadata refresh when
 contexts change. A normal resource delete uses background propagation after a Tab + Enter

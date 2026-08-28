@@ -637,7 +637,9 @@ fn resource_action_hints(app: &App) -> Vec<HeaderHint> {
             hints.push(action_hint("shift-f", "Port Forward"));
         }
     }
-    if app.selected_row().is_some_and(|row| row.owner.is_some()) {
+    if app.selected_row().is_some_and(|row| row.owner.is_some())
+        || app.kind.known_kind() == Some(ResourceKind::Nodes)
+    {
         hints.push(action_hint("shift-j", "Owner"));
     }
     if app.namespace.is_none() && app.kind.is_namespaced() {
@@ -3493,6 +3495,18 @@ mod tests {
             action_hints(&app)
                 .iter()
                 .any(|hint| hint.key == "ctrl-d" && hint.label == "Delete (1)")
+        );
+    }
+
+    #[test]
+    fn node_header_advertises_owner_navigation_before_metadata_is_hydrated() {
+        let mut app = app_with_rendered_pod();
+        app.kind = ResourceKind::Nodes.into();
+
+        assert!(
+            action_hints(&app)
+                .iter()
+                .any(|hint| hint.key == "shift-j" && hint.label == "Owner")
         );
     }
 

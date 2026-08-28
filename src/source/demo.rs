@@ -151,6 +151,10 @@ fn demo_action(action: ActionIntent) -> ActionResult {
         ActionIntent::FindChildResource { target, .. } => {
             ActionResult::NoChildResource { parent: target }
         }
+        ActionIntent::ResolveOwner { target } => ActionResult::Owner {
+            target,
+            owner: None,
+        },
     }
 }
 

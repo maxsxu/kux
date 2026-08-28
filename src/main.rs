@@ -38,29 +38,28 @@ async fn main() -> Result<()> {
     let (action_tx, action_rx) = mpsc::channel(16);
     let (action_result_tx, action_result_rx) = mpsc::channel(16);
 
-    let namespace;
-    let source_task;
-    if cli.demo {
-        namespace = if cli.all_namespaces || !cli.resource.is_namespaced() {
+    let (namespace, source_task) = if cli.demo {
+        let namespace = if cli.all_namespaces || !cli.resource.is_namespaced() {
             None
         } else {
             cli.namespace.clone()
         };
-        source_task = source::spawn_demo(
+        let source_task = source::spawn_demo(
             cli.demo_items,
             request_rx,
             snapshot_tx,
             action_rx,
             action_result_tx,
         );
+        (namespace, source_task)
     } else {
         let (client, default_namespace) = kubernetes_client(cli.context.as_deref()).await?;
-        namespace = if cli.all_namespaces || !cli.resource.is_namespaced() {
+        let namespace = if cli.all_namespaces || !cli.resource.is_namespaced() {
             None
         } else {
             Some(cli.namespace.clone().unwrap_or(default_namespace))
         };
-        source_task = source::spawn_kubernetes(
+        let source_task = source::spawn_kubernetes(
             client,
             KubernetesSettings {
                 initial_context: context_label.clone(),
@@ -72,7 +71,8 @@ async fn main() -> Result<()> {
             action_rx,
             action_result_tx,
         );
-    }
+        (namespace, source_task)
+    };
 
     let mut app = App::new(
         context_label,
@@ -364,6 +364,9 @@ fn apply_action_result(app: &mut App, result: ActionResult) -> AppCommand {
             owner_uid,
         } => return app.show_discovered_child(&parent, kind, &owner_uid),
         ActionResult::NoChildResource { parent } => app.show_no_discovered_child(&parent),
+        ActionResult::Owner { target, owner } => {
+            return app.show_resolved_owner(&target, owner);
+        }
         ActionResult::Containers { target, rows } => app.show_containers(target, rows),
         ActionResult::Policy {
             target,

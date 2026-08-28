@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, watch};
 use crate::{
     app::{ActionIntent, ResourceTarget},
     kubeconfig::ContextInfo,
-    model::{NamespaceInfo, ResourceDescriptor, ResourceRow, ResourceSnapshot},
+    model::{NamespaceInfo, OwnerReferenceData, ResourceDescriptor, ResourceRow, ResourceSnapshot},
 };
 
 pub use discovery::discover_resources;
@@ -78,6 +78,10 @@ pub enum ActionResult {
     },
     NoChildResource {
         parent: crate::app::ResourceTarget,
+    },
+    Owner {
+        target: ResourceTarget,
+        owner: Option<OwnerReferenceData>,
     },
     Containers {
         target: ResourceTarget,

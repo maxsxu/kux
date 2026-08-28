@@ -68,7 +68,7 @@ K9s key and reports that its backend is pending, and **planned** is not yet expo
 | Pod attach | `a` | Interaction; backend pending |
 | Edit any Kubernetes resource | `e` | Implemented from list, details, and YAML views through interactive `kubectl edit` with the active context and selected resource namespace; unavailable in read-only mode |
 | Port-forward list/start | `f`, `:pf`, `Shift-F` | Implemented for Pods and Services with declared TCP-port suggestions, editable local port/address, bounded `kubectl port-forward` subprocesses, a context-wide full-body list, and `Ctrl-D` stop; starting a forward is unavailable in read-only mode |
-| Owner navigation | `Shift-J` | Implemented through controller owner references and a server-side name selector |
+| Owner navigation | `Shift-J` | Implemented through controller owner references and a server-side name selector; rows without hydrated owner metadata, including Nodes owned by NodeClaims, resolve the selected object on demand |
 | Pod Node navigation | `o` | Implemented through the compact Pod `spec.nodeName` and a server-side Node name selector |
 | Service benchmark | `b` | Interaction; backend pending |
 | Cordon/uncordon and drain | `u`, `r` on Nodes | Cordon and uncordon use a guarded scheduling-state patch; drain includes editable grace period and timeout plus Ignore DaemonSets, Delete EmptyDir Data, Force, and Disable Eviction toggles; preflight safety checks run before cordon and evictions remain PDB-aware unless explicitly disabled |

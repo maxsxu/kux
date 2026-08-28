@@ -336,6 +336,9 @@ pub enum ActionIntent {
         target: ResourceTarget,
         resources: Vec<ResourceDescriptor>,
     },
+    ResolveOwner {
+        target: ResourceTarget,
+    },
     Restart {
         targets: Vec<ResourceTarget>,
     },
@@ -360,6 +363,7 @@ impl ActionIntent {
                 | Self::ContainerLogs { .. }
                 | Self::AuthorizationPolicy { .. }
                 | Self::FindChildResource { .. }
+                | Self::ResolveOwner { .. }
         )
     }
 }
@@ -712,6 +716,7 @@ pub struct App {
     pending_containers: Option<ResourceTarget>,
     pending_policy: Option<ResourceTarget>,
     pending_child: Option<(ResourceTarget, ResourceRow)>,
+    pending_owner: Option<ResourceTarget>,
     column_hitboxes: Vec<ColumnHitbox>,
     resource_rows_hitbox: ResourceRowsHitbox,
     chooser_hitbox: ChooserHitbox,
@@ -814,6 +819,7 @@ impl App {
             pending_containers: None,
             pending_policy: None,
             pending_child: None,
+            pending_owner: None,
             column_hitboxes: Vec::new(),
             resource_rows_hitbox: ResourceRowsHitbox::default(),
             chooser_hitbox: ChooserHitbox::default(),
@@ -2481,6 +2487,7 @@ impl App {
         self.pending_containers = None;
         self.pending_policy = None;
         self.pending_child = None;
+        self.pending_owner = None;
         self.details_row = None;
         self.body_query.clear();
         if resource_kind_changed {
@@ -2717,6 +2724,7 @@ impl App {
         if self.pending_containers.take().is_some()
             || self.pending_policy.take().is_some()
             || self.pending_child.take().is_some()
+            || self.pending_owner.take().is_some()
         {
             self.notice = None;
             return AppCommand::None;
@@ -3146,21 +3154,49 @@ impl App {
         if !self.is_resource_view() {
             return self.unsupported("Synthetic rows do not have Kubernetes owners");
         }
-        let Some((namespace, owner)) = self.selected_row().and_then(|row| {
+        if let Some((namespace, owner)) = self.selected_row().and_then(|row| {
             row.owner
                 .as_ref()
                 .map(|owner| (row.namespace.to_string(), owner.clone()))
-        }) else {
+        }) {
+            return self.open_owner_reference((namespace != "-").then_some(namespace), &owner);
+        }
+        let Some(target) = self.selected_target() else {
+            return AppCommand::None;
+        };
+        self.pending_owner = Some(target.clone());
+        AppCommand::Action(ActionIntent::ResolveOwner { target })
+    }
+
+    pub fn show_resolved_owner(
+        &mut self,
+        target: &ResourceTarget,
+        owner: Option<OwnerReferenceData>,
+    ) -> AppCommand {
+        if self.pending_owner.as_ref() != Some(target) {
+            return AppCommand::None;
+        }
+        self.pending_owner = None;
+        self.notice = None;
+        let Some(owner) = owner else {
             return self.unsupported("Selected resource has no owner");
         };
-        let Some(kind) = self.owner_kind(&owner) else {
+        self.open_owner_reference(target.namespace.clone(), &owner)
+    }
+
+    fn open_owner_reference(
+        &mut self,
+        namespace: Option<String>,
+        owner: &OwnerReferenceData,
+    ) -> AppCommand {
+        let Some(kind) = self.owner_kind(owner) else {
             let message = format!(
                 "Owner kind {}/{} is not available in discovery",
                 owner.api_version, owner.kind
             );
             return self.unsupported(&message);
         };
-        let namespace = (kind.is_namespaced() && namespace != "-").then_some(namespace);
+        let namespace = namespace.filter(|_| kind.is_namespaced());
         self.request_view(
             ViewState {
                 context: self.context.clone(),
@@ -3949,7 +3985,7 @@ mod tests {
     use super::*;
     use crate::{
         kubeconfig::ContextInfo,
-        model::{NamespaceInfo, PodData},
+        model::{NamespaceInfo, NodeData, PodData},
     };
 
     fn context(
@@ -4737,14 +4773,57 @@ mod tests {
     #[test]
     fn shift_j_reports_rows_without_an_owner() {
         let mut app = app_with_rows();
-
-        assert_eq!(
-            app.handle_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT)),
-            AppCommand::None
-        );
+        let AppCommand::Action(ActionIntent::ResolveOwner { target }) =
+            app.handle_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT))
+        else {
+            panic!("owner lookup should inspect rows without hydrated metadata");
+        };
+        assert_eq!(app.show_resolved_owner(&target, None), AppCommand::None);
         assert_eq!(
             app.notice.as_deref(),
             Some("Selected resource has no owner")
+        );
+    }
+
+    #[test]
+    fn shift_j_resolves_a_cluster_scoped_node_owner_on_demand() {
+        let node_claim = descriptor(
+            "karpenter.sh",
+            "v1",
+            "karpenter.sh/v1",
+            "NodeClaim",
+            "nodeclaims",
+            false,
+        );
+        let row = ResourceRow::new("-", "worker-0", "Ready", "worker", "v1.34.0", 0)
+            .with_node_data(NodeData::default());
+        let mut app = app_with_descriptor(ResourceKind::Nodes.into(), None, row);
+        app.resource_options.push(node_claim.clone());
+
+        let AppCommand::Action(ActionIntent::ResolveOwner { target }) =
+            app.handle_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT))
+        else {
+            panic!("Node owner should be resolved from the API");
+        };
+        assert_eq!(target.kind.known_kind(), Some(ResourceKind::Nodes));
+        assert_eq!(target.namespace, None);
+        assert_eq!(
+            app.show_resolved_owner(
+                &target,
+                Some(OwnerReferenceData {
+                    api_version: Arc::from("karpenter.sh/v1"),
+                    kind: Arc::from("NodeClaim"),
+                    name: Arc::from("worker-0-claim"),
+                    uid: Arc::from("nodeclaim-worker-0"),
+                }),
+            ),
+            AppCommand::Request(ViewState {
+                context: "demo".to_owned(),
+                kind: node_claim,
+                namespace: None,
+                field_selector: Some("metadata.name=worker-0-claim".to_owned()),
+                label_selector: None,
+            })
         );
     }
 

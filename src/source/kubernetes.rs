@@ -411,6 +411,7 @@ async fn handle_action(client: Client, context: &str, action: ActionIntent) -> A
         ActionIntent::FindChildResource { target, resources } => {
             find_child_resource(client, target, resources).await
         }
+        ActionIntent::ResolveOwner { target } => resolve_owner(client, target).await,
         ActionIntent::Restart { targets } => restart_workloads(client, targets).await,
         ActionIntent::SetNodeUnschedulable {
             name,
@@ -419,6 +420,17 @@ async fn handle_action(client: Client, context: &str, action: ActionIntent) -> A
         ActionIntent::DrainNode { name, options } => drain_node(client, &name, options).await,
     };
     result.unwrap_or_else(ActionResult::Error)
+}
+
+async fn resolve_owner(client: Client, target: ResourceTarget) -> Result<ActionResult, String> {
+    let object = dynamic_target_api(client, &target)?
+        .get(&target.name)
+        .await
+        .map_err(|error| format!("Unable to inspect {}: {error}", resource_identity(&target)))?;
+    Ok(ActionResult::Owner {
+        target,
+        owner: owner_reference_data(object.meta()),
+    })
 }
 
 async fn find_child_resource(
@@ -4288,7 +4300,16 @@ mod tests {
         let mut node: Node = serde_json::from_value(serde_json::json!({
             "apiVersion": "v1",
             "kind": "Node",
-            "metadata": { "name": "worker-0" },
+            "metadata": {
+                "name": "worker-0",
+                "ownerReferences": [{
+                    "apiVersion": "karpenter.sh/v1",
+                    "kind": "NodeClaim",
+                    "name": "worker-0-claim",
+                    "uid": "nodeclaim-worker-0",
+                    "controller": true
+                }]
+            },
             "spec": { "unschedulable": true },
             "status": {
                 "conditions": [{
@@ -4321,6 +4342,10 @@ mod tests {
                 .node_data()
                 .is_some_and(|data| data.unschedulable)
         );
+        let owner = node_row(&node).owner.expect("NodeClaim owner");
+        assert_eq!(owner.api_version.as_ref(), "karpenter.sh/v1");
+        assert_eq!(owner.kind.as_ref(), "NodeClaim");
+        assert_eq!(owner.name.as_ref(), "worker-0-claim");
         node.status
             .as_mut()
             .and_then(|status| status.conditions.as_mut())
