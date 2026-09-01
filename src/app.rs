@@ -2044,7 +2044,12 @@ impl App {
             KeyCode::Char('c')
                 if matches!(
                     self.content_kind,
-                    Some(ContentKind::Yaml | ContentKind::SecretData)
+                    Some(
+                        ContentKind::Yaml
+                            | ContentKind::SecretData
+                            | ContentKind::Logs
+                            | ContentKind::PreviousLogs
+                    )
                 ) =>
             {
                 AppCommand::Copy(self.active_content_body().to_owned())
@@ -6042,6 +6047,21 @@ mod tests {
         app.show_transient_notice("YAML copied to clipboard");
         assert_eq!(app.overlay, Overlay::Content);
         assert_eq!(app.notice.as_deref(), Some("YAML copied to clipboard"));
+    }
+
+    #[test]
+    fn current_and_previous_logs_copy_the_raw_content() {
+        for content in [ContentKind::Logs, ContentKind::PreviousLogs] {
+            let mut app = app_with_rows();
+            let body = "2026-09-01T01:02:03Z INFO started\nplain second line";
+            app.show_content("Logs(prod/api-0)", body, None, None, None, content);
+
+            assert_eq!(
+                app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+                AppCommand::Copy(body.to_owned())
+            );
+            assert_eq!(app.overlay, Overlay::Content);
+        }
     }
 
     #[test]

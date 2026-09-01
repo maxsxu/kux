@@ -541,7 +541,12 @@ fn content_action_hints(app: &App) -> Vec<HeaderHint> {
     let mut hints = vec![action_hint("esc", "Back")];
     if matches!(
         app.content_kind,
-        Some(ContentKind::Yaml | ContentKind::SecretData)
+        Some(
+            ContentKind::Yaml
+                | ContentKind::SecretData
+                | ContentKind::Logs
+                | ContentKind::PreviousLogs
+        )
     ) {
         hints.push(action_hint("c", "Copy"));
     }
@@ -1553,6 +1558,7 @@ const HELP_CATEGORIES: &[HelpCategory] = &[
             ("Ctrl-Space", "Mark range"),
             ("Ctrl-\\", "Clear marks"),
             ("c / n", "Copy name / namespace"),
+            ("c in content", "Copy YAML / Secret data / logs"),
             ("y / d / e", "YAML / describe / edit"),
             ("l / p", "Logs / previous logs"),
             ("o on Pods", "Open the Pod's Node"),
@@ -3723,6 +3729,31 @@ mod tests {
         let rendered = rendered_lines(&terminal, 120).join("\n");
         assert!(rendered.contains("token: secret"));
         assert!(rendered.contains("Secret values decoded"));
+    }
+
+    #[test]
+    fn logs_header_advertises_copy() {
+        let mut app = App::new(
+            "demo",
+            Some("default".to_owned()),
+            ResourceKind::Pods,
+            false,
+            vec!["demo".to_owned()],
+        );
+        app.show_content(
+            "Logs(default/api-0)",
+            "INFO started",
+            None,
+            None,
+            None,
+            ContentKind::Logs,
+        );
+
+        assert!(
+            action_hints(&app)
+                .iter()
+                .any(|hint| hint.key == "c" && hint.label == "Copy")
+        );
     }
 
     #[test]

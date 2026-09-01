@@ -173,7 +173,7 @@ The header always shows the actions available in the current view. These are the
 | `e` | Edit the selected resource from its list, details, or YAML view with `kubectl edit` |
 | `l`, `p` | Colorized current and previous logs for the resolved Pod/container |
 | `o` on Pods | Jump to the Pod's assigned Node |
-| `c`, `n` | Copy resource name or namespace |
+| `c`, `n` | Copy resource name or namespace; `c` copies raw content in YAML, Secret-data, and log views |
 | `x` on Secret | Open decoded data only; in YAML, toggle decoded values |
 | `Space`, `Ctrl-Space`, `Ctrl-\` | Mark one, mark a range, clear marks |
 | Left-click a row | Select that resource without changing marked resources |

@@ -6,7 +6,7 @@ use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::StreamExt;
 use kube::{Client, Config, config::KubeConfigOptions};
 use kux::{
-    app::{ActionIntent, App, AppCommand, Overlay, PodShellTarget, ResourceTarget},
+    app::{ActionIntent, App, AppCommand, ContentKind, Overlay, PodShellTarget, ResourceTarget},
     cli::Cli,
     kubeconfig::{ContextCatalog, ContextInfo, fallback_contexts},
     model::ResourceSnapshot,
@@ -379,14 +379,22 @@ fn apply_action_result(app: &mut App, result: ActionResult) -> AppCommand {
 }
 
 fn handle_copy(app: &mut App, terminal: &mut TerminalGuard, value: &str) {
-    let message = if app.overlay == Overlay::Content {
-        "YAML copied to clipboard"
-    } else {
-        "Copied to clipboard"
-    };
+    let message = copy_success_message(app);
     match terminal.copy_to_clipboard(value) {
         Ok(()) => app.show_transient_notice(message),
         Err(error) => app.show_transient_notice(format!("Copy failed: {error}")),
+    }
+}
+
+fn copy_success_message(app: &App) -> &'static str {
+    match (app.overlay, app.content_kind) {
+        (Overlay::Content, Some(ContentKind::Yaml | ContentKind::SecretData)) => {
+            "YAML copied to clipboard"
+        }
+        (Overlay::Content, Some(ContentKind::Logs | ContentKind::PreviousLogs)) => {
+            "Logs copied to clipboard"
+        }
+        _ => "Copied to clipboard",
     }
 }
 
@@ -497,7 +505,9 @@ mod tests {
         source::ActionResult,
     };
 
-    use super::{apply_action_result, edit_args, pod_shell_args, pod_shell_banner};
+    use super::{
+        apply_action_result, copy_success_message, edit_args, pod_shell_args, pod_shell_banner,
+    };
 
     fn target(group: &str, kind: &str, plural: &str, namespace: Option<&str>) -> ResourceTarget {
         ResourceTarget {
@@ -550,6 +560,27 @@ mod tests {
         apply_action_result(&mut app, yaml_result(2));
         assert_eq!(app.overlay, Overlay::Content);
         assert_eq!(app.content_body, "kind: Application");
+    }
+
+    #[test]
+    fn log_copy_uses_a_content_specific_confirmation() {
+        let mut app = App::new(
+            "production",
+            None,
+            ResourceKind::Pods,
+            false,
+            vec!["production".to_owned()],
+        );
+        app.show_content(
+            "Logs(default/api-0)",
+            "INFO started",
+            None,
+            None,
+            None,
+            ContentKind::Logs,
+        );
+
+        assert_eq!(copy_success_message(&app), "Logs copied to clipboard");
     }
 
     #[test]

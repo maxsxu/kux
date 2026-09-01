@@ -57,7 +57,7 @@ K9s key and reports that its backend is pending, and **planned** is not yet expo
 
 | Interaction | Key | Status |
 | --- | --- | --- |
-| Pod/container logs/previous logs | `l`, `p` | Implemented, last 500 lines; Pod actions resolve and pass the selected default container for both current and previous requests, and timestamps/severity levels are colorized without changing the raw content |
+| Pod/container logs/previous logs | `l`, `p`, then `c` to copy | Implemented, last 500 lines; Pod actions resolve and pass the selected default container for both current and previous requests, timestamps/severity levels are colorized without changing the raw content, and copy preserves that raw content |
 | Copy YAML/toggle managed fields | `c`, `m` in YAML | Implemented; copy uses the visible variant |
 | Search YAML without hiding context | `/query`, then `n`/`Shift-N` in YAML | Implemented; keeps the full document, highlights matches, and scrolls between matching lines |
 | Copy decoded Secret data | `c` in Secret data view | Implemented; copies the data-only body |
