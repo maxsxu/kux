@@ -342,7 +342,9 @@ async fn run_watch(
         None => {
             let api = dynamic_api(client.clone(), &request.kind, request.namespace.as_deref());
             if request.kind.is_api_service() && request.kind.operations.watchable() {
-                watch_api(api, client, settings, request, snapshots, dynamic_row).await;
+                // List items may omit TypeMeta. The requested resource, not each
+                // object's kind/apiVersion, determines the APIService projection.
+                watch_api(api, client, settings, request, snapshots, api_service_row).await;
             } else if request.kind.operations.watchable() {
                 watch_table_api(api, client, settings, request, snapshots).await;
             } else {
@@ -4937,10 +4939,8 @@ mod tests {
     }
 
     #[test]
-    fn projects_local_and_remote_api_services_to_k9s_columns() {
+    fn projects_api_service_list_items_without_type_meta_like_kubectl() {
         let local: DynamicObject = serde_json::from_value(serde_json::json!({
-            "apiVersion": "apiregistration.k8s.io/v1",
-            "kind": "APIService",
             "metadata": {
                 "name": "v1.",
                 "creationTimestamp": "2024-01-01T00:00:00Z"
@@ -4951,7 +4951,7 @@ mod tests {
             }
         }))
         .expect("local APIService");
-        let row = dynamic_row(&local);
+        let row = api_service_row(&local);
         assert_eq!(row.namespace.as_ref(), "-");
         assert_eq!(row.name.as_ref(), "v1.");
         assert_eq!(row.ready.as_ref(), "Local");
@@ -4959,8 +4959,6 @@ mod tests {
         assert_eq!(row.created_unix, 1_704_067_200);
 
         let remote: DynamicObject = serde_json::from_value(serde_json::json!({
-            "apiVersion": "apiregistration.k8s.io/v1",
-            "kind": "APIService",
             "metadata": {"name": "v1beta1.metrics.k8s.io"},
             "spec": {
                 "service": {"namespace": "kube-system", "name": "metrics-server"}
@@ -4974,19 +4972,17 @@ mod tests {
             }
         }))
         .expect("remote APIService");
-        let row = dynamic_row(&remote);
+        let row = api_service_row(&remote);
         assert_eq!(row.name.as_ref(), "v1beta1.metrics.k8s.io");
         assert_eq!(row.ready.as_ref(), "kube-system/metrics-server");
         assert_eq!(row.status.as_ref(), "False (MissingEndpoints)");
 
         let unknown: DynamicObject = serde_json::from_value(serde_json::json!({
-            "apiVersion": "apiregistration.k8s.io/v1",
-            "kind": "APIService",
             "metadata": {"name": "v1.example.io"},
             "spec": {"service": null}
         }))
         .expect("APIService without a condition");
-        let row = dynamic_row(&unknown);
+        let row = api_service_row(&unknown);
         assert_eq!(row.ready.as_ref(), "Local");
         assert_eq!(row.status.as_ref(), "Unknown");
     }
@@ -5807,6 +5803,87 @@ mod tests {
             .timestamp_unix,
             Some(3_600)
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires KUX_LIVE_CONTEXT and access to a Kubernetes cluster"]
+    async fn live_api_service_watch_values_match_kubectl() {
+        let context = std::env::var("KUX_LIVE_CONTEXT").expect("KUX_LIVE_CONTEXT");
+        let output = tokio::process::Command::new("kubectl")
+            .args(["--context", &context, "get", "apiservice", "--no-headers"])
+            .output()
+            .await
+            .expect("kubectl APIService list");
+        assert!(output.status.success());
+        let expected: Vec<_> = String::from_utf8(output.stdout)
+            .expect("kubectl text")
+            .lines()
+            .map(|line| {
+                let cells: Vec<_> = line.split_whitespace().collect();
+                (
+                    cells[0].to_owned(),
+                    cells[1].to_owned(),
+                    cells[2..cells.len() - 1].join(" "),
+                )
+            })
+            .collect();
+        assert!(!expected.is_empty());
+        let kind = ResourceDescriptor::new(
+            "apiregistration.k8s.io",
+            "v1",
+            "apiregistration.k8s.io/v1",
+            "APIService",
+            "apiservices",
+            false,
+            crate::model::ResourceOperations::all(),
+        );
+        let request = WatchRequest {
+            generation: 1,
+            context: context.clone(),
+            kind: kind.clone(),
+            namespace: None,
+            field_selector: None,
+            label_selector: None,
+        };
+        let (snapshots, mut receiver) = watch::channel(ResourceSnapshot::loading(1, kind));
+        let client = client_for_context(&context)
+            .await
+            .expect("Kubernetes client");
+        let task = tokio::spawn(run_watch(
+            client,
+            KubernetesSettings {
+                initial_context: context,
+                publish_interval: Duration::from_millis(100),
+                streaming_lists: false,
+            },
+            request,
+            snapshots,
+        ));
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                receiver.changed().await.expect("APIService watch active");
+                let snapshot = receiver.borrow_and_update().clone();
+                // Table bootstrap must have been replaced by the completed object list.
+                if snapshot.state == SourceState::Ready
+                    && snapshot.rows.iter().all(|row| row.table_cells.is_empty())
+                {
+                    return snapshot;
+                }
+            }
+        })
+        .await;
+        task.abort();
+        let snapshot = result.expect("completed APIService list within 30 seconds");
+        assert_eq!(snapshot.rows.len(), expected.len());
+        for (name, service, available) in expected {
+            let row = snapshot
+                .rows
+                .iter()
+                .find(|row| row.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("missing APIService {name}"));
+            assert_eq!(row.ready.as_ref(), service, "{name} SERVICE");
+            assert_eq!(row.status.as_ref(), available, "{name} AVAILABLE");
+        }
     }
 
     #[tokio::test]
