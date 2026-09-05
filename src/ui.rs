@@ -15,7 +15,7 @@ use crate::{
         PORT_FORWARD_CANCEL_FIELD, PORT_FORWARD_LOCAL_FIELD, PORT_FORWARD_OK_FIELD,
         PORT_FORWARD_REMOTE_FIELD, PendingDelete, PortForwardDialog, SortField,
     },
-    model::{ResourceKind, SourceState, format_age},
+    model::{ResourceKind, SourceState, format_age, format_kubectl_age},
 };
 
 const CYAN: Color = Color::Rgb(139, 233, 253);
@@ -712,6 +712,7 @@ struct ViewColumn {
     field: Option<SortField>,
     table_index: Option<usize>,
     table_age: bool,
+    kubectl_age: bool,
     width: Constraint,
     visible_from: u16,
 }
@@ -727,6 +728,7 @@ fn view_column(
         field: Some(field),
         table_index: None,
         table_age: false,
+        kubectl_age: false,
         width,
         visible_from,
     }
@@ -738,6 +740,7 @@ fn columns_for_view(app: &App, width: u16) -> Vec<ViewColumn> {
         field: None,
         table_index: None,
         table_age: false,
+        kubectl_age: false,
         width: Constraint::Length(2),
         visible_from: 0,
     }];
@@ -758,7 +761,7 @@ fn columns_for_view(app: &App, width: u16) -> Vec<ViewColumn> {
     } else if app.is_container_view() {
         container_columns()
     } else if app.kind.is_api_service() {
-        api_service_columns()
+        api_service_columns(app)
     } else if !app.snapshot.table_columns.is_empty() {
         server_table_columns(app, show_namespace)
     } else {
@@ -833,6 +836,7 @@ fn server_table_columns(app: &App, namespace_already_shown: bool) -> Vec<ViewCol
                 field,
                 table_index: Some(index),
                 table_age,
+                kubectl_age: false,
                 width,
                 visible_from: 0,
             }
@@ -847,12 +851,44 @@ fn is_created_at_column(name: &str) -> bool {
     )
 }
 
-fn api_service_columns() -> Vec<ViewColumn> {
+fn api_service_columns(app: &App) -> Vec<ViewColumn> {
+    let service_width = app
+        .snapshot
+        .rows
+        .iter()
+        .take(200)
+        .map(|row| row.ready.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("SERVICE".len())
+        .clamp(7, 48);
+    let available_width = app
+        .snapshot
+        .rows
+        .iter()
+        .take(200)
+        .map(|row| row.status.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("AVAILABLE".len())
+        .clamp(9, 32);
+    let mut age = view_column("AGE", SortField::Age, Constraint::Length(10), 38);
+    age.kubectl_age = true;
     vec![
         view_column("NAME", SortField::Name, Constraint::Fill(5), 0),
-        view_column("SERVICE", SortField::Ready, Constraint::Fill(4), 0),
-        view_column("AVAILABLE", SortField::Status, Constraint::Fill(3), 0),
-        view_column("AGE", SortField::Age, Constraint::Length(10), 38),
+        view_column(
+            "SERVICE",
+            SortField::Ready,
+            Constraint::Length(u16::try_from(service_width).unwrap_or(48)),
+            0,
+        ),
+        view_column(
+            "AVAILABLE",
+            SortField::Status,
+            Constraint::Length(u16::try_from(available_width).unwrap_or(32)),
+            0,
+        ),
+        age,
     ]
 }
 
@@ -1096,7 +1132,9 @@ fn resource_cell(
     now_unix: i64,
     filter_matcher: &FilterMatcher,
 ) -> Cell<'static> {
-    let value = if let Some(index) = column.table_index {
+    let value = if column.kubectl_age {
+        format_kubectl_age(row.age_seconds(now_unix))
+    } else if let Some(index) = column.table_index {
         table_column_value(row, index, column.table_age, now_unix)
     } else if let Some(field) = column.field {
         column_value(row, field, now_unix)
@@ -4356,11 +4394,18 @@ mod tests {
             vec!["demo".to_owned()],
         );
         app.kind = api_service.clone();
+        let age_seconds = (4 * 365 + 194) * 86_400;
+        app.now_unix = 1_000 + age_seconds;
         app.apply_snapshot(ResourceSnapshot {
             generation: app.generation,
             kind: api_service,
             rows: Arc::new(vec![Arc::new(ResourceRow::new(
-                "-", "v1.", "True", "Local", "", 0,
+                "-",
+                "v1alpha2.cloud.streamnative.io",
+                "True",
+                "sn-system/cloud-api-server-apiservice",
+                "",
+                1_000,
             ))]),
             table_columns: Arc::from([]),
             state: SourceState::Ready,
@@ -4382,9 +4427,10 @@ mod tests {
             .expect("draw APIService view");
         let rendered = rendered_lines(&terminal, 120).join("\n");
         assert!(rendered.contains("apiservices(all)[1]"));
-        assert!(rendered.contains("v1."));
-        assert!(rendered.contains("Local"));
+        assert!(rendered.contains("v1alpha2.cloud.streamnative.io"));
+        assert!(rendered.contains("sn-system/cloud-api-server-apiservice"));
         assert!(rendered.contains("True"));
+        assert!(rendered.contains("4y194d"));
         assert!(!rendered.contains("NAMESPACE"));
     }
 

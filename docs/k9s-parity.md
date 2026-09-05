@@ -49,7 +49,7 @@ K9s key and reports that its backend is pending, and **planned** is not yet expo
 | Workload → owned children | `Enter` on Deployment/ReplicaSet/StatefulSet/DaemonSet | Implemented with server-side label selectors; selector-backed Services also open Pods |
 | Pod → containers | `Enter` on Pod | Implemented for regular, init, and ephemeral containers |
 | Container → logs | `Enter` on container | Implemented with explicit container selection |
-| APIService status table | `:apiservice` | Implemented with `NAME`, `SERVICE`, `AVAILABLE`, and `AGE` |
+| APIService status table | `:apiservice` | Implemented with kubectl-compatible `NAME`, `SERVICE`, `AVAILABLE`, and `AGE` values from both progressive Table rows and watched objects |
 | ServiceAccount effective rules | `Enter` on ServiceAccount | Implemented by matching RoleBindings and ClusterRoleBindings and resolving referenced roles |
 | RBAC rule view | `Enter` on Role/ClusterRole/RoleBinding/ClusterRoleBinding | Implemented as a resource, API group, binding, and verb matrix |
 

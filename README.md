@@ -106,7 +106,7 @@ and scrolls directly to the first matching line; `n` and `Shift-N` continue thro
 | --- | --- |
 | Pods | `READY`, `STATUS`, restarts, CPU and memory usage versus requests/limits, node, age |
 | Nodes | status, taint count, version, pod count, CPU/memory usage and allocatable capacity |
-| APIService | backing service, Available condition, and age for local and aggregated APIs |
+| APIService | kubectl-compatible `NAME`, `SERVICE`, `AVAILABLE`, and `AGE`, including `Local` services and compound multi-year ages |
 | ServiceAccount and RBAC | resource/API group, binding source, and the full verb matrix |
 | Secrets | encoded YAML toggle or decoded `data`-only view; values never enter the list cache |
 | Any discovered resource | sortable metadata view, formatted YAML, real describe output, and filters |

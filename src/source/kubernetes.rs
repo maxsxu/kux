@@ -3363,8 +3363,12 @@ fn server_table_row(row: ServerTableRow, columns: &[TableColumn]) -> ResourceRow
         .filter(|name| !name.is_empty())
         .or_else(|| column_text("name"))
         .unwrap_or_else(|| "<unknown>".to_owned());
-    let status = column_text("status").unwrap_or_else(|| "-".to_owned());
-    let ready = column_text("ready").unwrap_or_else(|| "-".to_owned());
+    let status = column_text("status")
+        .or_else(|| column_text("available"))
+        .unwrap_or_else(|| "-".to_owned());
+    let ready = column_text("ready")
+        .or_else(|| column_text("service"))
+        .unwrap_or_else(|| "-".to_owned());
     let details = column_text("details").unwrap_or_else(|| "-".to_owned());
     let created_unix = object
         .as_ref()
@@ -5344,6 +5348,45 @@ mod tests {
         assert!(query.contains("limit=250"));
         assert!(query.contains("includeObject=Metadata"));
         assert!(!query.contains("includeObject=Object"));
+    }
+
+    #[test]
+    fn kubernetes_table_projects_apiservice_service_and_availability() {
+        let page = decode_table_list(serde_json::json!({
+            "kind": "Table",
+            "apiVersion": "meta.k8s.io/v1",
+            "metadata": {"resourceVersion": "42"},
+            "columnDefinitions": [
+                {"name": "Name", "format": "name", "priority": 0},
+                {"name": "Service", "format": "string", "priority": 0},
+                {"name": "Available", "format": "string", "priority": 0},
+                {"name": "Age", "format": "string", "priority": 0}
+            ],
+            "rows": [{
+                "cells": [
+                    "v1alpha2.cloud.streamnative.io",
+                    "sn-system/cloud-api-server-apiservice",
+                    "True",
+                    "4y194d"
+                ],
+                "object": {
+                    "apiVersion": "meta.k8s.io/v1",
+                    "kind": "PartialObjectMetadata",
+                    "metadata": {
+                        "name": "v1alpha2.cloud.streamnative.io",
+                        "resourceVersion": "42",
+                        "creationTimestamp": "2021-01-01T00:00:00Z"
+                    }
+                }
+            }]
+        }))
+        .expect("APIService table");
+
+        let row = page.rows.first().expect("APIService row");
+        assert_eq!(row.name.as_ref(), "v1alpha2.cloud.streamnative.io");
+        assert_eq!(row.ready.as_ref(), "sn-system/cloud-api-server-apiservice");
+        assert_eq!(row.status.as_ref(), "True");
+        assert_eq!(row.created_unix, 1_609_459_200);
     }
 
     #[test]

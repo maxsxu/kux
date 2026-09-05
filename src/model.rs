@@ -809,6 +809,62 @@ pub fn format_age(total_seconds: u64) -> String {
     }
 }
 
+#[must_use]
+pub fn format_kubectl_age(total_seconds: u64) -> String {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+
+    if total_seconds < 2 * MINUTE {
+        return format!("{total_seconds}s");
+    }
+    let minutes = total_seconds / MINUTE;
+    if minutes < 10 {
+        let seconds = total_seconds % MINUTE;
+        return if seconds == 0 {
+            format!("{minutes}m")
+        } else {
+            format!("{minutes}m{seconds}s")
+        };
+    }
+    if minutes < 3 * 60 {
+        return format!("{minutes}m");
+    }
+    let hours = total_seconds / HOUR;
+    if hours < 8 {
+        let minutes = minutes % 60;
+        return if minutes == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h{minutes}m")
+        };
+    }
+    if hours < 48 {
+        return format!("{hours}h");
+    }
+    if hours < 24 * 8 {
+        let days = hours / 24;
+        let hours = hours % 24;
+        return if hours == 0 {
+            format!("{days}d")
+        } else {
+            format!("{days}d{hours}h")
+        };
+    }
+    if hours < 24 * 365 * 2 {
+        return format!("{}d", hours / 24);
+    }
+    if hours < 24 * 365 * 8 {
+        let years = hours / 24 / 365;
+        let days = hours / 24 % 365;
+        return if days == 0 {
+            format!("{years}y")
+        } else {
+            format!("{years}y{days}d")
+        };
+    }
+    format!("{}y", hours / 24 / 365)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -819,6 +875,19 @@ mod tests {
         assert_eq!(format_age(120), "2m");
         assert_eq!(format_age(7_200), "2h");
         assert_eq!(format_age(172_800), "2d");
+    }
+
+    #[test]
+    fn formats_ages_like_kubectl_human_duration() {
+        assert_eq!(format_kubectl_age(42), "42s");
+        assert_eq!(format_kubectl_age(120), "2m");
+        assert_eq!(format_kubectl_age(125), "2m5s");
+        assert_eq!(format_kubectl_age(7_200), "120m");
+        assert_eq!(format_kubectl_age(12_780), "3h33m");
+        assert_eq!(format_kubectl_age(172_800), "2d");
+        assert_eq!(format_kubectl_age(183_600), "2d3h");
+        assert_eq!(format_kubectl_age(718 * 86_400), "718d");
+        assert_eq!(format_kubectl_age((4 * 365 + 194) * 86_400), "4y194d");
     }
 
     #[test]
