@@ -48,6 +48,7 @@ use crate::{
 
 use super::{
     ActionRequest, ActionResult, KubernetesSettings, WatchRequest, discovery::discover_resources,
+    logs::LogTask,
 };
 
 struct PodWatchCache {
@@ -125,9 +126,11 @@ pub async fn run_manager(
     let mut active_request: Option<WatchRequest> = None;
     let mut running: Option<tokio::task::JoinHandle<()>> = None;
     let mut running_read_action: Option<tokio::task::JoinHandle<()>> = None;
+    let mut running_logs: Option<LogTask> = None;
     loop {
         tokio::select! {
             Some(request) = requests.recv() => {
+                running_logs.take();
                 if let Some(task) = running_read_action.take() {
                     task.abort();
                 }
@@ -183,19 +186,14 @@ pub async fn run_manager(
                 }
             }
             Some(action) = actions.recv() => {
-                let cancelable = action.intent.cancelable_read();
-                let task = spawn_action_task(
+                dispatch_action(
                     client.clone(),
                     active_context.clone(),
                     action,
                     action_results.clone(),
-                    cancelable,
+                    &mut running_read_action,
+                    &mut running_logs,
                 );
-                if cancelable
-                    && let Some(previous) = running_read_action.replace(task)
-                {
-                    previous.abort();
-                }
             }
             () = snapshots.closed() => break,
             else => break,
@@ -206,6 +204,40 @@ pub async fn run_manager(
     }
     if let Some(task) = running_read_action {
         task.abort();
+    }
+}
+
+fn dispatch_action(
+    client: Client,
+    context: String,
+    action: ActionRequest,
+    results: mpsc::Sender<ActionResult>,
+    running_read: &mut Option<tokio::task::JoinHandle<()>>,
+    running_logs: &mut Option<LogTask>,
+) {
+    match &action.intent {
+        ActionIntent::StartLogs { request } => {
+            if let Some(task) = running_read.take() {
+                task.abort();
+            }
+            *running_logs = Some(LogTask::spawn(
+                client,
+                action.generation,
+                request.clone(),
+                results,
+            ));
+        }
+        ActionIntent::StopLogs { id } => LogTask::stop_if_matching(running_logs, *id),
+        _ => {
+            let cancelable = action.intent.cancelable_read();
+            if cancelable {
+                running_logs.take();
+            }
+            let task = spawn_action_task(client, context, action, results, cancelable);
+            if cancelable && let Some(previous) = running_read.replace(task) {
+                previous.abort();
+            }
+        }
     }
 }
 
@@ -406,6 +438,9 @@ async fn handle_action(client: Client, context: &str, action: ActionIntent) -> A
         ActionIntent::Containers { target } => load_containers(client, target).await,
         ActionIntent::ContainerLogs { target, previous } => {
             fetch_container_logs(client, target, previous).await
+        }
+        ActionIntent::StartLogs { .. } | ActionIntent::StopLogs { .. } => {
+            Err("Log sessions are handled by the source manager".to_owned())
         }
         ActionIntent::AuthorizationPolicy { target } => {
             load_authorization_policy(client, target).await

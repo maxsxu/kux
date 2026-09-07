@@ -11,7 +11,7 @@ use crate::{
     },
 };
 
-use super::{ActionRequest, ActionResult, WatchRequest};
+use super::{ActionRequest, ActionResult, WatchRequest, logs::LogTask};
 
 pub async fn run_manager(
     item_count: usize,
@@ -32,9 +32,11 @@ pub async fn run_manager(
         .send(ActionResult::ServerVersion("v1.32.0-demo".to_owned()))
         .await;
     let mut running: Option<tokio::task::JoinHandle<()>> = None;
+    let mut running_logs: Option<LogTask> = None;
     loop {
         tokio::select! {
             Some(request) = requests.recv() => {
+                running_logs.take();
                 if let Some(task) = running.take() {
                     task.abort();
                 }
@@ -61,7 +63,25 @@ pub async fn run_manager(
                 }));
             }
             Some(action) = actions.recv() => {
+                match &action.intent {
+                    ActionIntent::StartLogs { request } => {
+                        running_logs = Some(LogTask::spawn_demo(
+                            action.generation,
+                            request.clone(),
+                            action_results.clone(),
+                        ));
+                        continue;
+                    }
+                    ActionIntent::StopLogs { id } => {
+                        LogTask::stop_if_matching(&mut running_logs, *id);
+                        continue;
+                    }
+                    _ => {}
+                }
                 let scoped = action.intent.cancelable_read();
+                if scoped {
+                    running_logs.take();
+                }
                 let result = demo_action(action.intent);
                 let result = if scoped {
                     ActionResult::Scoped {
@@ -73,6 +93,7 @@ pub async fn run_manager(
                 };
                 let _ = action_results.send(result).await;
             }
+            () = snapshots.closed() => break,
             else => break,
         }
     }
@@ -83,6 +104,9 @@ pub async fn run_manager(
 
 fn demo_action(action: ActionIntent) -> ActionResult {
     match action {
+        ActionIntent::StartLogs { .. } | ActionIntent::StopLogs { .. } => {
+            ActionResult::Error("Log sessions are handled by the source manager".to_owned())
+        }
         ActionIntent::Delete { targets, immediate } => demo_delete(&targets, immediate),
         ActionIntent::DeleteContext { name } => ActionResult::Error(format!(
             "Context deletion is unavailable in demo mode: {name}"

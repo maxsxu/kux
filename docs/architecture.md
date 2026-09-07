@@ -109,6 +109,24 @@ API resource, so Secrets, CRDs, aggregated resources, namespaced resources, and 
 resources follow the same path. Describe uses `plural.group` for non-core APIs to avoid ambiguous
 names.
 
+Pod logs have a dedicated cancellable streaming task and request ID in addition to the view
+generation. Range changes replace the stream, and late batches cannot append to a newer log
+session. The source emits bounded batches instead of waiting for the entire response. Tail and
+time-range requests follow from up to 100 recent lines; head reads the first 5,000 bytes without
+following, and previous-instance requests never follow. The display retains at most 5,000 lines
+or 4 MiB. Pausing autoscroll freezes displayed arrivals while the backing buffer continues to
+update; resuming appends retained pending lines and returns to the end. Column lock preserves the
+horizontal offset on arrivals. Clear and separator marks are local operations.
+
+Log requests always include Kubernetes timestamps, which the renderer can hide locally without
+reopening the stream. Unwrapped logs style only the visible filtered rows after calculating and
+clamping the scroll extent; wrapped logs measure rendered height before scrolling. The log header
+reflows all log-specific bindings at narrow widths, and fullscreen logs remove borders and header
+padding. Copy and save export the full displayed buffer using the current filter/timestamp settings
+without terminal control sequences. Save is an explicit local action: it creates a unique `0600`
+file under `$XDG_STATE_HOME/kux/screen-dumps/<context>/` (or
+`~/.local/state/kux/screen-dumps/<context>/`). Logs are never persisted automatically.
+
 Node drilldown starts a Pod watch with a server-side `spec.nodeName` field selector. Pod drilldown
 fetches one Pod and compacts regular, init, and ephemeral containers into transient rows. The
 parent Pod snapshot continues receiving coalesced watch updates and is restored locally on Esc;

@@ -9,10 +9,12 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use regex::RegexBuilder;
 
 use crate::kubeconfig::ContextInfo;
+use crate::log_view::{LogView, append_display_lines, plain_log_line, without_log_timestamp};
 use crate::model::{
     NamespaceInfo, OwnerReferenceData, PortForwardPort, ResourceDescriptor, ResourceKind,
     ResourceOperations, ResourceRow, ResourceSnapshot, SourceState, unix_now,
 };
+use crate::source::{LogRange, LogRequest, LogTarget};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SortField {
@@ -329,6 +331,12 @@ pub enum ActionIntent {
         target: ContainerTarget,
         previous: bool,
     },
+    StartLogs {
+        request: LogRequest,
+    },
+    StopLogs {
+        id: u64,
+    },
     AuthorizationPolicy {
         target: ResourceTarget,
     },
@@ -361,6 +369,8 @@ impl ActionIntent {
                 | Self::ManagedYaml { .. }
                 | Self::Containers { .. }
                 | Self::ContainerLogs { .. }
+                | Self::StartLogs { .. }
+                | Self::StopLogs { .. }
                 | Self::AuthorizationPolicy { .. }
                 | Self::FindChildResource { .. }
                 | Self::ResolveOwner { .. }
@@ -503,6 +513,7 @@ pub enum AppCommand {
     Quit,
     Request(ViewState),
     Copy(String),
+    SaveLogs { name: String, body: String },
     Edit(ResourceTarget),
     Shell(PodShellTarget),
     StartPortForward(PortForwardRequest),
@@ -701,6 +712,8 @@ pub struct App {
     pub content_kind: Option<ContentKind>,
     pub content_scroll: u16,
     pub content_horizontal_scroll: u16,
+    pub log_view: Option<LogView>,
+    pub log_view_width: u16,
     pub details_row: Option<ResourceRow>,
     pub notice: Option<String>,
     pub filter_error: Option<String>,
@@ -712,6 +725,7 @@ pub struct App {
     content_max_scroll: u16,
     content_match_cursor: Option<usize>,
     content_target: Option<ResourceTarget>,
+    next_log_id: u64,
     saved_resource_list: Option<SavedResourceList>,
     pending_containers: Option<ResourceTarget>,
     pending_policy: Option<ResourceTarget>,
@@ -804,6 +818,8 @@ impl App {
             content_kind: None,
             content_scroll: 0,
             content_horizontal_scroll: 0,
+            log_view: None,
+            log_view_width: 80,
             details_row: None,
             notice: None,
             filter_error: None,
@@ -815,6 +831,7 @@ impl App {
             content_max_scroll: 0,
             content_match_cursor: None,
             content_target: None,
+            next_log_id: 0,
             saved_resource_list: None,
             pending_containers: None,
             pending_policy: None,
@@ -1026,7 +1043,7 @@ impl App {
             match key.code {
                 KeyCode::Char(':') => return self.start_input(InputMode::Command),
                 KeyCode::Char('/') => return self.start_input(InputMode::Filter),
-                KeyCode::Char(number) if number.is_ascii_digit() => {
+                KeyCode::Char(number) if number.is_ascii_digit() && !self.is_logs_view() => {
                     return self.switch_recent_namespace(number);
                 }
                 KeyCode::Char('[' | '-') => return self.navigate_history(-1),
@@ -2029,7 +2046,257 @@ impl App {
         AppCommand::Action(ActionIntent::DrainNode { name, options })
     }
 
+    #[must_use]
+    pub fn is_logs_view(&self) -> bool {
+        self.overlay == Overlay::Content
+            && matches!(
+                self.content_kind,
+                Some(ContentKind::Logs | ContentKind::PreviousLogs)
+            )
+    }
+
+    #[must_use]
+    pub fn log_display_line<'a>(&self, line: &'a str) -> &'a str {
+        if self.ui.timestamps() {
+            line
+        } else {
+            without_log_timestamp(line)
+        }
+    }
+
+    #[must_use]
+    pub fn log_status_label(&self) -> String {
+        let Some(view) = &self.log_view else {
+            return String::new();
+        };
+        let range = match view.request.range {
+            LogRange::Tail => "tail".to_owned(),
+            LogRange::Head => "head".to_owned(),
+            LogRange::SinceSeconds(3_600) => "1h".to_owned(),
+            LogRange::SinceSeconds(seconds) => format!("{}m", seconds / 60),
+        };
+        let state = if view.finished {
+            "complete"
+        } else if !view.auto_scroll {
+            "paused"
+        } else {
+            "following"
+        };
+        format!("{range} · {state}")
+    }
+
+    fn open_logs(&mut self, target: LogTarget) -> AppCommand {
+        self.next_log_id = self.next_log_id.wrapping_add(1);
+        let request = LogRequest {
+            id: self.next_log_id,
+            target,
+            range: LogRange::Tail,
+        };
+        let label = if request.target.previous {
+            "Previous Logs"
+        } else {
+            "Logs"
+        };
+        let container = request
+            .target
+            .container
+            .as_ref()
+            .map(|name| format!("/{name}"))
+            .unwrap_or_default();
+        let title = format!(
+            "{label}({}/{}{container})",
+            request.target.namespace, request.target.pod
+        );
+        self.show_content(
+            title,
+            "",
+            None,
+            None,
+            None,
+            if request.target.previous {
+                ContentKind::PreviousLogs
+            } else {
+                ContentKind::Logs
+            },
+        );
+        self.log_view = Some(LogView::new(request.clone()));
+        self.content_scroll = u16::MAX;
+        self.notice = Some("Loading logs…".to_owned());
+        AppCommand::Action(ActionIntent::StartLogs { request })
+    }
+
+    fn reload_logs(&mut self, range: LogRange) -> AppCommand {
+        let Some(view) = &mut self.log_view else {
+            return AppCommand::None;
+        };
+        self.next_log_id = self.next_log_id.wrapping_add(1);
+        view.request.id = self.next_log_id;
+        view.request.range = range;
+        view.finished = false;
+        view.refresh_pending = true;
+        view.clear();
+        let request = view.request.clone();
+        self.content_body.clear();
+        self.reset_body_scroll();
+        if self.log_view.as_ref().is_some_and(|view| view.auto_scroll) {
+            self.content_scroll = u16::MAX;
+        }
+        self.notice = Some("Loading logs…".to_owned());
+        AppCommand::Action(ActionIntent::StartLogs { request })
+    }
+
+    /// Export the complete displayed buffer, respecting timestamps and filtering.
+    #[must_use]
+    pub fn log_export_text(&self) -> String {
+        let matcher = FilterMatcher::new(self.body_filter());
+        self.content_body
+            .lines()
+            .map(|line| self.log_display_line(line))
+            .filter(|line| matcher.matches_text(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn handle_log_key(&mut self, key: KeyEvent) -> Option<AppCommand> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return (key.code == KeyCode::Char('s')).then(|| {
+                let name = self.log_view.as_ref().map_or_else(
+                    || "pod-logs".to_owned(),
+                    |view| {
+                        format!(
+                            "{}-{}",
+                            view.request.target.namespace, view.request.target.pod
+                        )
+                    },
+                );
+                AppCommand::SaveLogs {
+                    name,
+                    body: self.log_export_text(),
+                }
+            });
+        }
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            return None;
+        }
+        let command = match key.code {
+            KeyCode::Char('0') => self.reload_logs(LogRange::Tail),
+            KeyCode::Char('1') => self.reload_logs(LogRange::Head),
+            KeyCode::Char('2') => self.reload_logs(LogRange::SinceSeconds(60)),
+            KeyCode::Char('3') => self.reload_logs(LogRange::SinceSeconds(300)),
+            KeyCode::Char('4') => self.reload_logs(LogRange::SinceSeconds(900)),
+            KeyCode::Char('5') => self.reload_logs(LogRange::SinceSeconds(1_800)),
+            KeyCode::Char('6') => self.reload_logs(LogRange::SinceSeconds(3_600)),
+            KeyCode::Char('c') => AppCommand::Copy(self.log_export_text()),
+            KeyCode::Char('C') => {
+                if let Some(view) = &mut self.log_view {
+                    view.clear();
+                    view.refresh_pending = false;
+                }
+                self.content_body.clear();
+                self.reset_body_scroll();
+                AppCommand::None
+            }
+            KeyCode::Char('m') => {
+                let mark = "─".repeat(usize::from(self.log_view_width.saturating_sub(4).max(1)));
+                if !self.content_body.is_empty() && !self.content_body.ends_with('\n') {
+                    self.content_body.push('\n');
+                }
+                append_display_lines(&mut self.content_body, &[mark]);
+                self.content_scroll = u16::MAX;
+                AppCommand::None
+            }
+            KeyCode::Char('s') => {
+                if let Some(view) = &mut self.log_view {
+                    view.auto_scroll = !view.auto_scroll;
+                    if view.auto_scroll {
+                        append_display_lines(&mut self.content_body, &view.take_pending());
+                        self.content_scroll = u16::MAX;
+                        if !view.column_lock {
+                            self.content_horizontal_scroll = 0;
+                        }
+                    }
+                }
+                AppCommand::None
+            }
+            KeyCode::Char('L') => {
+                if let Some(view) = &mut self.log_view {
+                    view.column_lock = !view.column_lock;
+                }
+                AppCommand::None
+            }
+            KeyCode::Char('t') => {
+                let keep_bottom = self.content_scroll >= self.content_max_scroll;
+                self.ui.toggle(UiFlags::TIMESTAMPS);
+                if keep_bottom {
+                    self.content_scroll = u16::MAX;
+                }
+                AppCommand::None
+            }
+            KeyCode::Esc | KeyCode::Char('q' | '?') => {
+                if !self.body_query.is_empty() {
+                    self.body_query.clear();
+                    self.filter_error = None;
+                    self.content_match_cursor = None;
+                    return Some(AppCommand::None);
+                }
+                self.overlay = Overlay::None;
+                self.notice = None;
+                self.log_view.take().map_or(AppCommand::None, |view| {
+                    AppCommand::Action(ActionIntent::StopLogs {
+                        id: view.request.id,
+                    })
+                })
+            }
+            _ => return None,
+        };
+        Some(command)
+    }
+
+    pub fn append_log_batch(
+        &mut self,
+        id: u64,
+        lines: Vec<String>,
+        finished: bool,
+        error: Option<String>,
+    ) {
+        if !self.is_logs_view() {
+            return;
+        }
+        let Some(view) = self.log_view.as_mut().filter(|view| view.request.id == id) else {
+            return;
+        };
+        let lines: Vec<_> = lines
+            .into_iter()
+            .map(|line| plain_log_line(&line))
+            .collect();
+        view.append(&lines);
+        view.finished = finished;
+        if view.auto_scroll || view.refresh_pending || view.request.range == LogRange::Head {
+            append_display_lines(&mut self.content_body, &view.take_pending());
+            if view.auto_scroll && !lines.is_empty() {
+                self.content_scroll = u16::MAX;
+                if !view.column_lock {
+                    self.content_horizontal_scroll = 0;
+                }
+            }
+        }
+        if !lines.is_empty() {
+            view.refresh_pending = false;
+        }
+        if let Some(error) = error {
+            self.notice = Some(format!("Logs: {error}"));
+        } else if (!lines.is_empty() || finished) && self.notice.as_deref() == Some("Loading logs…")
+        {
+            self.notice = None;
+        }
+    }
+
     fn handle_content_overlay(&mut self, key: KeyEvent) -> AppCommand {
+        if self.is_logs_view()
+            && let Some(command) = self.handle_log_key(key)
+        {
+            return command;
+        }
         if self.handle_body_navigation(&key) {
             return AppCommand::None;
         }
@@ -2324,6 +2591,13 @@ impl App {
             (0..self
                 .active_content_body()
                 .lines()
+                .map(|line| {
+                    if self.is_logs_view() {
+                        self.log_display_line(line)
+                    } else {
+                        line
+                    }
+                })
                 .filter(|line| matcher.matches_text(line))
                 .count())
                 .collect::<Vec<_>>()
@@ -2494,6 +2768,7 @@ impl App {
         self.pending_child = None;
         self.pending_owner = None;
         self.details_row = None;
+        self.log_view = None;
         self.body_query.clear();
         if resource_kind_changed {
             self.query.clear();
@@ -3223,20 +3498,20 @@ impl App {
             .cloned()
     }
 
-    fn container_log_action(&self, previous: bool) -> AppCommand {
+    fn container_log_action(&mut self, previous: bool) -> AppCommand {
         let ListMode::Containers { namespace, pod } = &self.list_mode else {
             return AppCommand::None;
         };
-        self.selected_row().map_or(AppCommand::None, |row| {
-            AppCommand::Action(ActionIntent::ContainerLogs {
-                target: ContainerTarget {
-                    namespace: namespace.clone(),
-                    pod: pod.clone(),
-                    container: row.name.to_string(),
-                },
-                previous,
-            })
-        })
+        let Some(row) = self.selected_row() else {
+            return AppCommand::None;
+        };
+        let target = LogTarget {
+            namespace: namespace.clone(),
+            pod: pod.clone(),
+            container: Some(row.name.to_string()),
+            previous,
+        };
+        self.open_logs(target)
     }
 
     fn pod_log_action(&mut self, previous: bool) -> AppCommand {
@@ -3252,12 +3527,10 @@ impl App {
         };
         let namespace = row.namespace.to_string();
         let pod = row.name.to_string();
-        AppCommand::Action(ActionIntent::ContainerLogs {
-            target: ContainerTarget {
-                namespace,
-                pod,
-                container,
-            },
+        self.open_logs(LogTarget {
+            namespace,
+            pod,
+            container: Some(container),
             previous,
         })
     }
@@ -3575,6 +3848,7 @@ impl App {
         decoded_managed_fields: Option<String>,
         content: ContentKind,
     ) {
+        self.log_view = None;
         self.content_title = title.into();
         self.content_body = body.into();
         self.content_managed_fields = managed_fields;
@@ -4380,17 +4654,16 @@ mod tests {
         let mut pods = app_with_rows();
         assert!(matches!(
             pods.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)),
-            AppCommand::Action(ActionIntent::ContainerLogs {
-                target: ContainerTarget { ref container, .. },
-                previous: false,
-            }) if container == "api"
+            AppCommand::Action(ActionIntent::StartLogs {
+                request: LogRequest { target: LogTarget { ref container, previous: false, .. }, .. },
+            }) if container.as_deref() == Some("api")
         ));
+        pods.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(matches!(
             pods.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)),
-            AppCommand::Action(ActionIntent::ContainerLogs {
-                target: ContainerTarget { ref container, .. },
-                previous: true,
-            }) if container == "api"
+            AppCommand::Action(ActionIntent::StartLogs {
+                request: LogRequest { target: LogTarget { ref container, previous: true, .. }, .. },
+            }) if container.as_deref() == Some("api")
         ));
     }
 
@@ -6050,7 +6323,119 @@ mod tests {
     }
 
     #[test]
-    fn current_and_previous_logs_copy_the_raw_content() {
+    fn log_ranges_preserve_pause_and_reject_previous_session_batches() {
+        let mut app = app_with_rows();
+        app.pod_log_action(false);
+        let initial_id = app.log_view.as_ref().unwrap().request.id;
+        app.append_log_batch(initial_id, vec!["initial".to_owned()], false, None);
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        let generation = app.generation;
+        for (key, range) in [
+            ('0', LogRange::Tail),
+            ('1', LogRange::Head),
+            ('2', LogRange::SinceSeconds(60)),
+            ('3', LogRange::SinceSeconds(300)),
+            ('4', LogRange::SinceSeconds(900)),
+            ('5', LogRange::SinceSeconds(1_800)),
+            ('6', LogRange::SinceSeconds(3_600)),
+        ] {
+            let command = app.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+            assert!(
+                matches!(command, AppCommand::Action(ActionIntent::StartLogs { request }) if request.range == range)
+            );
+            assert_eq!(
+                app.generation, generation,
+                "log range digits must not switch namespaces"
+            );
+            assert!(!app.log_view.as_ref().unwrap().auto_scroll);
+            app.append_log_batch(initial_id, vec!["stale".to_owned()], false, None);
+            assert!(app.content_body.is_empty());
+        }
+        let id = app.log_view.as_ref().unwrap().request.id;
+        app.append_log_batch(id, vec!["refreshed".to_owned()], false, None);
+        assert_eq!(
+            app.content_body, "refreshed\n",
+            "paused ranges get one refresh"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.append_log_batch(id, vec!["late".to_owned()], false, None);
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(!app.content_body.contains("late"));
+    }
+
+    #[test]
+    fn log_pause_mark_resume_clear_and_column_lock_preserve_stream_state() {
+        let mut app = app_with_rows();
+        app.pod_log_action(false);
+        let id = app.log_view.as_ref().unwrap().request.id;
+        app.append_log_batch(id, vec!["one".to_owned()], false, None);
+        app.content_horizontal_scroll = 12;
+        app.handle_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT));
+        app.append_log_batch(id, vec!["two".to_owned()], false, None);
+        assert_eq!(app.content_horizontal_scroll, 12);
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert!(!app.log_view.as_ref().unwrap().auto_scroll);
+        app.append_log_batch(id, vec!["three".to_owned()], false, None);
+        assert!(!app.content_body.contains("three"));
+        assert!(app.content_body.contains("────"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert!(app.content_body.contains("three"));
+        assert!(app.content_body.contains("────"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT));
+        app.show_transient_notice("Logs saved to example.log");
+        app.append_log_batch(id, vec!["four".to_owned()], false, None);
+        assert_eq!(app.content_horizontal_scroll, 0);
+        assert_eq!(app.notice.as_deref(), Some("Logs saved to example.log"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT));
+        assert!(app.content_body.is_empty());
+        assert_eq!(app.log_view.as_ref().unwrap().request.id, id);
+        app.append_log_batch(id, vec!["after clear".to_owned()], false, None);
+        assert_eq!(app.content_body, "after clear\n");
+    }
+
+    #[test]
+    fn log_save_exports_filtered_display_and_escape_clears_filter_before_closing() {
+        let mut app = app_with_rows();
+        app.pod_log_action(false);
+        let id = app.log_view.as_ref().unwrap().request.id;
+        app.append_log_batch(
+            id,
+            vec![
+                "2026-09-07T00:00:00Z \x1b[31mERROR example\x1b[0m".to_owned(),
+                "2026-09-07T00:00:01Z INFO running".to_owned(),
+            ],
+            false,
+            None,
+        );
+        app.body_query = "ERROR".to_owned();
+        assert!(
+            matches!(app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            AppCommand::SaveLogs { body, .. } if body == "ERROR example")
+        );
+        app.append_log_batch(
+            id,
+            vec!["2026-09-07T00:00:02Z ERROR second".to_owned()],
+            false,
+            None,
+        );
+        app.body_query = "^ERROR".to_owned();
+        app.content_scroll = 0;
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert_eq!(app.content_scroll, 1, "matches use timestamp-hidden text");
+        app.handle_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT));
+        assert_eq!(app.content_scroll, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.body_query.is_empty());
+        assert!(app.is_logs_view());
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            AppCommand::Action(ActionIntent::StopLogs { id })
+        );
+    }
+
+    #[test]
+    fn current_and_previous_logs_copy_the_displayed_text() {
         for content in [ContentKind::Logs, ContentKind::PreviousLogs] {
             let mut app = app_with_rows();
             let body = "2026-09-01T01:02:03Z INFO started\nplain second line";
@@ -6058,8 +6443,12 @@ mod tests {
 
             assert_eq!(
                 app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
-                AppCommand::Copy(body.to_owned())
+                AppCommand::Copy("INFO started\nplain second line".to_owned())
             );
+            app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+            assert_eq!(app.log_export_text(), body);
+            app.body_query = "started".to_owned();
+            assert_eq!(app.log_export_text(), "2026-09-01T01:02:03Z INFO started");
             assert_eq!(app.overlay, Overlay::Content);
         }
     }
@@ -6386,16 +6775,25 @@ mod tests {
         assert_eq!(app.selected_row().map(|row| row.name.as_ref()), Some("api"));
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            AppCommand::Action(ActionIntent::ContainerLogs {
-                target: ContainerTarget {
-                    namespace: "prod".to_owned(),
-                    pod: "api-0".to_owned(),
-                    container: "api".to_owned(),
+            AppCommand::Action(ActionIntent::StartLogs {
+                request: LogRequest {
+                    id: 1,
+                    range: LogRange::Tail,
+                    target: LogTarget {
+                        namespace: "prod".to_owned(),
+                        pod: "api-0".to_owned(),
+                        container: Some("api".to_owned()),
+                        previous: false,
+                    },
                 },
-                previous: false,
             })
         );
 
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            AppCommand::Action(ActionIntent::StopLogs { id: 1 })
+        );
+        assert!(app.is_container_view());
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             AppCommand::None

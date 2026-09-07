@@ -57,11 +57,15 @@ K9s key and reports that its backend is pending, and **planned** is not yet expo
 
 | Interaction | Key | Status |
 | --- | --- | --- |
-| Pod/container logs/previous logs | `l`, `p`, then `c` to copy | Implemented, last 500 lines; Pod actions resolve and pass the selected default container for both current and previous requests, timestamps/severity levels are colorized without changing the raw content, and copy preserves that raw content |
+| Pod/container logs/previous logs | `l`, `p` | Implemented with explicit default/selected container, incremental streaming, severity colors, bounded buffers, and cancellation when leaving the view; previous logs finish without following |
+| Log ranges | `0` tail, `1` head, `2` 1m, `3` 5m, `4` 15m, `5` 30m, `6` 1h | Implemented; tail/time ranges start with up to 100 recent lines and follow, while head reads the first 5,000 bytes without following |
+| Clear/mark logs | `Shift-C`, `m` | Implemented; clear resets the local buffer and mark adds a colored separator |
+| Copy/save logs | `c`, `Ctrl-S` | Implemented for the full displayed buffer, respecting filter/timestamps; saves a new `0600` file in the context's `kux/screen-dumps` state directory |
+| Log autoscroll/column lock | `s`, `Shift-L` | Implemented; pausing freezes displayed arrivals while buffering, resuming catches up, and column lock preserves horizontal position as messages arrive |
 | Copy YAML/toggle managed fields | `c`, `m` in YAML | Implemented; copy uses the visible variant |
 | Search YAML without hiding context | `/query`, then `n`/`Shift-N` in YAML | Implemented; keeps the full document, highlights matches, and scrolls between matching lines |
 | Copy decoded Secret data | `c` in Secret data view | Implemented; copies the data-only body |
-| Wrap/timestamps/fullscreen | `w`, `t`, `f` in content view | Implemented UI toggles |
+| Wrap/timestamps/fullscreen | `w`, `t`, `f` in content view | Implemented; log timestamps toggle locally, wrapped tails preserve the end, and fullscreen logs use the entire terminal without borders |
 | Delete marked resources, current resource, or inactive context with Tab + Enter confirmation | `Ctrl-D` | Implemented; all marked resources are deleted as one bounded batch, while active/synthetic contexts and resources without delete capability remain protected |
 | Kill without confirmation | `Ctrl-K` | Implemented with zero grace period |
 | Pod shell | `s` | Implemented through interactive `kubectl exec` with the active context and namespace; the host terminal is cleared and starts with a Kux Pod/container identity banner, and Kux explicitly targets the valid `kubectl.kubernetes.io/default-container` annotation or the first `spec.containers` entry; unavailable in read-only mode |

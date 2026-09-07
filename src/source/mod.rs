@@ -1,6 +1,7 @@
 mod demo;
 mod discovery;
 mod kubernetes;
+mod logs;
 
 use std::time::Duration;
 
@@ -14,6 +15,7 @@ use crate::{
 };
 
 pub use discovery::discover_resources;
+pub use logs::{LogRange, LogRequest, LogTarget};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchRequest {
@@ -40,6 +42,12 @@ pub struct KubernetesSettings {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionResult {
+    LogBatch {
+        id: u64,
+        lines: Vec<String>,
+        finished: bool,
+        error: Option<String>,
+    },
     Scoped {
         generation: u64,
         result: Box<ActionResult>,

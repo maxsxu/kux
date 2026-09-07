@@ -247,6 +247,7 @@ async fn handle_app_command(
                 .context("data source stopped")?;
         }
         AppCommand::Copy(value) => handle_copy(app, terminal, &value),
+        AppCommand::SaveLogs { name, body } => save_log_dump(app, name, body).await,
         AppCommand::Edit(target) => {
             let result = edit_resource(terminal, &app.context, &target)
                 .await
@@ -293,6 +294,10 @@ async fn handle_app_command(
         }
         AppCommand::Action(action) => {
             let keeps_overlay = matches!(&action, ActionIntent::ManagedYaml { .. });
+            let log_action = matches!(
+                &action,
+                ActionIntent::StartLogs { .. } | ActionIntent::StopLogs { .. }
+            );
             actions
                 .send(ActionRequest {
                     generation: app.generation,
@@ -302,13 +307,37 @@ async fn handle_app_command(
                 .context("action worker stopped")?;
             if keeps_overlay {
                 app.show_transient_notice("Loading managed fields…");
-            } else {
+            } else if !log_action {
                 app.show_notice("Working…");
             }
         }
         AppCommand::None => {}
     }
+    if !app.is_logs_view()
+        && let Some(view) = app.log_view.take()
+    {
+        actions
+            .send(ActionRequest {
+                generation: app.generation,
+                intent: ActionIntent::StopLogs {
+                    id: view.request.id,
+                },
+            })
+            .await
+            .context("action worker stopped")?;
+    }
     Ok(false)
+}
+
+async fn save_log_dump(app: &mut App, name: String, body: String) {
+    let context = app.context.clone();
+    let result =
+        tokio::task::spawn_blocking(move || kux::log_view::save_logs(&context, &name, &body)).await;
+    match result {
+        Ok(Ok(path)) => app.show_transient_notice(format!("Logs saved to {}", path.display())),
+        Ok(Err(error)) => app.show_transient_notice(format!("Save logs failed: {error}")),
+        Err(error) => app.show_transient_notice(format!("Save logs failed: {error}")),
+    }
 }
 
 fn refresh_visible_port_forwards(app: &mut App, manager: &PortForwardManager) {
@@ -344,6 +373,14 @@ fn apply_action_result(app: &mut App, result: ActionResult) -> AppCommand {
             body,
             decoded_body,
         } => app.show_managed_yaml(&target, body, decoded_body),
+        ActionResult::LogBatch {
+            id,
+            lines,
+            finished,
+            error,
+        } => {
+            app.append_log_batch(id, lines, finished, error);
+        }
         ActionResult::NamespaceOptions {
             context,
             namespaces,

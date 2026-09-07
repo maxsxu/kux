@@ -163,7 +163,7 @@ The header always shows the actions available in the current view. These are the
 | Key | Action |
 | --- | --- |
 | `:`, `/` | Command mode and filter mode |
-| `0`, `1`…`9` | All namespaces, then the nine most recent named namespaces |
+| `0`, `1`…`9` | All namespaces, then the nine most recent named namespaces; log views use `0`…`6` for time ranges |
 | `j`/`k`, Up/Down, `Ctrl-B`/`Ctrl-F`, `PgUp`/`PgDn`, `g`/`G` | Navigate vertically |
 | `h`/`l` | Go back or open contextually |
 | Left/Right | Scroll text views horizontally; never open, close, or activate an item |
@@ -173,7 +173,7 @@ The header always shows the actions available in the current view. These are the
 | `e` | Edit the selected resource from its list, details, or YAML view with `kubectl edit` |
 | `l`, `p` | Colorized current and previous logs for the resolved Pod/container |
 | `o` on Pods | Jump to the Pod's assigned Node |
-| `c`, `n` | Copy resource name or namespace; `c` copies raw content in YAML, Secret-data, and log views |
+| `c`, `n` | Copy resource name or namespace; `c` copies the active content in YAML, Secret-data, and log views |
 | `x` on Secret | Open decoded data only; in YAML, toggle decoded values |
 | `Space`, `Ctrl-Space`, `Ctrl-\` | Mark one, mark a range, clear marks |
 | Left-click a row | Select that resource without changing marked resources |
@@ -190,6 +190,29 @@ The header always shows the actions available in the current view. These are the
 
 Press `?` for the categorized keymap in the body. The full compatibility surface is documented in the
 [K9s interaction matrix](docs/k9s-parity.md).
+
+### Pod logs
+
+Current logs stream continuously, starting with the last 100 lines. The log header shows the
+K9s controls, highlights active toggles, and replaces namespace shortcuts with log ranges:
+
+| Key | Action |
+| --- | --- |
+| `0`, `1` | Tail, or head (the first 5,000 bytes without following) |
+| `2`, `3`, `4`, `5`, `6` | Last 1m, 5m, 15m, 30m, or 1h; start with up to 100 matching recent lines and follow |
+| `Shift-C` | Clear the local log buffer; incoming messages continue |
+| `c`, `Ctrl-S` | Copy or save the complete displayed buffer, respecting filter and timestamp settings |
+| `m` | Insert a colored separator mark |
+| `s` | Pause or resume autoscroll; incoming logs stay buffered while the display is paused |
+| `Shift-L` | Keep the horizontal scroll position when messages arrive |
+| `f`, `t`, `w` | Toggle borderless fullscreen, API timestamps, or line wrapping |
+
+The title shows the selected range and whether logs are following, paused, or complete. Previous
+container logs use the same controls but finish after the previous instance's log has been read.
+Buffers retain at most 5,000 lines or 4 MiB. Copy and save include the whole displayed buffer, not
+just the visible screen, and omit terminal control sequences. `Ctrl-S` creates a new private
+(`0600`) file under `$XDG_STATE_HOME/kux/screen-dumps/<context>/`, defaulting to
+`~/.local/state/kux/screen-dumps/<context>/`, and shows the saved path. Nothing is saved automatically.
 
 ## Safety and requirements
 

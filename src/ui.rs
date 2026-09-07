@@ -16,6 +16,7 @@ use crate::{
         PORT_FORWARD_REMOTE_FIELD, PendingDelete, PortForwardDialog, SortField,
     },
     model::{ResourceKind, SourceState, format_age, format_kubectl_age},
+    source::LogRange,
 };
 
 const CYAN: Color = Color::Rgb(139, 233, 253);
@@ -120,6 +121,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 }
 
 fn header_layout(app: &App, width: u16) -> HeaderLayout {
+    if app.is_logs_view() {
+        return logs_header_layout(app, width);
+    }
     let natural_info_width = cluster_info_width(app);
     let logo_width = logo_width();
     let all_columns = header_hint_columns(app);
@@ -183,6 +187,10 @@ fn header_layout(app: &App, width: u16) -> HeaderLayout {
 
 fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect, layout: &HeaderLayout) {
     if area.is_empty() {
+        return;
+    }
+    if app.is_logs_view() {
+        draw_header_menu_columns(frame, area, &layout.columns);
         return;
     }
     match layout.flow {
@@ -354,6 +362,13 @@ struct HeaderHintColumn {
 }
 
 fn header_hint_columns(app: &App) -> Vec<HeaderHintColumn> {
+    if app.is_logs_view() {
+        let hints = log_action_hints(app, false);
+        return [&hints[..6], &hints[6..7], &hints[7..13], &hints[13..]]
+            .into_iter()
+            .map(header_hint_column)
+            .collect();
+    }
     let namespaces = namespace_hints(app);
     let actions = action_hints(app);
     namespaces
@@ -361,6 +376,106 @@ fn header_hint_columns(app: &App) -> Vec<HeaderHintColumn> {
         .chain(actions.chunks(HEADER_MENU_ROWS))
         .map(header_hint_column)
         .collect()
+}
+
+fn logs_header_layout(app: &App, width: u16) -> HeaderLayout {
+    let mut columns = header_hint_columns(app);
+    if header_columns_width(&columns) > width {
+        let hints = log_action_hints(app, width < 80);
+        for rows in HEADER_MENU_ROWS..=hints.len() {
+            columns = hints.chunks(rows).map(header_hint_column).collect();
+            if header_columns_width(&columns) <= width {
+                break;
+            }
+        }
+    }
+    let height = columns
+        .iter()
+        .map(|column| column.hints.len())
+        .max()
+        .and_then(|height| u16::try_from(height).ok())
+        .unwrap_or(0);
+    HeaderLayout {
+        flow: HeaderFlow::Horizontal,
+        height,
+        show_logo: false,
+        logo_width: 0,
+        info_width: 0,
+        info_height: 0,
+        menu_width: width,
+        columns,
+    }
+}
+
+fn log_action_hints(app: &App, compact: bool) -> Vec<HeaderHint> {
+    let range = app.log_view.as_ref().map(|view| view.request.range);
+    let mut hints = [
+        ("0", "tail", LogRange::Tail),
+        ("1", "head", LogRange::Head),
+        ("2", "1m", LogRange::SinceSeconds(60)),
+        ("3", "5m", LogRange::SinceSeconds(300)),
+        ("4", "15m", LogRange::SinceSeconds(900)),
+        ("5", "30m", LogRange::SinceSeconds(1_800)),
+        ("6", "1h", LogRange::SinceSeconds(3_600)),
+    ]
+    .into_iter()
+    .map(|(key, label, candidate)| HeaderHint {
+        key: key.to_owned(),
+        label: label.to_owned(),
+        kind: HeaderHintKind::Namespace,
+        active: range == Some(candidate),
+    })
+    .collect::<Vec<_>>();
+    hints.extend([
+        action_hint("shift-c", "Clear"),
+        action_hint("c", "Copy"),
+        action_hint("m", "Mark"),
+        action_hint("ctrl-s", "Save"),
+        action_hint(
+            "s",
+            if compact {
+                "AutoScroll"
+            } else {
+                "Toggle AutoScroll"
+            },
+        ),
+        action_hint(
+            "shift-l",
+            if compact {
+                "ColumnLock"
+            } else {
+                "Toggle ColumnLock"
+            },
+        ),
+        action_hint(
+            "f",
+            if compact {
+                "FullScreen"
+            } else {
+                "Toggle FullScreen"
+            },
+        ),
+        action_hint(
+            "t",
+            if compact {
+                "Timestamp"
+            } else {
+                "Toggle Timestamp"
+            },
+        ),
+        action_hint("w", if compact { "Wrap" } else { "Toggle Wrap" }),
+    ]);
+    for hint in &mut hints {
+        hint.active |= match hint.key.as_str() {
+            "s" => app.log_view.as_ref().is_some_and(|view| view.auto_scroll),
+            "shift-l" => app.log_view.as_ref().is_some_and(|view| view.column_lock),
+            "f" => app.ui.fullscreen(),
+            "t" => app.ui.timestamps(),
+            "w" => app.ui.wrap(),
+            _ => false,
+        };
+    }
+    hints
 }
 
 fn header_hint_column(hints: &[HeaderHint]) -> HeaderHintColumn {
@@ -417,7 +532,12 @@ fn draw_header_menu_columns(frame: &mut Frame<'_>, area: Rect, columns: &[Header
     let widths = columns
         .iter()
         .map(|column| Constraint::Length(column.width));
-    let rows = (0..HEADER_MENU_ROWS).map(|row_index| {
+    let row_count = columns
+        .iter()
+        .map(|column| column.hints.len())
+        .max()
+        .unwrap_or(0);
+    let rows = (0..row_count).map(|row_index| {
         Row::new(columns.iter().map(|column| {
             column.hints.get(row_index).map_or_else(
                 || Cell::from(""),
@@ -454,6 +574,9 @@ fn namespace_hints(app: &App) -> Vec<HeaderHint> {
 }
 
 fn action_hints(app: &App) -> Vec<HeaderHint> {
+    if app.is_logs_view() {
+        return log_action_hints(app, false);
+    }
     let mut hints = if matches!(
         app.overlay,
         Overlay::ConfirmDelete | Overlay::PortForwardDialog | Overlay::PortForwards
@@ -1608,6 +1731,19 @@ const HELP_CATEGORIES: &[HelpCategory] = &[
         ],
     ),
     (
+        "POD LOGS",
+        &[
+            ("0 / 1", "Tail / head"),
+            ("2 / 3 / 4 / 5 / 6", "Last 1m / 5m / 15m / 30m / 1h"),
+            ("Shift-C", "Clear log buffer"),
+            ("c / Ctrl-S", "Copy / save displayed logs"),
+            ("m", "Insert a separator mark"),
+            ("s", "Pause / resume autoscroll"),
+            ("Shift-L", "Lock horizontal scroll on arrival"),
+            ("f / t / w", "Fullscreen / timestamps / wrap"),
+        ],
+    ),
+    (
         "DISPLAY",
         &[
             ("Ctrl-E", "Toggle header"),
@@ -2004,6 +2140,10 @@ fn draw_details(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 }
 
 fn draw_content(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    if app.is_logs_view() {
+        draw_log_content(frame, app, area);
+        return;
+    }
     let body = app.active_content_body();
     let matcher = FilterMatcher::new(app.body_filter());
     let has_filter = !app.body_filter().is_empty();
@@ -2079,6 +2219,89 @@ fn draw_content(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
+fn draw_log_content(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let matcher = FilterMatcher::new(app.body_filter());
+    let has_filter = !app.body_filter().is_empty();
+    let filter = if has_filter {
+        format!(" /{}", app.body_filter())
+    } else {
+        String::new()
+    };
+    let status = app.log_status_label();
+    let status = if status.is_empty() {
+        status
+    } else {
+        format!(" · {status}")
+    };
+    let title = format!(" {}{status}{filter} ", app.content_title);
+    let block = (!app.ui.fullscreen())
+        .then(|| notice_block(popup_block(&title).title_alignment(Alignment::Center), app));
+    let mut inner = block.as_ref().map_or(area, |block| block.inner(area));
+    if app.ui.fullscreen() && app.notice.is_some() {
+        inner.height = inner.height.saturating_sub(1);
+    }
+    app.log_view_width = inner.width;
+    let style_line = |line: &str| {
+        let line = highlight_log_line(line);
+        if has_filter {
+            highlight_line_matches(line, &matcher)
+        } else {
+            line
+        }
+    };
+    let paragraph = if app.ui.wrap() {
+        let lines = app
+            .active_content_body()
+            .lines()
+            .map(|line| app.log_display_line(line))
+            .filter(|line| matcher.matches_text(line))
+            .map(style_line)
+            .collect::<Vec<_>>();
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+        app.set_content_scroll_extent(paragraph.line_count(inner.width), inner.height);
+        paragraph.scroll((app.content_scroll, 0))
+    } else {
+        let total = app
+            .active_content_body()
+            .lines()
+            .map(|line| app.log_display_line(line))
+            .filter(|line| matcher.matches_text(line))
+            .count();
+        // A fresh stream batch and wrap/fullscreen transitions may request the end via
+        // u16::MAX. Clamp before selecting visible rows to avoid a blank first frame.
+        app.set_content_scroll_extent(total, inner.height);
+        let lines = app
+            .active_content_body()
+            .lines()
+            .map(|line| app.log_display_line(line))
+            .filter(|line| matcher.matches_text(line))
+            .skip(usize::from(app.content_scroll))
+            .take(usize::from(inner.height))
+            .map(style_line)
+            .collect::<Vec<_>>();
+        Paragraph::new(lines).scroll((0, app.content_horizontal_scroll))
+    };
+    if let Some(block) = block {
+        frame.render_widget(block, area);
+    }
+    frame.render_widget(paragraph, inner);
+    if app.ui.fullscreen()
+        && let Some(notice) = &app.notice
+    {
+        frame.render_widget(
+            Paragraph::new(notice.as_str())
+                .style(Style::default().fg(GREEN).bold())
+                .alignment(Alignment::Right),
+            Rect::new(
+                area.x,
+                area.bottom().saturating_sub(1),
+                area.width,
+                u16::from(area.height > 0),
+            ),
+        );
+    }
+}
+
 fn highlight_content_line(content: Option<ContentKind>, line: &str) -> Line<'static> {
     match content {
         Some(ContentKind::Yaml | ContentKind::SecretData) => highlight_yaml_line(line),
@@ -2093,6 +2316,9 @@ fn highlight_logs(body: &str) -> Vec<Line<'static>> {
 }
 
 fn highlight_log_line(line: &str) -> Line<'static> {
+    if line.starts_with("────") {
+        return Line::styled(line.to_owned(), Style::default().fg(PINK).bold());
+    }
     let message_style = log_message_style(line);
     let Some(separator) = line.find(char::is_whitespace) else {
         return Line::from(Span::styled(line.to_owned(), message_style));
@@ -3791,6 +4017,131 @@ mod tests {
             action_hints(&app)
                 .iter()
                 .any(|hint| hint.key == "c" && hint.label == "Copy")
+        );
+    }
+
+    fn app_with_streamed_logs(lines: Vec<String>) -> App {
+        let mut app = app_with_rendered_pod();
+        let row = app.snapshot.rows[0]
+            .as_ref()
+            .clone()
+            .with_pod_data(PodData {
+                default_container: Arc::from("api"),
+                ..PodData::default()
+            });
+        let mut snapshot = app.snapshot.clone();
+        snapshot.rows = Arc::new(vec![Arc::new(row)]);
+        snapshot.revision += 1;
+        app.apply_snapshot(snapshot);
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        let id = app.log_view.as_ref().expect("active log stream").request.id;
+        app.append_log_batch(id, lines, false, None);
+        app
+    }
+
+    #[test]
+    fn log_header_shows_every_control_without_namespace_shortcuts() {
+        for width in [50, 80, 180] {
+            let mut app = app_with_streamed_logs(vec!["INFO started".to_owned()]);
+            let mut terminal = Terminal::new(TestBackend::new(width, 32)).expect("log terminal");
+            terminal
+                .draw(|frame| draw(frame, &mut app))
+                .expect("draw log header");
+            let text = rendered_lines(&terminal, width).join("\n");
+            for key in [
+                "0", "1", "2", "3", "4", "5", "6", "shift-c", "c", "m", "ctrl-s", "s", "shift-l",
+                "f", "t", "w",
+            ] {
+                assert!(
+                    text.contains(&format!("<{key}>")),
+                    "missing {key} at width {width}"
+                );
+            }
+            assert!(!text.contains("<0> all"));
+            assert!(!text.contains("<1> default"));
+            assert!(!text.contains("Context:"));
+            assert!(text.contains("INFO started"));
+            assert!(header_columns_width(&header_layout(&app, width).columns) <= width);
+            let hints = log_action_hints(&app, false);
+            assert!(hints.iter().any(|hint| hint.key == "0" && hint.active));
+            assert!(hints.iter().any(|hint| hint.key == "s" && hint.active));
+        }
+    }
+
+    #[test]
+    fn fullscreen_logs_use_the_top_left_cell_and_toggle_timestamp_locally() {
+        let mut app = app_with_streamed_logs(vec![
+            "2026-09-07T10:00:00.000Z ERROR failed to connect".to_owned(),
+        ]);
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("fullscreen logs");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw plain logs");
+        let lines = rendered_lines(&terminal, 80);
+        assert!(lines[0].starts_with("ERROR failed to connect"));
+        assert!(!lines.join("\n").contains("2026-09-07"));
+        assert!(!lines.join("\n").contains('╭'));
+        assert_eq!(terminal.backend().buffer()[(0, 0)].fg, RED);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw timestamped logs");
+        let lines = rendered_lines(&terminal, 80);
+        assert!(lines[0].starts_with("2026-09-07T10:00:00.000Z ERROR failed to connect"));
+        assert_eq!(terminal.backend().buffer()[(0, 0)].fg, PURPLE);
+    }
+
+    #[test]
+    fn log_arrivals_and_wrap_toggle_render_the_end_on_the_first_frame() {
+        let mut app = app_with_streamed_logs(
+            (0..80)
+                .map(|index| format!("INFO line {index}"))
+                .chain(std::iter::once(format!(
+                    "INFO {} FINAL-MESSAGE",
+                    "payload ".repeat(15)
+                )))
+                .collect(),
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).expect("tail logs");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw initial tail");
+        let lines = rendered_lines(&terminal, 40);
+        assert!(lines.iter().any(|line| line.contains("INFO line 79")));
+        assert!(app.content_scroll > 0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw wrapped tail");
+        assert!(
+            rendered_lines(&terminal, 40)
+                .join("\n")
+                .contains("FINAL-MESSAGE")
+        );
+
+        let id = app.log_view.as_ref().expect("active logs").request.id;
+        app.append_log_batch(id, vec!["WARN newest-message".to_owned()], false, None);
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw wrapped arrival");
+        assert!(
+            rendered_lines(&terminal, 40)
+                .join("\n")
+                .contains("WARN newest-message")
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw unwrapped tail");
+        assert!(
+            rendered_lines(&terminal, 40)
+                .join("\n")
+                .contains("WARN newest-message")
         );
     }
 
