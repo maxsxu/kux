@@ -1650,9 +1650,13 @@ fn spawn_enrichment_tasks(
     updates: mpsc::Sender<EnrichmentUpdate>,
 ) -> Vec<AbortOnDrop> {
     match request.kind.known_kind() {
-        Some(ResourceKind::Pods) if server_field_selector(request).is_none() => vec![AbortOnDrop(
-            tokio::spawn(pod_metrics_loop(client, request.namespace.clone(), updates)),
-        )],
+        // Pod field selectors scope the resource watch, not the Metrics API.
+        // Fetch namespace-scoped metrics and join only matching visible pod keys.
+        Some(ResourceKind::Pods) => vec![AbortOnDrop(tokio::spawn(pod_metrics_loop(
+            client,
+            request.namespace.clone(),
+            updates,
+        )))],
         Some(ResourceKind::Nodes) => vec![
             AbortOnDrop(tokio::spawn(node_metrics_loop(
                 client.clone(),
@@ -5707,6 +5711,38 @@ mod tests {
         assert!(!is_all_namespace_pod_request(&request, "production"));
     }
 
+    #[tokio::test]
+    async fn pod_metrics_are_started_for_filtered_views() {
+        let client = Client::try_from(Config::new("http://127.0.0.1:1".parse().unwrap())).unwrap();
+        let settings = KubernetesSettings {
+            initial_context: "test".to_owned(),
+            publish_interval: Duration::from_millis(100),
+            streaming_lists: false,
+        };
+        for field_selector in [
+            None,
+            Some("spec.nodeName=worker-07"),
+            Some("metadata.name=api-0"),
+            Some("kux.ownerUID=parent-123"),
+        ] {
+            for namespace in [None, Some("default")] {
+                let request = WatchRequest {
+                    generation: 1,
+                    context: "test".to_owned(),
+                    kind: ResourceKind::Pods.into(),
+                    namespace: namespace.map(str::to_owned),
+                    field_selector: field_selector.map(str::to_owned),
+                    label_selector: Some("app=api".to_owned()),
+                };
+                let (sender, _receiver) = mpsc::channel(8);
+                let tasks = spawn_enrichment_tasks(client.clone(), &request, &settings, sender);
+                assert_eq!(tasks.len(), 1, "pod metrics task for {request:?}");
+                // Abort before yielding; this unit test performs no network calls.
+                drop(tasks);
+            }
+        }
+    }
+
     #[test]
     fn owner_uid_filters_are_local_and_match_exact_controller_uids() {
         let mut request = WatchRequest {
@@ -6147,6 +6183,72 @@ mod tests {
         let elapsed = started.elapsed();
         let page = decode_table_list(value).expect("decoded Table response");
         eprintln!("compact table rows={} elapsed={elapsed:?}", page.rows.len());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires KUX_LIVE_CONTEXT, KUX_LIVE_NODE and access to pod metrics"]
+    async fn live_node_pods_include_metrics() {
+        let context = std::env::var("KUX_LIVE_CONTEXT").expect("KUX_LIVE_CONTEXT");
+        let node = std::env::var("KUX_LIVE_NODE").expect("KUX_LIVE_NODE");
+        let client = client_for_context(&context)
+            .await
+            .expect("Kubernetes client");
+        let request = WatchRequest {
+            generation: 1,
+            context: context.clone(),
+            kind: ResourceKind::Pods.into(),
+            namespace: None,
+            field_selector: Some(format!("spec.nodeName={node}")),
+            label_selector: None,
+        };
+        let (snapshots, mut receiver) =
+            watch::channel(ResourceSnapshot::loading(1, request.kind.clone()));
+        let task = tokio::spawn(run_watch(
+            client,
+            KubernetesSettings {
+                initial_context: context,
+                publish_interval: Duration::from_millis(100),
+                streaming_lists: false,
+            },
+            request,
+            snapshots,
+        ));
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                receiver.changed().await.expect("pod watch active");
+                let snapshot = receiver.borrow_and_update().clone();
+                if snapshot.state == SourceState::Ready
+                    && snapshot.rows.iter().any(|row| {
+                        row.pod_data().is_some_and(|pod| {
+                            pod.cpu_millis.is_some() && pod.memory_bytes.is_some()
+                        })
+                    })
+                {
+                    return snapshot;
+                }
+            }
+        })
+        .await;
+        task.abort();
+        let snapshot = result.expect("node-scoped pod metrics arrive within 30 seconds");
+        assert!(
+            snapshot
+                .rows
+                .iter()
+                .all(|row| row.pod_data().is_some_and(|pod| pod.node.as_ref() == node))
+        );
+        let with_metrics = snapshot
+            .rows
+            .iter()
+            .filter(|row| {
+                row.pod_data()
+                    .is_some_and(|pod| pod.cpu_millis.is_some() && pod.memory_bytes.is_some())
+            })
+            .count();
+        eprintln!(
+            "node-scoped pods={} with CPU and memory metrics={with_metrics}",
+            snapshot.rows.len()
+        );
     }
 
     #[tokio::test]
