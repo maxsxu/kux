@@ -31,13 +31,29 @@ Kux keeps the workflow experienced Kubernetes operators already know, then rebui
 for large datasets. It loads one active resource view plus a compact live all-namespace Pod cache,
 never queues an unbounded stream of frames, and does not require a hard-coded resource catalog.
 
-## Try it in 10 seconds
+## Install and run
 
-Requires Rust 1.88 or newer.
+Install with [Homebrew](https://brew.sh) on macOS or Linux:
 
 ```bash
-cargo install --path .
+brew install maxsxu/tap/kux
+```
 
+The formula is maintained in [maxsxu/homebrew-tap](https://github.com/maxsxu/homebrew-tap).
+It builds Kux from source and installs Rust and `kubectl` as dependencies; the first
+build can take several minutes. While this repository is private, Git must be
+authenticated with an account that has access (for example, run `gh auth login`
+and `gh auth setup-git` first).
+
+Or build from a local checkout with Rust 1.88 or newer:
+
+```bash
+cargo install --locked --path .
+```
+
+Then try Kux:
+
+```bash
 # Explore 250,000 synthetic resources without touching a cluster.
 kux --demo --demo-items 250000
 
