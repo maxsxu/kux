@@ -120,11 +120,28 @@ fn demo_action(action: ActionIntent) -> ActionResult {
         } => demo_set_node_unschedulable(&name, unschedulable),
         ActionIntent::Restart { targets } => demo_restart(&targets),
         ActionIntent::Content { target, content } => demo_content(&target, content),
-        ActionIntent::ManagedYaml { target } => ActionResult::ManagedYaml {
+        ActionIntent::ManagedYaml {
             target,
-            body: "metadata:\n  managedFields:\n  - manager: demo\n".to_owned(),
-            decoded_body: None,
-        },
+            body,
+            decoded_body,
+        } => {
+            let insert = |body: &str| {
+                super::kubernetes::insert_managed_fields_yaml(
+                    body,
+                    "managedFields:\n- manager: demo\n",
+                )
+            };
+            match insert(&body)
+                .and_then(|body| Ok((body, decoded_body.as_deref().map(insert).transpose()?)))
+            {
+                Ok((body, decoded_body)) => ActionResult::ManagedYaml {
+                    target,
+                    body,
+                    decoded_body,
+                },
+                Err(error) => ActionResult::Error(error),
+            }
+        }
         ActionIntent::Containers { target } => demo_containers(target),
         ActionIntent::ContainerLogs { target, previous } => {
             let label = if previous { "Previous Logs" } else { "Logs" };

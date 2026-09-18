@@ -323,6 +323,8 @@ pub enum ActionIntent {
     },
     ManagedYaml {
         target: ResourceTarget,
+        body: String,
+        decoded_body: Option<String>,
     },
     Containers {
         target: ResourceTarget,
@@ -2327,12 +2329,14 @@ impl App {
                         let Some(target) = self.content_target.clone() else {
                             return AppCommand::None;
                         };
-                        AppCommand::Action(ActionIntent::ManagedYaml { target })
+                        AppCommand::Action(ActionIntent::ManagedYaml {
+                            target,
+                            body: self.content_body.clone(),
+                            decoded_body: self.content_decoded_body.clone(),
+                        })
                     }
                     Some(_) => {
                         self.ui.toggle(UiFlags::MANAGED_FIELDS);
-                        self.reset_body_scroll();
-                        self.scroll_to_first_content_match();
                         AppCommand::None
                     }
                     None => self.unsupported("Selected resource has no managed fields"),
@@ -3885,8 +3889,6 @@ impl App {
         if !self.ui.managed_fields() {
             self.ui.toggle(UiFlags::MANAGED_FIELDS);
         }
-        self.reset_body_scroll();
-        self.scroll_to_first_content_match();
         self.notice = None;
     }
 
@@ -6472,7 +6474,9 @@ mod tests {
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)),
             AppCommand::Action(ActionIntent::ManagedYaml {
-                target: target.clone()
+                target: target.clone(),
+                body: "kind: Pod".to_owned(),
+                decoded_body: None,
             })
         );
         assert!(!app.ui.managed_fields());
@@ -6482,6 +6486,9 @@ mod tests {
         app.show_managed_yaml(&stale, "stale".to_owned(), None);
         assert!(!app.ui.managed_fields());
 
+        app.content_scroll = 7;
+        app.content_horizontal_scroll = 3;
+        app.body_query = "metadata".to_owned();
         app.show_managed_yaml(
             &target,
             "metadata:\n  managedFields:\n  - manager: kubelet".to_owned(),
@@ -6489,6 +6496,14 @@ mod tests {
         );
         assert!(app.ui.managed_fields());
         assert!(app.active_content_body().contains("managedFields"));
+        assert_eq!(app.content_scroll, 7);
+        assert_eq!(app.content_horizontal_scroll, 3);
+        assert_eq!(app.body_query, "metadata");
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert_eq!(app.active_content_body(), "kind: Pod");
+        assert_eq!(app.content_scroll, 7);
+        assert_eq!(app.content_horizontal_scroll, 3);
+        assert_eq!(app.body_query, "metadata");
     }
 
     #[test]

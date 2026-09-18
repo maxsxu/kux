@@ -434,7 +434,11 @@ async fn handle_action(client: Client, context: &str, action: ActionIntent) -> A
         ActionIntent::Content { target, content } => {
             fetch_content(client, context, &target, content).await
         }
-        ActionIntent::ManagedYaml { target } => fetch_managed_yaml(client, target).await,
+        ActionIntent::ManagedYaml {
+            target,
+            body,
+            decoded_body,
+        } => fetch_managed_yaml(client, target, body, decoded_body).await,
         ActionIntent::Containers { target } => load_containers(client, target).await,
         ActionIntent::ContainerLogs { target, previous } => {
             fetch_container_logs(client, target, previous).await
@@ -1155,14 +1159,15 @@ async fn fetch_content(
 async fn fetch_managed_yaml(
     client: Client,
     target: ResourceTarget,
+    body: String,
+    decoded_body: Option<String>,
 ) -> Result<ActionResult, String> {
     let object = dynamic_target_api(client, &target)?
         .get(&target.name)
         .await
         .map_err(|error| error.to_string())?;
-    let format_target = target.clone();
     let (body, decoded_body) = tokio::task::spawn_blocking(move || {
-        managed_yaml_content_from_object(&object, &format_target)
+        managed_yaml_content_from_object(&object, &body, decoded_body.as_deref())
     })
     .await
     .map_err(|error| format!("Unable to format managed-fields YAML: {error}"))??;
@@ -1175,18 +1180,38 @@ async fn fetch_managed_yaml(
 
 fn managed_yaml_content_from_object(
     object: &DynamicObject,
-    target: &ResourceTarget,
+    body: &str,
+    decoded_body: Option<&str>,
 ) -> Result<(String, Option<String>), String> {
-    let decoded = is_core_v1_secret(target)
-        .then(|| decode_secret_object(object))
-        .flatten();
-    let body = serde_yaml::to_string(object).map_err(|error| error.to_string())?;
-    let decoded_body = decoded
-        .as_ref()
-        .map(serde_yaml::to_string)
-        .transpose()
+    let Some(fields) = object.metadata.managed_fields.as_ref() else {
+        return Ok((body.to_owned(), decoded_body.map(str::to_owned)));
+    };
+    let fragment = serde_yaml::to_string(&BTreeMap::from([("managedFields", fields)]))
         .map_err(|error| error.to_string())?;
-    Ok((body, decoded_body))
+    Ok((
+        insert_managed_fields_yaml(body, &fragment)?,
+        decoded_body
+            .map(|body| insert_managed_fields_yaml(body, &fragment))
+            .transpose()?,
+    ))
+}
+
+/// Add only the managed-fields entry to the already displayed snapshot. Reusing
+/// its text preserves every other value, including encoded/decoded Secret data.
+pub(super) fn insert_managed_fields_yaml(body: &str, fragment: &str) -> Result<String, String> {
+    let header = "metadata:\n";
+    let offset = body
+        .match_indices(header)
+        .find(|(index, _)| *index == 0 || body.as_bytes()[index - 1] == b'\n')
+        .map(|(index, _)| index + header.len())
+        .ok_or_else(|| "Displayed YAML has no metadata mapping".to_owned())?;
+    let mut result = String::with_capacity(body.len() + fragment.len());
+    result.push_str(&body[..offset]);
+    for line in fragment.lines() {
+        let _ = writeln!(result, "  {line}");
+    }
+    result.push_str(&body[offset..]);
+    Ok(result)
 }
 
 async fn fetch_secret_data(
@@ -5064,11 +5089,49 @@ mod tests {
         assert_eq!(yaml.decoded_with_managed_fields.as_deref(), Some(""));
 
         let (managed, decoded_managed) =
-            managed_yaml_content_from_object(&object, &target).expect("managed-fields yaml");
+            managed_yaml_content_from_object(&object, &yaml.body, Some(&decoded))
+                .expect("managed-fields yaml");
         assert!(managed.contains("managedFields"));
         let decoded_managed = decoded_managed.expect("decoded managed body");
         assert!(decoded_managed.contains("managedFields"));
         assert!(decoded_managed.contains("0x00ff10"));
+    }
+
+    #[test]
+    fn managed_fields_toggle_preserves_the_displayed_snapshot() {
+        let original = "apiVersion: v1\nkind: Secret\nmetadata:\n  name: example\n  resourceVersion: '1'\n  annotations:\n    keep: original\ndata:\n  token: b2xk\nspec:\n  managedFields: keep-this\nstatus:\n  phase: Old\n";
+        let decoded = original.replace("b2xk", "old");
+        let latest: DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Secret",
+            "metadata": {
+                "name": "example", "resourceVersion": "2",
+                "annotations": {"keep": "changed"},
+                "managedFields": [{"manager": "controller", "operation": "Update", "apiVersion": "v1"}]
+            },
+            "data": {"token": "bmV3"},
+            "spec": {"managedFields": "changed"},
+            "status": {"phase": "New"}
+        })).unwrap();
+        let (body, decoded_body) =
+            managed_yaml_content_from_object(&latest, original, Some(&decoded)).unwrap();
+        for (expanded, baseline) in [(body, original), (decoded_body.unwrap(), decoded.as_str())] {
+            let mut value: serde_json::Value = serde_yaml::from_str(&expanded).unwrap();
+            assert_eq!(
+                value["metadata"]["managedFields"][0]["manager"],
+                "controller"
+            );
+            value["metadata"]
+                .as_object_mut()
+                .unwrap()
+                .remove("managedFields");
+            assert_eq!(
+                value,
+                serde_yaml::from_str::<serde_json::Value>(baseline).unwrap()
+            );
+            let (prefix, suffix) = baseline.split_once("metadata:\n").unwrap();
+            assert!(expanded.starts_with(&format!("{prefix}metadata:\n")));
+            assert!(expanded.ends_with(suffix));
+        }
     }
 
     #[test]
