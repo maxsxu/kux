@@ -33,7 +33,7 @@ K9s key and reports that its backend is pending, and **planned** is not yet expo
 | Interaction | Key | Status |
 | --- | --- | --- |
 | Vim navigation | `h/j/k/l`, `g/G`, `Ctrl-B/F` | Implemented contextually across resource lists, choosers, text bodies, help, details, and confirmation actions |
-| Horizontal arrow scrolling | Left/Right | Scrolls text bodies only; never opens, closes, selects, or activates list, chooser, or confirmation items |
+| Horizontal arrow scrolling | Left/Right | Scrolls text bodies and Pod tables; never opens, closes, selects, or activates items |
 | Mark, range mark, clear | `Space`, `Ctrl-Space`, `Ctrl-\` | Implemented |
 | Faults, wide, header, logo | `Ctrl-Z/W/E/L` | Implemented |
 | Select column | `Shift-Left`, `Shift-Right` | Implemented |

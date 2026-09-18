@@ -1,9 +1,10 @@
 use ratatui::{
     Frame,
+    buffer::Buffer,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, Wrap},
+    widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, Widget, Wrap},
 };
 
 use crate::{
@@ -861,6 +862,7 @@ fn view_column(
 }
 
 fn columns_for_view(app: &App, width: u16) -> Vec<ViewColumn> {
+    let scrollable_pods = is_pod_list(app);
     let mut columns = vec![ViewColumn {
         label: String::new(),
         field: None,
@@ -873,7 +875,7 @@ fn columns_for_view(app: &App, width: u16) -> Vec<ViewColumn> {
     let show_namespace = app.is_resource_view()
         && app.kind.is_namespaced()
         && (app.namespace.is_none() || app.ui.wide())
-        && width >= 64;
+        && (scrollable_pods || width >= 64);
     if show_namespace {
         columns.push(view_column(
             "NAMESPACE",
@@ -900,9 +902,51 @@ fn columns_for_view(app: &App, width: u16) -> Vec<ViewColumn> {
     columns.extend(
         kind_columns
             .into_iter()
-            .filter(|column| width >= column.visible_from),
+            .filter(|column| scrollable_pods || width >= column.visible_from),
     );
+    if scrollable_pods {
+        // Pod names must not share a shrinking Fill constraint with other columns.
+        // Measure every loaded row so vertical scrolling cannot truncate a longer name.
+        for column in &mut columns {
+            if matches!(column.width, Constraint::Fill(_)) {
+                let content_width = app
+                    .snapshot
+                    .rows
+                    .iter()
+                    .map(|row| match column.field {
+                        Some(SortField::Namespace) => row.namespace.len(),
+                        Some(SortField::Name) => row.name.len(),
+                        Some(SortField::Node) => row.pod_data().map_or(0, |pod| pod.node.len()),
+                        _ => 0,
+                    })
+                    .max()
+                    .unwrap_or(0)
+                    .max(column.label.len().saturating_add(2));
+                column.width = Constraint::Length(u16::try_from(content_width).unwrap_or(u16::MAX));
+            }
+        }
+    }
     columns
+}
+
+fn is_pod_list(app: &App) -> bool {
+    app.is_resource_view() && app.kind.known_kind() == Some(ResourceKind::Pods)
+}
+
+fn resource_table_width(app: &App, columns: &[ViewColumn], viewport_width: u16) -> u16 {
+    if !is_pod_list(app) {
+        return viewport_width;
+    }
+    columns
+        .iter()
+        .fold(0_u16, |width, column| {
+            let Constraint::Length(length) = column.width else {
+                return width;
+            };
+            width.saturating_add(length).saturating_add(1)
+        })
+        .saturating_sub(1)
+        .max(viewport_width)
 }
 
 fn server_table_columns(app: &App, namespace_already_shown: bool) -> Vec<ViewColumn> {
@@ -1170,6 +1214,8 @@ fn draw_resources(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let viewport_height = usize::from(area.height.saturating_sub(if show_header { 3 } else { 2 }));
     app.set_viewport_height(viewport_height);
     let columns = columns_for_view(app, area.width);
+    let table_width = resource_table_width(app, &columns, area.width.saturating_sub(2));
+    app.set_list_scroll_extent(table_width, area.width.saturating_sub(2));
     let filter = if app.input_mode == InputMode::Filter && !app.input.is_empty() {
         &app.input
     } else {
@@ -1226,7 +1272,9 @@ fn draw_resources(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .title_alignment(Alignment::Center),
         app,
     );
-    let mut table = Table::new(rows, widths).column_spacing(1).block(block);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let mut table = Table::new(rows, widths).column_spacing(1);
     if show_header {
         let header_cells = columns.iter().map(|column| {
             column.field.map_or_else(
@@ -1236,7 +1284,7 @@ fn draw_resources(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         });
         table = table.header(Row::new(header_cells).bottom_margin(1));
     }
-    frame.render_widget(table, area);
+    draw_scrolled_table(frame, table, inner, table_width, app.list_horizontal_scroll);
     if show_header {
         update_column_hitboxes(app, area, &hitbox_widths, &columns);
     } else {
@@ -1259,6 +1307,30 @@ fn draw_resources(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 .style(Style::default().fg(MUTED)),
             centered_rect(70, 3, area),
         );
+    }
+}
+
+fn draw_scrolled_table(
+    frame: &mut Frame<'_>,
+    table: Table<'_>,
+    viewport: Rect,
+    width: u16,
+    scroll: u16,
+) {
+    if width <= viewport.width {
+        frame.render_widget(table, viewport);
+        return;
+    }
+    // Render only the visible rows at their natural column widths, then copy the
+    // horizontal viewport. Keep the border/title outside this scrolling buffer.
+    let area = Rect::new(0, 0, width, viewport.height);
+    let mut buffer = Buffer::empty(area);
+    table.render(area, &mut buffer);
+    let target = frame.buffer_mut();
+    for y in 0..viewport.height {
+        for x in 0..viewport.width {
+            target[(viewport.x + x, viewport.y + y)] = buffer[(scroll + x, y)].clone();
+        }
     }
 }
 
@@ -1440,9 +1512,9 @@ fn update_column_hitboxes(
         return;
     }
     let header_area = Rect::new(
-        area.x.saturating_add(1),
+        0,
         area.y.saturating_add(1),
-        area.width.saturating_sub(2),
+        resource_table_width(app, visible, area.width.saturating_sub(2)),
         1,
     );
     let columns = Layout::horizontal(widths.to_vec())
@@ -1452,12 +1524,19 @@ fn update_column_hitboxes(
         .iter()
         .zip(visible)
         .filter_map(|(column, spec)| {
-            spec.field.map(|field| ColumnHitbox {
-                x: column.x,
-                y: column.y,
-                width: column.width,
-                field,
-            })
+            let start = column.x.saturating_sub(app.list_horizontal_scroll);
+            let end = column
+                .right()
+                .saturating_sub(app.list_horizontal_scroll)
+                .min(area.width.saturating_sub(2));
+            spec.field
+                .filter(|_| end > start)
+                .map(|field| ColumnHitbox {
+                    x: area.x.saturating_add(1).saturating_add(start),
+                    y: column.y,
+                    width: end - start,
+                    field,
+                })
         })
         .collect();
     app.set_column_hitboxes(hitboxes);
@@ -3277,6 +3356,91 @@ mod tests {
             .expect("nested name line");
         assert_eq!(name_column, metadata_column + 2);
         assert!(!lines.iter().any(|line| line.contains("NAME       STATUS")));
+    }
+
+    #[test]
+    fn pod_names_keep_their_full_width_in_namespaced_and_all_namespace_lists() {
+        let name = format!("provider-terraform-{}-last", "a".repeat(65));
+        for namespace in [None, Some("default".to_owned())] {
+            let mut app = app_with_rendered_pod();
+            app.namespace = namespace;
+            app.apply_snapshot(ResourceSnapshot {
+                rows: Arc::new(vec![Arc::new(ResourceRow::new(
+                    "default", &name, "Running", "1/1", "0", 0,
+                ))]),
+                revision: 2,
+                ..app.snapshot.clone()
+            });
+            let mut terminal = Terminal::new(TestBackend::new(120, 8)).unwrap();
+            terminal
+                .draw(|frame| draw_resources(frame, &mut app, frame.area()))
+                .unwrap();
+            let lines = rendered_lines(&terminal, 120);
+            assert!(lines[3].contains(&name), "full pod name: {}", lines[3]);
+            assert_eq!(app.list_horizontal_scroll, 0);
+        }
+    }
+
+    #[test]
+    fn pod_table_scrolls_full_names_and_columns_with_fixed_border_and_mouse_sorting() {
+        let name = format!("pod-{}-last", "a".repeat(150));
+        let mut app = app_with_rendered_pod();
+        app.apply_snapshot(ResourceSnapshot {
+            rows: Arc::new(vec![Arc::new(ResourceRow::new(
+                "default", &name, "Running", "1/1", "0", 0,
+            ))]),
+            revision: 2,
+            ..app.snapshot.clone()
+        });
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        terminal
+            .draw(|frame| draw_resources(frame, &mut app, frame.area()))
+            .unwrap();
+        let initial = rendered_lines(&terminal, 60);
+        assert!(initial[3].contains("pod-aaaa"));
+
+        // Scroll far enough to see the end of the name and the adjacent columns.
+        for _ in 0..130 {
+            app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        }
+        terminal
+            .draw(|frame| draw_resources(frame, &mut app, frame.area()))
+            .unwrap();
+        let scrolled = rendered_lines(&terminal, 60);
+        assert!(scrolled[3].contains("-last"));
+        assert!(scrolled[3].contains("Running"));
+        assert_eq!(scrolled[0], initial[0], "title stays fixed");
+        assert_eq!(scrolled[7], initial[7], "border stays fixed");
+        let column = u16::try_from(scrolled[1].find("STATUS").unwrap()).unwrap();
+        assert!(app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(app.sort_field, SortField::Status);
+
+        for _ in 0..1000 {
+            app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        }
+        terminal
+            .draw(|frame| draw_resources(frame, &mut app, frame.area()))
+            .unwrap();
+        let end = rendered_lines(&terminal, 60);
+        assert!(end[1].contains("AGE"), "last column is reachable");
+        let max_scroll = app.list_horizontal_scroll;
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.list_horizontal_scroll, max_scroll);
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.list_horizontal_scroll, max_scroll - 1);
+        assert_eq!(app.selected, 0, "scrolling does not change selection");
+
+        let mut wider = Terminal::new(TestBackend::new(600, 8)).unwrap();
+        wider
+            .draw(|frame| draw_resources(frame, &mut app, frame.area()))
+            .unwrap();
+        assert_eq!(app.list_horizontal_scroll, 0, "resize clamps scrolling");
+        assert!(rendered_lines(&wider, 600)[3].contains(&name));
     }
 
     #[test]

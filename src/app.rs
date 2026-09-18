@@ -692,6 +692,8 @@ pub struct App {
     pub selected_column: usize,
     pub selected: usize,
     pub offset: usize,
+    pub list_horizontal_scroll: u16,
+    list_max_horizontal_scroll: u16,
     pub viewport_height: usize,
     pub filtered: Vec<usize>,
     pub started_loading_at: Instant,
@@ -800,6 +802,8 @@ impl App {
             selected_column: 1,
             selected: 0,
             offset: 0,
+            list_horizontal_scroll: 0,
+            list_max_horizontal_scroll: 0,
             viewport_height: 1,
             filtered: Vec::new(),
             started_loading_at: Instant::now(),
@@ -1142,6 +1146,13 @@ impl App {
         self.chooser_hitbox = ChooserHitbox::default();
     }
 
+    pub(crate) fn set_list_scroll_extent(&mut self, width: u16, viewport_width: u16) {
+        self.list_max_horizontal_scroll = width.saturating_sub(viewport_width);
+        self.list_horizontal_scroll = self
+            .list_horizontal_scroll
+            .min(self.list_max_horizontal_scroll);
+    }
+
     fn handle_browse_key(&mut self, key: KeyEvent) -> AppCommand {
         match key.code {
             KeyCode::Char('?') => self.open_overlay(Overlay::Help),
@@ -1149,7 +1160,17 @@ impl App {
             KeyCode::Char('/') => self.start_input(InputMode::Filter),
             KeyCode::Esc | KeyCode::Char('h') => self.escape_view(),
             KeyCode::Enter => self.open_selected(),
-            KeyCode::Left | KeyCode::Right => AppCommand::None,
+            KeyCode::Left => {
+                self.list_horizontal_scroll = self.list_horizontal_scroll.saturating_sub(1);
+                AppCommand::None
+            }
+            KeyCode::Right => {
+                self.list_horizontal_scroll = self
+                    .list_horizontal_scroll
+                    .saturating_add(1)
+                    .min(self.list_max_horizontal_scroll);
+                AppCommand::None
+            }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.move_selection_down(1);
                 AppCommand::None
@@ -2760,6 +2781,8 @@ impl App {
         self.namespace.clone_from(&view.namespace);
         self.field_selector.clone_from(&view.field_selector);
         self.label_selector.clone_from(&view.label_selector);
+        self.list_horizontal_scroll = 0;
+        self.list_max_horizontal_scroll = 0;
         if view.kind.is_namespaced() {
             self.remember_namespace(view.namespace.clone());
         }
@@ -4521,16 +4544,19 @@ mod tests {
         let mut list = app_with_rows();
         list.query = "api".to_owned();
         list.rebuild_filter(None);
+        list.set_list_scroll_extent(200, 100);
         assert_eq!(
             list.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
             AppCommand::None
         );
         assert_eq!(list.overlay, Overlay::None);
+        assert_eq!(list.list_horizontal_scroll, 1);
         assert_eq!(
             list.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
             AppCommand::None
         );
         assert_eq!(list.query, "api", "Left does not clear or leave the view");
+        assert_eq!(list.list_horizontal_scroll, 0);
 
         let mut chooser = app_with_rows();
         chooser.open_aliases();

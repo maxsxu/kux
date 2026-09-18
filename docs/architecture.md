@@ -78,6 +78,11 @@ outside the viewport. The frame timer is only a maximum rate: a frame is produce
 is dirty, plus a one-second heartbeat for age labels. Resize, input, or a new snapshot marks the
 state dirty.
 
+Pod tables size the name column for the longest loaded pod name and keep all columns available.
+When the table is wider than the terminal, Left/Right scrolls its visible rows and column headers
+horizontally while the border and section title stay fixed. Mouse column hitboxes follow the
+horizontal offset. The scroll offset is clamped on resize and reset on resource navigation.
+
 ## Memory model
 
 Each Kubernetes object is converted to an `Arc<ResourceRow>` and then dropped. Strings inside a
