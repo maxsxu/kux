@@ -977,6 +977,18 @@ fn is_created_at_column(name: &str) -> bool {
     )
 }
 
+fn resource_list_scope(app: &App) -> &str {
+    if app.kind.known_kind() == Some(ResourceKind::Pods)
+        && let Some(node) = app
+            .field_selector
+            .as_deref()
+            .and_then(|selector| selector.strip_prefix("spec.nodeName="))
+    {
+        return node;
+    }
+    app.namespace_display()
+}
+
 fn api_service_columns(app: &App) -> Vec<ViewColumn> {
     let service_width = app
         .snapshot
@@ -1193,7 +1205,7 @@ fn draw_resources(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         ListMode::Resources => format!(
             " {}({})[{}]{} ",
             app.kind.plural_name(),
-            app.namespace_display(),
+            resource_list_scope(app),
             visible_count,
             filter_suffix
         ),
@@ -4200,6 +4212,88 @@ mod tests {
             .position(|line| line.contains("pods(default)[0] /api"))
             .expect("resource title with filter");
         assert!(prompt_row < title_row);
+    }
+
+    #[test]
+    fn node_pods_title_shows_node_name_and_filtered_count() {
+        let mut app = App::new(
+            "demo",
+            None,
+            ResourceKind::Nodes,
+            false,
+            vec!["demo".to_owned()],
+        );
+        app.apply_snapshot(ResourceSnapshot {
+            generation: app.generation,
+            kind: ResourceKind::Nodes.into(),
+            rows: Arc::new(vec![Arc::new(ResourceRow::new(
+                "-",
+                "worker-07",
+                "Ready",
+                "worker",
+                "v1.32.0",
+                0,
+            ))]),
+            table_columns: Arc::from([]),
+            state: SourceState::Ready,
+            revision: 1,
+            emitted_at: Instant::now(),
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(
+            rendered_lines(&terminal, 100)
+                .join("\n")
+                .contains("pods(worker-07)[0]")
+        );
+
+        app.apply_snapshot(ResourceSnapshot {
+            generation: app.generation,
+            kind: ResourceKind::Pods.into(),
+            rows: Arc::new(vec![
+                Arc::new(ResourceRow::new(
+                    "default", "api-0", "Running", "1/1", "0", 0,
+                )),
+                Arc::new(ResourceRow::new(
+                    "system", "agent-0", "Running", "1/1", "0", 0,
+                )),
+            ]),
+            table_columns: Arc::from([]),
+            state: SourceState::Ready,
+            revision: 1,
+            emitted_at: Instant::now(),
+        });
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered = rendered_lines(&terminal, 100).join("\n");
+        assert!(rendered.contains("pods(worker-07)[2]"));
+        assert!(
+            columns_for_view(&app, 100)
+                .iter()
+                .any(|column| column.label == "NAMESPACE")
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for character in "api".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(
+            rendered_lines(&terminal, 100)
+                .join("\n")
+                .contains("pods(worker-07)[1] /api")
+        );
+
+        // Escape first clears the filter, then returns to the Node list.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(
+            rendered_lines(&terminal, 100)
+                .join("\n")
+                .contains("nodes(all)[0]")
+        );
     }
 
     #[test]
