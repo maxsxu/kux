@@ -552,6 +552,9 @@ fn draw_header_menu_columns(frame: &mut Frame<'_>, area: Rect, columns: &[Header
 }
 
 fn namespace_hints(app: &App) -> Vec<HeaderHint> {
+    if app.overlay == Overlay::Content && app.content_kind == Some(ContentKind::Yaml) {
+        return Vec::new();
+    }
     std::iter::once(HeaderHint {
         key: "0".to_owned(),
         label: "all".to_owned(),
