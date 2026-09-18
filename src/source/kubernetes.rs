@@ -1200,11 +1200,25 @@ fn managed_yaml_content_from_object(
 /// its text preserves every other value, including encoded/decoded Secret data.
 pub(super) fn insert_managed_fields_yaml(body: &str, fragment: &str) -> Result<String, String> {
     let header = "metadata:\n";
-    let offset = body
+    let mut offset = body
         .match_indices(header)
         .find(|(index, _)| *index == 0 || body.as_bytes()[index - 1] == b'\n')
         .map(|(index, _)| index + header.len())
         .ok_or_else(|| "Displayed YAML has no metadata mapping".to_owned())?;
+    // ObjectMeta keys are serialized in dictionary order. Skip complete earlier
+    // entries, including their nested mappings and indentless YAML sequences.
+    for line in body[offset..].split_inclusive('\n') {
+        if !line.starts_with(' ') && !line.trim().is_empty() {
+            break;
+        }
+        let key = line
+            .strip_prefix("  ")
+            .and_then(|entry| entry.split_once(':'));
+        if key.is_some_and(|(key, _)| !key.starts_with([' ', '-']) && key > "managedFields") {
+            break;
+        }
+        offset += line.len();
+    }
     let mut result = String::with_capacity(body.len() + fragment.len());
     result.push_str(&body[..offset]);
     for line in fragment.lines() {
@@ -5099,7 +5113,7 @@ mod tests {
 
     #[test]
     fn managed_fields_toggle_preserves_the_displayed_snapshot() {
-        let original = "apiVersion: v1\nkind: Secret\nmetadata:\n  name: example\n  resourceVersion: '1'\n  annotations:\n    keep: original\ndata:\n  token: b2xk\nspec:\n  managedFields: keep-this\nstatus:\n  phase: Old\n";
+        let original = "apiVersion: v1\nkind: Secret\nmetadata:\n  annotations:\n    keep: original\n  labels:\n    z-last: unchanged\n  name: example\n  resourceVersion: '1'\ndata:\n  token: b2xk\nspec:\n  managedFields: keep-this\nstatus:\n  phase: Old\n";
         let decoded = original.replace("b2xk", "old");
         let latest: DynamicObject = serde_json::from_value(serde_json::json!({
             "apiVersion": "v1", "kind": "Secret",
@@ -5128,9 +5142,32 @@ mod tests {
                 value,
                 serde_yaml::from_str::<serde_json::Value>(baseline).unwrap()
             );
-            let (prefix, suffix) = baseline.split_once("metadata:\n").unwrap();
-            assert!(expanded.starts_with(&format!("{prefix}metadata:\n")));
+            let (prefix, suffix) = baseline.split_once("  name:").unwrap();
+            assert!(expanded.starts_with(&format!("{prefix}  managedFields:\n")));
             assert!(expanded.ends_with(suffix));
+        }
+    }
+
+    #[test]
+    fn inserts_managed_fields_in_dictionary_order_within_metadata() {
+        let fragment = "managedFields:\n- manager: controller\n";
+        let inserted = "  managedFields:\n  - manager: controller\n";
+        for (before, after) in [
+            (
+                "metadata:\n  annotations:\n    z-key: value\n  finalizers:\n  - z-finalizer\n  labels:\n    z-label: value\n",
+                "  name: example\n  namespace: default\n  resourceVersion: '1'\n",
+            ),
+            ("metadata:\n", "  name: example\n"),
+            (
+                "metadata:\n  labels:\n    app: example\n",
+                "spec:\n  value: keep\n",
+            ),
+            ("metadata:\n  labels:\n    app: example\n", ""),
+        ] {
+            assert_eq!(
+                insert_managed_fields_yaml(&format!("{before}{after}"), fragment).unwrap(),
+                format!("{before}{inserted}{after}"),
+            );
         }
     }
 
