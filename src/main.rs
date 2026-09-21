@@ -212,6 +212,8 @@ async fn run(
             }
             _ = heartbeat.tick() => {
                 app.tick();
+                let command = app.poll_yaml_refresh();
+                handle_app_command(command, &mut app, &mut terminal, &requests, &actions, &mut port_forwards).await?;
                 dirty = true;
             }
             _ = frames.tick(), if dirty => {
@@ -293,6 +295,7 @@ async fn handle_app_command(
             refresh_visible_port_forwards(app, port_forwards);
         }
         AppCommand::Action(action) => {
+            let background_refresh = matches!(&action, ActionIntent::RefreshYaml { .. });
             let keeps_overlay = matches!(&action, ActionIntent::ManagedYaml { .. });
             let log_action = matches!(
                 &action,
@@ -307,7 +310,7 @@ async fn handle_app_command(
                 .context("action worker stopped")?;
             if keeps_overlay {
                 app.show_transient_notice("Loading managed fields…");
-            } else if !log_action {
+            } else if !log_action && !background_refresh {
                 app.show_notice("Working…");
             }
         }
@@ -347,6 +350,9 @@ fn refresh_visible_port_forwards(app: &mut App, manager: &PortForwardManager) {
 
 fn apply_action_result(app: &mut App, result: ActionResult) -> AppCommand {
     match result {
+        ActionResult::RefreshedYaml { id, target, result } => {
+            app.apply_yaml_refresh(id, &target, result);
+        }
         ActionResult::Scoped { generation, result } => {
             if app.generation == generation {
                 return apply_action_result(app, *result);

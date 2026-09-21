@@ -41,7 +41,20 @@ pub struct KubernetesSettings {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct YamlContent {
+    pub body: String,
+    pub with_managed_fields: Option<String>,
+    pub decoded_body: Option<String>,
+    pub decoded_with_managed_fields: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionResult {
+    RefreshedYaml {
+        id: u64,
+        target: ResourceTarget,
+        result: Result<YamlContent, String>,
+    },
     LogBatch {
         id: u64,
         lines: Vec<String>,

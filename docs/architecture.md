@@ -101,6 +101,10 @@ fetches strip managed fields and serialize only the compact object on the blocki
 `m` fetches managed fields through a separate cancellable read and inserts only
 `metadata.managedFields` into the displayed snapshot. Other YAML text, including encoded/decoded
 Secret data, remains unchanged; later toggles are local and preserve scrolling and filtering.
+Open YAML views also request a background GET every five seconds, with one request in flight and a
+ten-second timeout. Refresh results preserve view state and include managed fields only after they
+have been loaded. Generation, target, and YAML-session checks reject stale results after navigation
+or reopening the same resource. Errors keep the displayed document and retry on the next interval.
 Unwrapped content syntax-highlights and allocates only the visible terminal rows. Read
 actions carry the view generation and are cancelled when resource navigation changes, so a late
 YAML, log, container, policy, owner, or child-discovery result cannot replace a newer resource view. Describe invokes

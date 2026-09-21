@@ -115,6 +115,8 @@ Resource ──y / d / e──▶ Formatted YAML / kubectl describe / interactiv
 Command and filter mode remain available from resource tables, contexts, details, YAML, describe,
 logs, containers, and authorization policy views. In YAML, `/` keeps the complete document visible
 and scrolls directly to the first matching line; `n` and `Shift-N` continue through the document.
+YAML auto-refreshes every five seconds while open, preserving scrolling, search, wrap, fullscreen,
+and managed-fields/decoded Secret settings. Refresh failures retain the last displayed YAML and retry.
 
 ## Purpose-built Kubernetes views
 

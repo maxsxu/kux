@@ -120,6 +120,11 @@ fn demo_action(action: ActionIntent) -> ActionResult {
         } => demo_set_node_unschedulable(&name, unschedulable),
         ActionIntent::Restart { targets } => demo_restart(&targets),
         ActionIntent::Content { target, content } => demo_content(&target, content),
+        ActionIntent::RefreshYaml {
+            id,
+            target,
+            include_managed_fields,
+        } => demo_refresh_yaml(id, target, include_managed_fields),
         ActionIntent::ManagedYaml {
             target,
             body,
@@ -272,6 +277,42 @@ fn demo_delete(targets: &[ResourceTarget], immediate: bool) -> ActionResult {
         )
     };
     ActionResult::Notice(notice)
+}
+
+fn demo_refresh_yaml(
+    id: u64,
+    target: ResourceTarget,
+    include_managed_fields: bool,
+) -> ActionResult {
+    let ActionResult::Content {
+        body,
+        managed_fields,
+        decoded_body,
+        decoded_managed_fields,
+        ..
+    } = demo_content(&target, ContentKind::Yaml)
+    else {
+        unreachable!("demo YAML returns content");
+    };
+    let managed = |value: Option<String>| {
+        value.map(|body| {
+            if include_managed_fields {
+                body
+            } else {
+                String::new()
+            }
+        })
+    };
+    ActionResult::RefreshedYaml {
+        id,
+        target,
+        result: Ok(super::YamlContent {
+            body,
+            with_managed_fields: managed(managed_fields),
+            decoded_body,
+            decoded_with_managed_fields: managed(decoded_managed_fields),
+        }),
+    }
 }
 
 fn demo_content(target: &ResourceTarget, content: ContentKind) -> ActionResult {

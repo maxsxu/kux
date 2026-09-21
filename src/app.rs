@@ -14,7 +14,9 @@ use crate::model::{
     NamespaceInfo, OwnerReferenceData, PortForwardPort, ResourceDescriptor, ResourceKind,
     ResourceOperations, ResourceRow, ResourceSnapshot, SourceState, unix_now,
 };
-use crate::source::{LogRange, LogRequest, LogTarget};
+use crate::source::{LogRange, LogRequest, LogTarget, YamlContent};
+
+const YAML_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SortField {
@@ -326,6 +328,11 @@ pub enum ActionIntent {
         body: String,
         decoded_body: Option<String>,
     },
+    RefreshYaml {
+        id: u64,
+        target: ResourceTarget,
+        include_managed_fields: bool,
+    },
     Containers {
         target: ResourceTarget,
     },
@@ -369,6 +376,7 @@ impl ActionIntent {
             self,
             Self::Content { .. }
                 | Self::ManagedYaml { .. }
+                | Self::RefreshYaml { .. }
                 | Self::Containers { .. }
                 | Self::ContainerLogs { .. }
                 | Self::StartLogs { .. }
@@ -670,6 +678,13 @@ impl UiFlags {
 }
 
 #[derive(Debug)]
+struct YamlRefreshState {
+    id: u64,
+    pending: bool,
+    due: Instant,
+}
+
+#[derive(Debug)]
 pub struct App {
     pub context: String,
     pub server_version: String,
@@ -729,6 +744,7 @@ pub struct App {
     content_max_scroll: u16,
     content_match_cursor: Option<usize>,
     content_target: Option<ResourceTarget>,
+    yaml_refresh: YamlRefreshState,
     next_log_id: u64,
     saved_resource_list: Option<SavedResourceList>,
     pending_containers: Option<ResourceTarget>,
@@ -837,6 +853,11 @@ impl App {
             content_max_scroll: 0,
             content_match_cursor: None,
             content_target: None,
+            yaml_refresh: YamlRefreshState {
+                id: 0,
+                pending: false,
+                due: Instant::now(),
+            },
             next_log_id: 0,
             saved_resource_list: None,
             pending_containers: None,
@@ -871,6 +892,64 @@ impl App {
 
     pub fn tick(&mut self) {
         self.now_unix = unix_now();
+    }
+
+    pub fn poll_yaml_refresh(&mut self) -> AppCommand {
+        if self.overlay != Overlay::Content
+            || self.content_kind != Some(ContentKind::Yaml)
+            || self.yaml_refresh.pending
+            || Instant::now() < self.yaml_refresh.due
+        {
+            return AppCommand::None;
+        }
+        let Some(target) = self.content_target.clone() else {
+            return AppCommand::None;
+        };
+        self.yaml_refresh.pending = true;
+        AppCommand::Action(ActionIntent::RefreshYaml {
+            id: self.yaml_refresh.id,
+            target,
+            include_managed_fields: self
+                .content_managed_fields
+                .as_ref()
+                .is_some_and(|body| !body.is_empty()),
+        })
+    }
+
+    pub fn apply_yaml_refresh(
+        &mut self,
+        id: u64,
+        target: &ResourceTarget,
+        result: Result<YamlContent, String>,
+    ) {
+        if self.overlay != Overlay::Content
+            || self.content_kind != Some(ContentKind::Yaml)
+            || self.content_target.as_ref() != Some(target)
+            || self.yaml_refresh.id != id
+        {
+            return;
+        }
+        self.yaml_refresh.pending = false;
+        self.yaml_refresh.due = Instant::now() + YAML_REFRESH_INTERVAL;
+        match result {
+            Ok(yaml) => {
+                self.content_body = yaml.body;
+                self.content_managed_fields = yaml.with_managed_fields;
+                self.content_decoded_body = yaml.decoded_body;
+                self.content_decoded_managed_fields = yaml.decoded_with_managed_fields;
+                if self.ui.managed_fields() && self.content_managed_fields.is_none() {
+                    self.ui.toggle(UiFlags::MANAGED_FIELDS);
+                }
+                if self
+                    .notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.starts_with("YAML refresh failed:"))
+                {
+                    self.notice = None;
+                }
+            }
+            Err(error) => self.show_transient_notice(format!("YAML refresh failed: {error}")),
+        }
     }
 
     #[must_use]
@@ -2350,6 +2429,10 @@ impl App {
                         let Some(target) = self.content_target.clone() else {
                             return AppCommand::None;
                         };
+                        // This action uses the current snapshot: invalidate an older refresh
+                        // and do not start another until managed fields have been inserted.
+                        self.yaml_refresh.id = self.yaml_refresh.id.wrapping_add(1);
+                        self.yaml_refresh.pending = true;
                         AppCommand::Action(ActionIntent::ManagedYaml {
                             target,
                             body: self.content_body.clone(),
@@ -3875,6 +3958,9 @@ impl App {
         decoded_managed_fields: Option<String>,
         content: ContentKind,
     ) {
+        self.yaml_refresh.id = self.yaml_refresh.id.wrapping_add(1);
+        self.yaml_refresh.pending = false;
+        self.yaml_refresh.due = Instant::now() + YAML_REFRESH_INTERVAL;
         self.log_view = None;
         self.content_title = title.into();
         self.content_body = body.into();
@@ -3908,6 +3994,8 @@ impl App {
             return;
         }
         self.content_managed_fields = Some(body);
+        self.yaml_refresh.pending = false;
+        self.yaml_refresh.due = Instant::now() + YAML_REFRESH_INTERVAL;
         self.content_decoded_managed_fields = decoded_body;
         if !self.ui.managed_fields() {
             self.ui.toggle(UiFlags::MANAGED_FIELDS);
@@ -6482,6 +6570,131 @@ mod tests {
     }
 
     #[test]
+    fn yaml_auto_refresh_preserves_view_state_and_uses_the_opened_target() {
+        let mut app = app_with_rows();
+        let AppCommand::Action(ActionIntent::Content { target, .. }) =
+            app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        else {
+            panic!("expected YAML action");
+        };
+        app.show_content(
+            "YAML",
+            "old",
+            Some("old managed".to_owned()),
+            Some("old decoded".to_owned()),
+            Some("old decoded managed".to_owned()),
+            ContentKind::Yaml,
+        );
+        assert_eq!(app.poll_yaml_refresh(), AppCommand::None);
+        app.content_scroll = 7;
+        app.content_horizontal_scroll = 3;
+        app.body_query = "status".to_owned();
+        app.ui.toggle(UiFlags::MANAGED_FIELDS);
+        app.ui.toggle(UiFlags::SECRET_DECODED);
+        app.ui.toggle(UiFlags::WRAP);
+        app.ui.toggle(UiFlags::FULLSCREEN);
+        let flags = app.ui;
+        app.selected = 1;
+        app.yaml_refresh.due = Instant::now();
+        assert_eq!(
+            app.poll_yaml_refresh(),
+            AppCommand::Action(ActionIntent::RefreshYaml {
+                id: app.yaml_refresh.id,
+                target: target.clone(),
+                include_managed_fields: true,
+            })
+        );
+        assert_eq!(
+            app.poll_yaml_refresh(),
+            AppCommand::None,
+            "only one in-flight refresh"
+        );
+        app.apply_yaml_refresh(
+            app.yaml_refresh.id,
+            &target,
+            Ok(YamlContent {
+                body: "new".to_owned(),
+                with_managed_fields: Some("new managed".to_owned()),
+                decoded_body: Some("new decoded".to_owned()),
+                decoded_with_managed_fields: Some("new decoded managed".to_owned()),
+            }),
+        );
+        assert_eq!(app.active_content_body(), "new decoded managed");
+        assert_eq!(app.ui, flags);
+        assert_eq!(app.content_scroll, 7);
+        assert_eq!(app.content_horizontal_scroll, 3);
+        assert_eq!(app.body_query, "status");
+        assert_eq!(app.overlay, Overlay::Content);
+        assert_eq!(
+            app.poll_yaml_refresh(),
+            AppCommand::None,
+            "wait before refreshing again"
+        );
+    }
+
+    #[test]
+    fn yaml_refresh_errors_retry_and_stale_results_cannot_replace_a_reopened_view() {
+        let mut app = app_with_rows();
+        let AppCommand::Action(ActionIntent::Content { target, .. }) =
+            app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        else {
+            panic!("expected YAML action");
+        };
+        app.show_content(
+            "YAML",
+            "original",
+            Some(String::new()),
+            None,
+            None,
+            ContentKind::Yaml,
+        );
+        app.yaml_refresh.due = Instant::now();
+        let AppCommand::Action(ActionIntent::RefreshYaml {
+            id,
+            include_managed_fields,
+            ..
+        }) = app.poll_yaml_refresh()
+        else {
+            panic!("expected automatic refresh");
+        };
+        assert!(!include_managed_fields, "managed fields remain lazy");
+        app.apply_yaml_refresh(id, &target, Err("unavailable".to_owned()));
+        assert_eq!(app.content_body, "original");
+        assert_eq!(app.overlay, Overlay::Content);
+        assert!(!app.yaml_refresh.pending);
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("YAML refresh failed:")
+        );
+        app.yaml_refresh.due = Instant::now();
+        assert!(matches!(
+            app.poll_yaml_refresh(),
+            AppCommand::Action(ActionIntent::RefreshYaml { .. })
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.apply_yaml_refresh(id, &target, Err("late error".to_owned()));
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(app.poll_yaml_refresh(), AppCommand::None);
+        app.show_content("YAML", "reopened", None, None, None, ContentKind::Yaml);
+        app.apply_yaml_refresh(
+            id,
+            &target,
+            Ok(YamlContent {
+                body: "stale".to_owned(),
+                with_managed_fields: None,
+                decoded_body: None,
+                decoded_with_managed_fields: None,
+            }),
+        );
+        assert_eq!(app.content_body, "reopened");
+        app.content_kind = Some(ContentKind::Describe);
+        app.yaml_refresh.due = Instant::now();
+        assert_eq!(app.poll_yaml_refresh(), AppCommand::None);
+    }
+
+    #[test]
     fn yaml_managed_fields_load_lazily_and_ignore_stale_results() {
         let mut app = app_with_rows();
         let target = match app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)) {
@@ -6497,6 +6710,13 @@ mod tests {
             ContentKind::Yaml,
         );
 
+        app.yaml_refresh.due = Instant::now();
+        let old_refresh_id = app.yaml_refresh.id;
+        assert!(matches!(
+            app.poll_yaml_refresh(),
+            AppCommand::Action(ActionIntent::RefreshYaml { .. })
+        ));
+
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)),
             AppCommand::Action(ActionIntent::ManagedYaml {
@@ -6504,6 +6724,13 @@ mod tests {
                 body: "kind: Pod".to_owned(),
                 decoded_body: None,
             })
+        );
+        app.apply_yaml_refresh(old_refresh_id, &target, Err("stale refresh".to_owned()));
+        assert_eq!(app.notice, None);
+        assert_eq!(
+            app.poll_yaml_refresh(),
+            AppCommand::None,
+            "managed-fields request takes precedence"
         );
         assert!(!app.ui.managed_fields());
 

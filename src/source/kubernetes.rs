@@ -47,8 +47,8 @@ use crate::{
 };
 
 use super::{
-    ActionRequest, ActionResult, KubernetesSettings, WatchRequest, discovery::discover_resources,
-    logs::LogTask,
+    ActionRequest, ActionResult, KubernetesSettings, WatchRequest, YamlContent,
+    discovery::discover_resources, logs::LogTask,
 };
 
 struct PodWatchCache {
@@ -433,6 +433,27 @@ async fn handle_action(client: Client, context: &str, action: ActionIntent) -> A
         ActionIntent::DeleteContext { name } => delete_context(context, &name).await,
         ActionIntent::Content { target, content } => {
             fetch_content(client, context, &target, content).await
+        }
+        ActionIntent::RefreshYaml {
+            id,
+            target,
+            include_managed_fields,
+        } => {
+            let result = tokio::time::timeout(Duration::from_secs(10), async {
+                let object = dynamic_target_api(client, &target)?
+                    .get(&target.name)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let target = target.clone();
+                tokio::task::spawn_blocking(move || {
+                    yaml_content_with_managed_fields(object, &target, include_managed_fields)
+                })
+                .await
+                .map_err(|error| format!("Unable to format YAML: {error}"))?
+            })
+            .await
+            .unwrap_or_else(|_| Err("request timed out".to_owned()));
+            Ok(ActionResult::RefreshedYaml { id, target, result })
         }
         ActionIntent::ManagedYaml {
             target,
@@ -1297,13 +1318,6 @@ fn describe_args(context: &str, target: &ResourceTarget) -> Vec<String> {
         args.extend(["--namespace".to_owned(), namespace.clone()]);
     }
     args
-}
-
-struct YamlContent {
-    body: String,
-    with_managed_fields: Option<String>,
-    decoded_body: Option<String>,
-    decoded_with_managed_fields: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2474,8 +2488,16 @@ async fn yaml_from(
 }
 
 fn yaml_content_from_object(
+    object: DynamicObject,
+    target: &ResourceTarget,
+) -> Result<YamlContent, String> {
+    yaml_content_with_managed_fields(object, target, false)
+}
+
+fn yaml_content_with_managed_fields(
     mut object: DynamicObject,
     target: &ResourceTarget,
+    include_managed_fields: bool,
 ) -> Result<YamlContent, String> {
     let mut decoded = is_core_v1_secret(target)
         .then(|| decode_secret_object(&object))
@@ -2485,8 +2507,21 @@ fn yaml_content_from_object(
         .managed_fields
         .as_ref()
         .is_some_and(|fields| !fields.is_empty());
-    let with_managed_fields = has_managed_fields.then(String::new);
-    let decoded_with_managed_fields = (has_managed_fields && decoded.is_some()).then(String::new);
+    let managed_body = |object: &DynamicObject| {
+        if include_managed_fields {
+            serde_yaml::to_string(object).map_err(|error| error.to_string())
+        } else {
+            Ok(String::new())
+        }
+    };
+    let with_managed_fields = has_managed_fields
+        .then(|| managed_body(&object))
+        .transpose()?;
+    let decoded_with_managed_fields = decoded
+        .as_ref()
+        .filter(|_| has_managed_fields)
+        .map(managed_body)
+        .transpose()?;
     object.meta_mut().managed_fields = None;
     if let Some(decoded) = &mut decoded {
         decoded.meta_mut().managed_fields = None;
@@ -5113,6 +5148,22 @@ mod tests {
         let decoded_managed = decoded_managed.expect("decoded managed body");
         assert!(decoded_managed.contains("managedFields"));
         assert!(decoded_managed.contains("0x00ff10"));
+
+        let refreshed = yaml_content_with_managed_fields(object.clone(), &target, true).unwrap();
+        assert_eq!(refreshed.body, yaml.body);
+        assert_eq!(refreshed.decoded_body.as_deref(), Some(decoded.as_str()));
+        assert_eq!(
+            refreshed.with_managed_fields.as_deref(),
+            Some(managed.as_str())
+        );
+        assert_eq!(
+            refreshed.decoded_with_managed_fields.as_deref(),
+            Some(decoded_managed.as_str())
+        );
+        object.metadata.managed_fields = None;
+        let refreshed = yaml_content_with_managed_fields(object, &target, true).unwrap();
+        assert_eq!(refreshed.with_managed_fields, None);
+        assert_eq!(refreshed.decoded_with_managed_fields, None);
     }
 
     #[test]
