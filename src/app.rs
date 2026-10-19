@@ -8,18 +8,58 @@ use std::{
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use regex::RegexBuilder;
 
+use crate::config::UserConfig;
 use crate::kubeconfig::ContextInfo;
 use crate::log_view::{LogView, append_display_lines, plain_log_line, without_log_timestamp};
 use crate::model::{
-    NamespaceInfo, OwnerReferenceData, PortForwardPort, ResourceDescriptor, ResourceKind,
-    ResourceOperations, ResourceRow, ResourceSnapshot, SourceState, unix_now,
+    NamespaceInfo, OwnerReferenceData, PortForwardPort, ResourceData, ResourceDescriptor,
+    ResourceKind, ResourceOperations, ResourceRow, ResourceSnapshot, SourceState, unix_now,
 };
-use crate::source::{LogRange, LogRequest, LogTarget, YamlContent};
+use crate::source::{
+    LogLine, LogRange, LogRequest, LogSessionMeta, LogTarget, YamlContent, supports_logs,
+};
 
-const YAML_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+#[path = "app_plugins.rs"]
+mod plugin_ui;
+pub use plugin_ui::PluginDialog;
+#[path = "app_preferences.rs"]
+mod preferences;
+pub use preferences::LaunchPreferences;
+#[path = "app_dumps.rs"]
+mod dumps;
+pub use dumps::{DumpIntent, DumpPayload, ScreenDumpState};
+#[path = "app_live.rs"]
+mod live;
+#[cfg(test)]
+#[path = "app_logger_tests.rs"]
+mod logger_tests;
+#[cfg(test)]
+#[path = "app_multilog_tests.rs"]
+mod multilog_tests;
+use live::LiveRefreshState;
+#[path = "app_images.rs"]
+mod images;
+pub use images::{ImageDialog, ImageEditorState};
+#[path = "app_transfers.rs"]
+mod transfers;
+pub use transfers::{TransferDialog, TransferState};
+#[path = "app_sanitize.rs"]
+mod sanitize;
+pub use sanitize::{SANITIZE_CONFIRMATION, SanitizeDialog};
+#[path = "app_rollback.rs"]
+mod rollback;
+pub use rollback::{RollbackDialog, RollbackState};
+#[path = "app_navigation.rs"]
+mod navigation;
+pub use navigation::NavigationState;
+#[path = "app_references.rs"]
+mod references;
+pub use references::ReferencesState;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SortField {
+    Kind,
+    Validity,
     Namespace,
     #[default]
     Name,
@@ -52,10 +92,11 @@ pub enum SortField {
     Update,
     Delete,
     DeleteCollection,
+    VulnScore,
 }
 
 impl SortField {
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 34] = [
         Self::Namespace,
         Self::Name,
         Self::Ready,
@@ -87,11 +128,17 @@ impl SortField {
         Self::Update,
         Self::Delete,
         Self::DeleteCollection,
+        Self::Kind,
+        Self::Validity,
+        Self::VulnScore,
     ];
 
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
+            Self::Kind => "kind",
+            Self::Validity => "valid",
+            Self::VulnScore => "vs",
             Self::Namespace => "namespace",
             Self::Name => "name",
             Self::Ready => "ready",
@@ -135,6 +182,7 @@ impl std::fmt::Display for SortField {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ViewState {
+    pub instance: Option<ResourceTarget>,
     pub context: String,
     pub kind: ResourceDescriptor,
     pub namespace: Option<String>,
@@ -177,9 +225,11 @@ impl ResourceRowsHitbox {
 pub enum ContentKind {
     Yaml,
     SecretData,
+    HelmValues,
     Describe,
     Logs,
     PreviousLogs,
+    ScreenDump,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +251,12 @@ pub struct PodShellTarget {
     pub namespace: String,
     pub pod: String,
     pub container: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeShellTarget {
+    pub node: String,
+    pub settings: crate::config::ShellPodSettings,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,6 +294,28 @@ pub struct PortForwardInfo {
     pub state: PortForwardState,
 }
 
+#[must_use]
+pub fn cow_talk(says: &str) -> String {
+    let says = if says.trim().is_empty() {
+        "Nothing to report here. Please move along..."
+    } else {
+        says.trim()
+    };
+    let msg = format!("< Ruroh? {says} >");
+    let rule = format!(" {}", "─".repeat(says.chars().count() + 11));
+    [
+        rule.as_str(),
+        msg.as_str(),
+        rule.as_str(),
+        r"        \   ^__^            ",
+        r"         \  (oo)\_______    ",
+        r"            (__)\       )\/\",
+        r"                ||----w |   ",
+        r"                ||     ||   ",
+    ]
+    .join("\n")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortForwardDialog {
     pub target: ResourceTarget,
@@ -255,19 +333,29 @@ pub const PORT_FORWARD_CANCEL_FIELD: usize = 4;
 const PORT_FORWARD_FIELD_COUNT: usize = 5;
 
 impl PortForwardDialog {
-    fn new(target: ResourceTarget, ports: Vec<PortForwardPort>) -> Self {
-        let remote_port = ports
-            .first()
-            .map_or_else(String::new, PortForwardPort::selector);
-        let local_port = ports
-            .first()
-            .map_or_else(String::new, |port| port.port.to_string());
+    fn new(
+        target: ResourceTarget,
+        ports: Vec<PortForwardPort>,
+        default_address: &str,
+        preferred_spec: Option<&str>,
+    ) -> Self {
+        let (remote_port, local_port) = preferred_spec
+            .and_then(|spec| resolve_pf_annotation(spec, &ports))
+            .unwrap_or_else(|| {
+                let remote = ports
+                    .first()
+                    .map_or_else(String::new, PortForwardPort::selector);
+                let local = ports
+                    .first()
+                    .map_or_else(String::new, |port| port.port.to_string());
+                (remote, local)
+            });
         Self {
             target,
             ports,
             remote_port,
             local_port,
-            address: "localhost".to_owned(),
+            address: default_address.to_owned(),
         }
     }
 
@@ -301,6 +389,45 @@ fn parse_port(value: &str, label: &str) -> Result<u16, String> {
         .ok_or_else(|| format!("{label} must be between 1 and 65535"))
 }
 
+#[must_use]
+pub fn resolve_pf_annotation(spec: &str, ports: &[PortForwardPort]) -> Option<(String, String)> {
+    for token in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some((container, rest)) = token.split_once("::") {
+            let (local_str, remote_token) = rest
+                .split_once(':')
+                .map_or((rest, rest), |(l, r)| (l, if r.is_empty() { l } else { r }));
+            for port in ports {
+                if port.container.as_deref() == Some(container)
+                    && (port.name.as_ref() == remote_token || port.port.to_string() == remote_token)
+                {
+                    let local = if local_str.is_empty() {
+                        port.port.to_string()
+                    } else {
+                        local_str.to_owned()
+                    };
+                    return Some((port.selector(), local));
+                }
+            }
+        } else {
+            let (local_str, remote_token) =
+                token.split_once(':').map_or((token, token), |(l, r)| {
+                    (l, if r.is_empty() { l } else { r })
+                });
+            for port in ports {
+                if port.name.as_ref() == remote_token || port.port.to_string() == remote_token {
+                    let local = if local_str.is_empty() {
+                        port.port.to_string()
+                    } else {
+                        local_str.to_owned()
+                    };
+                    return Some((port.selector(), local));
+                }
+            }
+        }
+    }
+    None
+}
+
 fn port_forward_field_mut(dialog: &mut PortForwardDialog, field: usize) -> &mut String {
     match field {
         PORT_FORWARD_REMOTE_FIELD => &mut dialog.remote_port,
@@ -312,6 +439,41 @@ fn port_forward_field_mut(dialog: &mut PortForwardDialog, field: usize) -> &mut 
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionIntent {
+    LoadReferences {
+        id: u64,
+        target: ResourceTarget,
+    },
+    LoadDeploymentSelector {
+        id: u64,
+        target: ResourceTarget,
+        replica_sets: bool,
+    },
+    LoadBatchNavigation {
+        id: u64,
+        target: ResourceTarget,
+    },
+    LoadRollback {
+        id: u64,
+        target: ResourceTarget,
+    },
+    Rollback {
+        snapshot: Box<crate::source::RollbackSnapshot>,
+    },
+    LoadTransferPod {
+        id: u64,
+        target: ResourceTarget,
+    },
+    SanitizePods {
+        namespace: Option<String>,
+    },
+    LoadImages {
+        id: u64,
+        target: ResourceTarget,
+    },
+    SetImages {
+        snapshot: crate::source::ImageSnapshot,
+        images: Vec<crate::source::ContainerImage>,
+    },
     Delete {
         targets: Vec<ResourceTarget>,
         immediate: bool,
@@ -319,11 +481,17 @@ pub enum ActionIntent {
     DeleteContext {
         name: String,
     },
+    RenameContext {
+        old_name: String,
+        new_name: String,
+    },
     Content {
+        id: u64,
         target: ResourceTarget,
         content: ContentKind,
     },
     ManagedYaml {
+        id: u64,
         target: ResourceTarget,
         body: String,
         decoded_body: Option<String>,
@@ -333,6 +501,11 @@ pub enum ActionIntent {
         target: ResourceTarget,
         include_managed_fields: bool,
     },
+    RefreshDescribe {
+        id: u64,
+        target: ResourceTarget,
+    },
+    StopContentRefresh,
     Containers {
         target: ResourceTarget,
     },
@@ -359,6 +532,20 @@ pub enum ActionIntent {
     Restart {
         targets: Vec<ResourceTarget>,
     },
+    Scale {
+        targets: Vec<ResourceTarget>,
+        replicas: i32,
+    },
+    TriggerCronJob {
+        targets: Vec<ResourceTarget>,
+    },
+    ToggleCronJobSuspend {
+        target: ResourceTarget,
+    },
+    SetSuspended {
+        targets: Vec<ResourceTarget>,
+        suspended: bool,
+    },
     SetNodeUnschedulable {
         name: String,
         unschedulable: bool,
@@ -366,6 +553,17 @@ pub enum ActionIntent {
     DrainNode {
         name: String,
         options: NodeDrainOptions,
+    },
+    HelmRollback {
+        namespace: String,
+        release: String,
+        revision: String,
+    },
+    DirApply {
+        path: String,
+    },
+    DirDelete {
+        path: String,
     },
 }
 
@@ -375,8 +573,16 @@ impl ActionIntent {
         matches!(
             self,
             Self::Content { .. }
+                | Self::LoadReferences { .. }
+                | Self::LoadDeploymentSelector { .. }
+                | Self::LoadBatchNavigation { .. }
+                | Self::LoadRollback { .. }
+                | Self::LoadTransferPod { .. }
+                | Self::LoadImages { .. }
                 | Self::ManagedYaml { .. }
                 | Self::RefreshYaml { .. }
+                | Self::RefreshDescribe { .. }
+                | Self::StopContentRefresh
                 | Self::Containers { .. }
                 | Self::ContainerLogs { .. }
                 | Self::StartLogs { .. }
@@ -519,16 +725,24 @@ fn parse_drain_duration(value: &str) -> Result<Duration, String> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppCommand {
+    Transfer(crate::transfer::TransferIntent),
     None,
     Quit,
     Request(ViewState),
     Copy(String),
     SaveLogs { name: String, body: String },
+    Dump(DumpIntent),
+    EditDump(std::path::PathBuf),
     Edit(ResourceTarget),
     Shell(PodShellTarget),
+    NodeShell(NodeShellTarget),
+    Attach(PodShellTarget),
+    Plugin(crate::plugins::PluginInvocation),
     StartPortForward(PortForwardRequest),
     ShowPortForwards,
     StopPortForward(u64),
+    RunBenchmark(crate::benchmarks::BenchmarkRunRequest),
+    OpenUrl(String),
     Action(ActionIntent),
 }
 
@@ -536,9 +750,39 @@ pub enum AppCommand {
 pub enum PendingDelete {
     Resources(Vec<ResourceTarget>),
     Restart(Vec<ResourceTarget>),
-    Context { name: String },
-    NodeScheduling { name: String, unschedulable: bool },
+    Scale {
+        targets: Vec<ResourceTarget>,
+        replicas: String,
+    },
+    TriggerCronJob(Vec<ResourceTarget>),
+    ToggleCronJobSuspend {
+        target: ResourceTarget,
+        suspend: Option<bool>,
+    },
+    SetSuspended {
+        targets: Vec<ResourceTarget>,
+        suspended: bool,
+    },
+    Context {
+        name: String,
+    },
+    RenameContext {
+        old_name: String,
+        new_name: String,
+    },
+    NodeScheduling {
+        name: String,
+        unschedulable: bool,
+    },
     DrainNode(DrainDialog),
+    HelmRollback {
+        namespace: String,
+        release: String,
+        revision: String,
+    },
+    DirDelete {
+        path: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -551,6 +795,8 @@ pub enum InputMode {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Overlay {
+    RollbackDialog,
+    TransferDialog,
     #[default]
     None,
     Help,
@@ -562,10 +808,17 @@ pub enum Overlay {
     ConfirmDelete,
     PortForwardDialog,
     PortForwards,
+    PluginDialog,
+    ScreenDumps,
+    ImageDialog,
+    SanitizeDialog,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ListMode {
+    References {
+        title: String,
+    },
     #[default]
     Resources,
     Containers {
@@ -612,7 +865,7 @@ pub struct UiFlags(u16);
 
 impl Default for UiFlags {
     fn default() -> Self {
-        Self(Self::HEADER | Self::LOGO)
+        Self(Self::HEADER | Self::LOGO | Self::CRUMBS)
     }
 }
 
@@ -626,6 +879,26 @@ impl UiFlags {
     const TIMESTAMPS: u16 = 1 << 6;
     const MANAGED_FIELDS: u16 = 1 << 7;
     const SECRET_DECODED: u16 = 1 << 8;
+    const CRUMBS: u16 = 1 << 9;
+    const INVERT: u16 = 1 << 10;
+
+    fn set(&mut self, flag: u16, enabled: bool) {
+        if enabled {
+            self.0 |= flag;
+        } else {
+            self.0 &= !flag;
+        }
+    }
+
+    #[must_use]
+    pub const fn crumbs(self) -> bool {
+        self.0 & Self::CRUMBS != 0
+    }
+
+    #[must_use]
+    pub const fn invert(self) -> bool {
+        self.0 & Self::INVERT != 0
+    }
 
     fn toggle(&mut self, flag: u16) {
         self.0 ^= flag;
@@ -677,17 +950,50 @@ impl UiFlags {
     }
 }
 
-#[derive(Debug)]
-struct YamlRefreshState {
-    id: u64,
-    pending: bool,
-    due: Instant,
+fn default_resource_options() -> Vec<ResourceDescriptor> {
+    ResourceKind::ALL
+        .into_iter()
+        .map(ResourceDescriptor::from)
+        .chain([
+            ResourceDescriptor::workloads(),
+            ResourceDescriptor::users(),
+            ResourceDescriptor::groups(),
+            ResourceDescriptor::helm(),
+            ResourceDescriptor::benchmarks(),
+            ResourceDescriptor::pulses(),
+            ResourceDescriptor::xray(),
+            ResourceDescriptor::skins(),
+        ])
+        .collect()
+}
+
+fn normalize_context_options<T: Into<ContextInfo>>(
+    contexts: Vec<T>,
+    active: &str,
+) -> Vec<ContextInfo> {
+    let mut contexts = contexts.into_iter().map(Into::into).collect::<Vec<_>>();
+    if !contexts.iter().any(|item| item.name == active) {
+        contexts.push(ContextInfo::synthetic(active));
+    }
+    contexts.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    contexts.dedup_by(|left, right| left.name == right.name);
+    contexts
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessMode {
+    ForceReadWrite,
+    ReadWrite,
+    ReadOnly,
 }
 
 #[derive(Debug)]
 pub struct App {
+    pub instance: Option<ResourceTarget>,
     pub context: String,
     pub server_version: String,
+    pub cluster_cpu: String,
+    pub cluster_mem: String,
     pub context_options: Vec<ContextInfo>,
     pub namespace: Option<String>,
     pub kind: ResourceDescriptor,
@@ -715,6 +1021,7 @@ pub struct App {
     pub now_unix: i64,
     pub ui: UiFlags,
     pub marks: HashSet<Arc<str>>,
+    pub xray_collapsed: HashSet<Arc<str>>,
     pub mark_anchor: Option<usize>,
     pub history: Vec<ViewState>,
     pub history_cursor: usize,
@@ -740,11 +1047,25 @@ pub struct App {
     pub pending_delete: Option<PendingDelete>,
     pub port_forward_dialog: Option<PortForwardDialog>,
     pub port_forwards: Vec<PortForwardInfo>,
+    pub active_port_forwards: Vec<PortForwardInfo>,
     pub read_only: bool,
+    pub user_config: UserConfig,
+    pub theme: crate::theme::Skin,
+    pub connection: crate::connection::ConnectionOptions,
+    pub plugin_dialog: Option<PluginDialog>,
+    pub launch: LaunchPreferences,
+    pub dumps: ScreenDumpState,
+    pub image_editor: ImageEditorState,
+    pub rollback: RollbackState,
+    pub navigation: NavigationState,
+    pub references: ReferencesState,
+    pub transfers: TransferState,
+    pub sanitize_dialog: Option<SanitizeDialog>,
+    cli_access: AccessMode,
     content_max_scroll: u16,
     content_match_cursor: Option<usize>,
     content_target: Option<ResourceTarget>,
-    yaml_refresh: YamlRefreshState,
+    yaml_refresh: LiveRefreshState,
     next_log_id: u64,
     saved_resource_list: Option<SavedResourceList>,
     pending_containers: Option<ResourceTarget>,
@@ -763,6 +1084,7 @@ pub struct App {
 
 impl App {
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn new<T>(
         context: impl Into<String>,
         namespace: Option<String>,
@@ -773,41 +1095,25 @@ impl App {
     where
         T: Into<ContextInfo>,
     {
-        let generation = 1;
         let kind = ResourceDescriptor::from(kind);
         let context = context.into();
-        let mut context_options = context_options
-            .into_iter()
-            .map(Into::into)
-            .collect::<Vec<_>>();
-        if !context_options.iter().any(|item| item.name == context) {
-            context_options.push(ContextInfo::synthetic(context.clone()));
-        }
-        context_options.sort_unstable_by(|left, right| left.name.cmp(&right.name));
-        context_options.dedup_by(|left, right| left.name == right.name);
-        let initial_view = ViewState {
-            context: context.clone(),
-            kind: kind.clone(),
-            namespace: namespace.clone(),
-            field_selector: None,
-            label_selector: None,
-        };
+        let context_options = normalize_context_options(context_options, &context);
         let recent_namespaces = namespace.iter().cloned().collect();
-        Self {
+        let mut app = Self {
+            instance: None,
             context,
             server_version: "detecting…".to_owned(),
+            cluster_cpu: "n/a".to_owned(),
+            cluster_mem: "n/a".to_owned(),
             context_options,
             namespace,
             kind: kind.clone(),
             field_selector: None,
             label_selector: None,
-            resource_options: ResourceKind::ALL
-                .into_iter()
-                .map(ResourceDescriptor::from)
-                .collect(),
+            resource_options: default_resource_options(),
             list_mode: ListMode::Resources,
-            generation,
-            snapshot: ResourceSnapshot::loading(generation, kind),
+            generation: 1,
+            snapshot: ResourceSnapshot::loading(1, kind),
             query: String::new(),
             body_query: String::new(),
             input: String::new(),
@@ -826,8 +1132,9 @@ impl App {
             now_unix: unix_now(),
             ui: UiFlags::default(),
             marks: HashSet::new(),
+            xray_collapsed: HashSet::new(),
             mark_anchor: None,
-            history: vec![initial_view],
+            history: Vec::new(),
             history_cursor: 0,
             overlay_selected: 0,
             namespace_options: Vec::new(),
@@ -849,15 +1156,29 @@ impl App {
             pending_delete: None,
             port_forward_dialog: None,
             port_forwards: Vec::new(),
+            active_port_forwards: Vec::new(),
             read_only,
+            user_config: UserConfig::default(),
+            theme: crate::theme::Skin::default(),
+            connection: crate::connection::ConnectionOptions::default(),
+            plugin_dialog: None,
+            launch: LaunchPreferences::default(),
+            dumps: ScreenDumpState::default(),
+            image_editor: ImageEditorState::default(),
+            rollback: RollbackState::default(),
+            navigation: NavigationState::default(),
+            references: ReferencesState::default(),
+            transfers: TransferState::default(),
+            sanitize_dialog: None,
+            cli_access: if read_only {
+                AccessMode::ReadOnly
+            } else {
+                AccessMode::ReadWrite
+            },
             content_max_scroll: 0,
             content_match_cursor: None,
             content_target: None,
-            yaml_refresh: YamlRefreshState {
-                id: 0,
-                pending: false,
-                due: Instant::now(),
-            },
+            yaml_refresh: LiveRefreshState::new(),
             next_log_id: 0,
             saved_resource_list: None,
             pending_containers: None,
@@ -872,7 +1193,9 @@ impl App {
             input_before_edit: String::new(),
             drain_value_edit_state: DrainValueEditState::Pristine,
             port_forward_value_edit_state: DrainValueEditState::Pristine,
-        }
+        };
+        app.history.push(app.current_view());
+        app
     }
 
     pub fn apply_snapshot(&mut self, snapshot: ResourceSnapshot) {
@@ -885,71 +1208,123 @@ impl App {
             }
             return;
         }
-        let selected_key = self.selected_row().map(|row| Arc::clone(&row.key));
+        let selected_key = self
+            .restored_workload_selection(&snapshot)
+            .or_else(|| self.selected_row().map(|row| Arc::clone(&row.key)));
         self.snapshot = snapshot;
         self.rebuild_filter(selected_key.as_deref());
     }
 
+    pub fn apply_user_config(&mut self, mut config: UserConfig) {
+        self.apply_launch_preferences(&mut config);
+        self.apply_display_preferences(&config);
+        self.theme = config.theme.clone();
+        self.read_only = match self.cli_access {
+            AccessMode::ForceReadWrite => false,
+            AccessMode::ReadOnly => true,
+            AccessMode::ReadWrite => config.settings.read_only,
+        };
+        if config.settings.ui.headless != self.user_config.settings.ui.headless {
+            self.ui.0 = (self.ui.0 & !UiFlags::HEADER)
+                | if config.settings.ui.headless {
+                    0
+                } else {
+                    UiFlags::HEADER
+                };
+        }
+        if config.settings.ui.logoless != self.user_config.settings.ui.logoless {
+            self.set_logo_visible(!config.settings.ui.logoless);
+        }
+        if self.read_only
+            && (matches!(
+                self.overlay,
+                Overlay::ConfirmDelete | Overlay::PortForwardDialog
+            ) || (self.overlay == Overlay::PluginDialog
+                && self
+                    .plugin_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.plugin.dangerous)))
+        {
+            self.pending_delete = None;
+            self.port_forward_dialog = None;
+            self.plugin_dialog = None;
+            self.confirm_armed = false;
+            self.overlay = Overlay::None;
+        }
+        if self.read_only {
+            self.dumps.delete_pending = None;
+            self.close_image_editor();
+            self.close_rollback();
+            self.close_transfer();
+            self.close_sanitize_dialog();
+        }
+        if !config.diagnostics.is_empty() {
+            self.show_transient_notice(
+                config
+                    .diagnostics
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            );
+        }
+        self.user_config = config;
+        self.apply_custom_view_sort();
+        self.reset_completion();
+        let selected = self.selected_row().map(|row| Arc::clone(&row.key));
+        self.rebuild_filter(selected.as_deref());
+    }
+
+    fn apply_custom_view_sort(&mut self) {
+        let Some((col, asc)) = self
+            .user_config
+            .custom_view_for(&self.kind, self.namespace.as_deref())
+            .and_then(|view| view.sort_column.as_ref())
+        else {
+            return;
+        };
+        if let Some(field) = SortField::ALL
+            .into_iter()
+            .find(|field| field.label().eq_ignore_ascii_case(col))
+        {
+            self.sort_field = field;
+            self.sort_descending = !*asc;
+        }
+    }
+
+    pub fn begin_config_load(&mut self) {
+        // A new context's write policy must be known before accepting mutations.
+        self.read_only = true;
+        self.close_image_editor();
+        self.close_rollback();
+        self.close_transfer();
+        self.close_sanitize_dialog();
+        self.dumps = ScreenDumpState::default();
+        self.user_config.aliases.clear();
+        self.user_config.hotkeys.clear();
+        self.user_config.views.clear();
+        self.user_config.jumps.clear();
+        self.user_config.benchmarks = crate::config::BenchmarksConfig::default();
+        self.user_config.plugins = crate::plugins::PluginCatalog::default();
+        self.pending_delete = None;
+        self.port_forward_dialog = None;
+        self.plugin_dialog = None;
+        self.confirm_armed = false;
+        if matches!(
+            self.overlay,
+            Overlay::ConfirmDelete | Overlay::PortForwardDialog | Overlay::PluginDialog
+        ) {
+            self.overlay = Overlay::None;
+        }
+    }
+
+    pub fn run_command(&mut self, command: &str) -> AppCommand {
+        command.clone_into(&mut self.input);
+        self.execute_command()
+    }
+
     pub fn tick(&mut self) {
         self.now_unix = unix_now();
-    }
-
-    pub fn poll_yaml_refresh(&mut self) -> AppCommand {
-        if self.overlay != Overlay::Content
-            || self.content_kind != Some(ContentKind::Yaml)
-            || self.yaml_refresh.pending
-            || Instant::now() < self.yaml_refresh.due
-        {
-            return AppCommand::None;
-        }
-        let Some(target) = self.content_target.clone() else {
-            return AppCommand::None;
-        };
-        self.yaml_refresh.pending = true;
-        AppCommand::Action(ActionIntent::RefreshYaml {
-            id: self.yaml_refresh.id,
-            target,
-            include_managed_fields: self
-                .content_managed_fields
-                .as_ref()
-                .is_some_and(|body| !body.is_empty()),
-        })
-    }
-
-    pub fn apply_yaml_refresh(
-        &mut self,
-        id: u64,
-        target: &ResourceTarget,
-        result: Result<YamlContent, String>,
-    ) {
-        if self.overlay != Overlay::Content
-            || self.content_kind != Some(ContentKind::Yaml)
-            || self.content_target.as_ref() != Some(target)
-            || self.yaml_refresh.id != id
-        {
-            return;
-        }
-        self.yaml_refresh.pending = false;
-        self.yaml_refresh.due = Instant::now() + YAML_REFRESH_INTERVAL;
-        match result {
-            Ok(yaml) => {
-                self.content_body = yaml.body;
-                self.content_managed_fields = yaml.with_managed_fields;
-                self.content_decoded_body = yaml.decoded_body;
-                self.content_decoded_managed_fields = yaml.decoded_with_managed_fields;
-                if self.ui.managed_fields() && self.content_managed_fields.is_none() {
-                    self.ui.toggle(UiFlags::MANAGED_FIELDS);
-                }
-                if self
-                    .notice
-                    .as_deref()
-                    .is_some_and(|notice| notice.starts_with("YAML refresh failed:"))
-                {
-                    self.notice = None;
-                }
-            }
-            Err(error) => self.show_transient_notice(format!("YAML refresh failed: {error}")),
-        }
     }
 
     #[must_use]
@@ -1027,8 +1402,11 @@ impl App {
         contexts: Vec<ContextInfo>,
         notice: impl Into<String>,
     ) {
-        if self.context != context {
-            return;
+        context.clone_into(&mut self.context);
+        for entry in &mut self.history {
+            if !contexts.iter().any(|c| c.name == entry.context) {
+                context.clone_into(&mut entry.context);
+            }
         }
         let selected = self.overlay_selected;
         self.set_context_options(contexts);
@@ -1060,7 +1438,26 @@ impl App {
         self.server_version = version.into();
     }
 
+    pub fn set_cluster_metrics(&mut self, cpu: impl Into<String>, mem: impl Into<String>) {
+        self.cluster_cpu = cpu.into();
+        self.cluster_mem = mem.into();
+    }
+
     pub fn set_resource_options(&mut self, mut resources: Vec<ResourceDescriptor>) {
+        if resources.is_empty() {
+            resources = default_resource_options();
+        } else {
+            resources.extend([
+                ResourceDescriptor::workloads(),
+                ResourceDescriptor::users(),
+                ResourceDescriptor::groups(),
+                ResourceDescriptor::helm(),
+                ResourceDescriptor::benchmarks(),
+                ResourceDescriptor::pulses(),
+                ResourceDescriptor::xray(),
+                ResourceDescriptor::skins(),
+            ]);
+        }
         resources.sort_unstable_by(|left, right| {
             left.plural
                 .cmp(&right.plural)
@@ -1072,9 +1469,6 @@ impl App {
                 && left.version == right.version
                 && left.plural == right.plural
         });
-        if resources.is_empty() {
-            resources.extend(ResourceKind::ALL.into_iter().map(ResourceDescriptor::from));
-        }
         self.resource_options = resources;
         self.overlay_selected = self
             .resource_options
@@ -1108,8 +1502,33 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> AppCommand {
+        if self.overlay == Overlay::RollbackDialog {
+            return self.handle_rollback_key(key);
+        }
+        if self.overlay == Overlay::TransferDialog {
+            return self.handle_transfer_key(key);
+        }
+        if self.overlay == Overlay::SanitizeDialog {
+            return self.handle_sanitize_key(key);
+        }
+        if self.overlay == Overlay::ImageDialog {
+            return self.handle_image_key(key);
+        }
+        if self.overlay == Overlay::PluginDialog {
+            return self.handle_plugin_dialog(key);
+        }
+        if self.overlay == Overlay::ScreenDumps && self.dumps.delete_pending.is_some() {
+            return self.handle_screen_dumps_key(key);
+        }
+        if let Some(plugin) = self.plugin_for_key(key).cloned() {
+            return self.activate_plugin(plugin);
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            return AppCommand::Quit;
+            return if self.user_config.settings.no_exit_on_ctrl_c {
+                AppCommand::None
+            } else {
+                AppCommand::Quit
+            };
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
             self.ui.toggle(UiFlags::HEADER);
@@ -1117,6 +1536,34 @@ impl App {
         }
         if self.input_mode != InputMode::Browse {
             return self.handle_input_key(key);
+        }
+        if self.overlay == Overlay::None
+            && let Some(command) = self.reference_key(key)
+        {
+            return command;
+        }
+        if key.code == KeyCode::Char('s')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(
+                self.overlay,
+                Overlay::None
+                    | Overlay::Content
+                    | Overlay::Aliases
+                    | Overlay::Namespaces
+                    | Overlay::Contexts
+                    | Overlay::PortForwards
+                    | Overlay::ScreenDumps
+            )
+        {
+            return self.export_view();
+        }
+        if !matches!(
+            self.overlay,
+            Overlay::ConfirmDelete | Overlay::PortForwardDialog
+        ) && let Some(hotkey) = self.user_config.hotkey_for(key)
+        {
+            self.input = hotkey.command.clone();
+            return self.execute_command();
         }
         if !matches!(
             self.overlay,
@@ -1160,7 +1607,7 @@ impl App {
         }
         if matches!(
             self.overlay,
-            Overlay::Aliases | Overlay::Namespaces | Overlay::Contexts
+            Overlay::Aliases | Overlay::Namespaces | Overlay::Contexts | Overlay::ScreenDumps
         ) {
             let Some(index) = self.chooser_hitbox.index_at(event.column, event.row) else {
                 return false;
@@ -1233,6 +1680,12 @@ impl App {
     }
 
     fn handle_browse_key(&mut self, key: KeyEvent) -> AppCommand {
+        if self.kind.is_pulses()
+            && self.is_resource_view()
+            && let Some(command) = self.handle_pulse_key(key)
+        {
+            return command;
+        }
         match key.code {
             KeyCode::Char('?') => self.open_overlay(Overlay::Help),
             KeyCode::Char(':') => self.start_input(InputMode::Command),
@@ -1287,8 +1740,43 @@ impl App {
     }
 
     fn handle_resource_key(&mut self, key: KeyEvent) -> AppCommand {
+        if self.kind.is_workloads()
+            && matches!(key.code, KeyCode::Char('l' | 'p' | 'i' | 's' | 'r' | 'J'))
+        {
+            return AppCommand::None;
+        }
+        if self.kind.is_subject() && matches!(key.code, KeyCode::Char('y' | 'd' | 'e' | 'J')) {
+            return AppCommand::None;
+        }
+        if self.is_resource_view()
+            && let Some(command) = self.handle_virtual_resource_key(key)
+        {
+            return command;
+        }
         let known_kind = self.kind.known_kind();
         match key.code {
+            KeyCode::Char('i') if self.is_resource_view() => self.open_image_editor(),
+            KeyCode::Char('t')
+                if self.is_resource_view()
+                    && self.kind.known_kind() == Some(ResourceKind::Pods) =>
+            {
+                self.open_transfer()
+            }
+            KeyCode::Char('z')
+                if self.is_resource_view() && known_kind == Some(ResourceKind::Pods) =>
+            {
+                self.open_sanitize_dialog()
+            }
+            KeyCode::Char('z')
+                if self.is_resource_view() && known_kind == Some(ResourceKind::Deployments) =>
+            {
+                self.open_deployment_replica_sets()
+            }
+            KeyCode::Char('c')
+                if self.is_resource_view() && known_kind == Some(ResourceKind::Nodes) =>
+            {
+                self.open_node_cordon_confirmation(true)
+            }
             KeyCode::Char('c') => self.copy_name(),
             KeyCode::Char('n') => self.copy_namespace(),
             KeyCode::Char('y') if self.is_resource_view() => self.content_action(ContentKind::Yaml),
@@ -1300,36 +1788,39 @@ impl App {
             }
             KeyCode::Char('l') if self.is_container_view() => self.container_log_action(false),
             KeyCode::Char('p') if self.is_container_view() => self.container_log_action(true),
-            KeyCode::Char('l') if known_kind == Some(ResourceKind::Pods) => {
-                self.pod_log_action(false)
+            KeyCode::Char('l') if self.is_resource_view() && supports_logs(&self.kind) => {
+                self.resource_log_action(false)
             }
             KeyCode::Char('l') => self.open_selected(),
-            KeyCode::Char('p') if known_kind == Some(ResourceKind::Pods) => {
-                self.pod_log_action(true)
+            KeyCode::Char('p') if self.is_resource_view() && supports_logs(&self.kind) => {
+                self.resource_log_action(true)
             }
             KeyCode::Char('o') if known_kind == Some(ResourceKind::Pods) => self.open_pod_node(),
-            KeyCode::Char('s') if self.is_container_view() => self.container_shell_action(),
-            KeyCode::Char('s') if known_kind == Some(ResourceKind::Pods) => self.pod_shell_action(),
-            KeyCode::Char('a') if known_kind == Some(ResourceKind::Pods) => {
-                self.unsupported("Attach is not implemented yet")
+            KeyCode::Char('s') => self.handle_resource_s_key(known_kind),
+            KeyCode::Char('a')
+                if self.is_container_view() || known_kind == Some(ResourceKind::Pods) =>
+            {
+                self.attach_action()
+            }
+            KeyCode::Char('t') if self.is_resource_view() && self.kind.is_cron_job() => {
+                self.open_cronjob_trigger_confirmation()
             }
             KeyCode::Char('e') if self.is_resource_view() => self.edit_action(),
             KeyCode::Char('f')
-                if matches!(
-                    known_kind,
-                    Some(ResourceKind::Pods | ResourceKind::Services)
-                ) =>
+                if self.is_container_view()
+                    || matches!(
+                        known_kind,
+                        Some(ResourceKind::Pods | ResourceKind::Services)
+                    ) =>
             {
                 AppCommand::ShowPortForwards
             }
             KeyCode::Char('w') if self.namespace.is_none() && self.kind.is_namespaced() => {
                 self.warp_to_selected_namespace()
             }
-            KeyCode::Char('u') if known_kind == Some(ResourceKind::Nodes) => {
-                self.open_node_scheduling_confirmation()
-            }
+            KeyCode::Char('u') => self.handle_resource_u_key(known_kind),
             KeyCode::Char('b') if known_kind == Some(ResourceKind::Services) => {
-                self.unsupported("Benchmarking is not implemented yet")
+                self.benchmark_service_action()
             }
             KeyCode::Char('r') if self.is_restartable_workload() => {
                 self.open_workload_restart_confirmation()
@@ -1337,10 +1828,272 @@ impl App {
             KeyCode::Char('r') if known_kind == Some(ResourceKind::Nodes) => {
                 self.open_node_drain_confirmation()
             }
+            KeyCode::Char('v') => self.handle_resource_v_key(),
             KeyCode::Char(number) if number.is_ascii_digit() => {
                 self.switch_recent_namespace(number)
             }
             _ => AppCommand::None,
+        }
+    }
+
+    fn handle_resource_u_key(&mut self, known_kind: Option<ResourceKind>) -> AppCommand {
+        if known_kind == Some(ResourceKind::Nodes) {
+            self.open_node_scheduling_confirmation()
+        } else if self.is_resource_view() && self.kind.is_core_v1_namespace() {
+            self.use_selected_namespace_row()
+        } else if self.is_resource_view() && crate::source::supports_references(&self.kind) {
+            self.open_references()
+        } else {
+            AppCommand::None
+        }
+    }
+
+    fn handle_resource_v_key(&mut self) -> AppCommand {
+        if self.user_config.settings.image_scans.enable
+            && (self.is_container_view()
+                || (self.is_resource_view() && self.kind.supports_vulnerability_scans()))
+        {
+            self.open_vulnerability_scans()
+        } else {
+            AppCommand::None
+        }
+    }
+
+    fn handle_virtual_resource_key(&mut self, key: KeyEvent) -> Option<AppCommand> {
+        if self.kind.is_dir() {
+            Some(self.handle_dir_key(key))
+        } else if self.kind.is_benchmarks() {
+            Some(self.handle_benchmark_key(key))
+        } else if self.kind.is_pulses() {
+            Some(AppCommand::None)
+        } else if self.kind.is_xray() {
+            Some(self.handle_xray_key(key))
+        } else if self.kind.is_scans() {
+            Some(self.handle_scans_key(key))
+        } else if self.kind.is_skins() {
+            Some(self.handle_skins_key(key))
+        } else if self.kind.is_helm() || self.kind.is_helm_history() {
+            Some(self.handle_helm_key(key))
+        } else {
+            None
+        }
+    }
+
+    fn handle_pulse_key(&mut self, key: KeyEvent) -> Option<AppCommand> {
+        let len = self.filtered.len();
+        if len == 0 {
+            return None;
+        }
+        match key.code {
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                self.select((self.selected + 1) % len);
+                Some(AppCommand::None)
+            }
+            KeyCode::BackTab | KeyCode::Left => {
+                self.select(self.selected.checked_sub(1).unwrap_or(len - 1));
+                Some(AppCommand::None)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let next = if self.selected + 4 < len {
+                    self.selected + 4
+                } else {
+                    len - 1
+                };
+                self.select(next);
+                Some(AppCommand::None)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                let next = self.selected.saturating_sub(4);
+                self.select(next);
+                Some(AppCommand::None)
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_helm_key(&mut self, key: KeyEvent) -> AppCommand {
+        match key.code {
+            KeyCode::Char('v') => self.content_action(ContentKind::HelmValues),
+            KeyCode::Char('y') => self.content_action(ContentKind::Yaml),
+            KeyCode::Char('d') => self.content_action(ContentKind::Describe),
+            KeyCode::Char('c') => self.copy_name(),
+            KeyCode::Char('n') => self.copy_namespace(),
+            KeyCode::Char('r') if self.kind.is_helm() => self.open_helm_releases(),
+            KeyCode::Char('r') if self.kind.is_helm_history() => {
+                self.open_helm_rollback_confirmation()
+            }
+            KeyCode::Char('l') => self.open_selected(),
+            KeyCode::Char('w') if self.namespace.is_none() && self.kind.is_namespaced() => {
+                self.warp_to_selected_namespace()
+            }
+            KeyCode::Char(number) if number.is_ascii_digit() => {
+                self.switch_recent_namespace(number)
+            }
+            _ => AppCommand::None,
+        }
+    }
+
+    fn handle_dir_key(&mut self, key: KeyEvent) -> AppCommand {
+        match key.code {
+            KeyCode::Char('y') => self.content_action(ContentKind::Yaml),
+            KeyCode::Char('a') => self.dir_apply_action(),
+            KeyCode::Char('d') => self.open_dir_delete_confirmation(),
+            KeyCode::Char('e') => self.dir_edit_action(),
+            KeyCode::Char('c') => self.copy_name(),
+            KeyCode::Char('l') => self.open_selected(),
+            KeyCode::Char(number) if number.is_ascii_digit() => {
+                self.switch_recent_namespace(number)
+            }
+            _ => AppCommand::None,
+        }
+    }
+
+    fn handle_benchmark_key(&mut self, key: KeyEvent) -> AppCommand {
+        match key.code {
+            KeyCode::Char('y' | 'v' | 'l') => self.content_action(ContentKind::Yaml),
+            KeyCode::Char('d') => self.open_delete_confirmation(),
+            KeyCode::Char('c') => self.copy_name(),
+            KeyCode::Char('n') => self.copy_namespace(),
+            _ => AppCommand::None,
+        }
+    }
+
+    fn handle_scans_key(&mut self, key: KeyEvent) -> AppCommand {
+        match key.code {
+            KeyCode::Char('c') => self.copy_name(),
+            _ => AppCommand::None,
+        }
+    }
+
+    fn handle_skins_key(&mut self, key: KeyEvent) -> AppCommand {
+        match key.code {
+            KeyCode::Char('c') => self.copy_name(),
+            _ => AppCommand::None,
+        }
+    }
+
+    fn handle_xray_key(&mut self, key: KeyEvent) -> AppCommand {
+        match key.code {
+            KeyCode::Char('x') => {
+                let Some(xray) = self.selected_row().and_then(ResourceRow::xray_data) else {
+                    return AppCommand::None;
+                };
+                if xray.children_count == 0 {
+                    return AppCommand::None;
+                }
+                let path = Arc::clone(&xray.path);
+                if !self.xray_collapsed.remove(&path) {
+                    self.xray_collapsed.insert(path.clone());
+                }
+                self.rebuild_filter(Some(path.as_ref()));
+                AppCommand::None
+            }
+            KeyCode::Char('y') => self.content_action(ContentKind::Yaml),
+            KeyCode::Char('d') => self.content_action(ContentKind::Describe),
+            KeyCode::Char('e') => self.edit_action(),
+            KeyCode::Char('c') => self.copy_name(),
+            KeyCode::Char('n') => self.copy_namespace(),
+            KeyCode::Char('l') => self.xray_log_action(false),
+            KeyCode::Char('p') => self.xray_log_action(true),
+            KeyCode::Char('s') => self.xray_shell_action(false),
+            KeyCode::Char('a') => self.xray_shell_action(true),
+            KeyCode::Char(number) if number.is_ascii_digit() => {
+                self.switch_recent_namespace(number)
+            }
+            _ => AppCommand::None,
+        }
+    }
+
+    fn xray_log_action(&mut self, previous: bool) -> AppCommand {
+        let Some(row) = self.selected_row() else {
+            return AppCommand::None;
+        };
+        let Some(xray) = row.xray_data() else {
+            return AppCommand::None;
+        };
+        if xray.is_container {
+            let Some(pod) = xray.pod_name.as_ref() else {
+                return AppCommand::None;
+            };
+            self.open_logs(LogTarget::pod(
+                row.namespace.to_string(),
+                pod.to_string(),
+                Some(row.name.to_string()),
+                previous,
+            ))
+        } else if supports_logs(&xray.target_kind) {
+            let Some(target) = self.row_target(row) else {
+                return AppCommand::None;
+            };
+            self.open_logs(LogTarget::workload(target, previous))
+        } else {
+            AppCommand::None
+        }
+    }
+
+    fn xray_shell_action(&mut self, attach: bool) -> AppCommand {
+        if self.read_only {
+            return self.unsupported(if attach {
+                "Attach is disabled in read-only mode"
+            } else {
+                "Shell is disabled in read-only mode"
+            });
+        }
+        let Some(row) = self.selected_row() else {
+            return AppCommand::None;
+        };
+        let Some(xray) = row.xray_data() else {
+            return AppCommand::None;
+        };
+        let (pod, container) = if xray.is_container {
+            let Some(pod) = xray.pod_name.as_ref() else {
+                return AppCommand::None;
+            };
+            (pod.to_string(), row.name.to_string())
+        } else if xray.target_kind.known_kind() == Some(ResourceKind::Pods) {
+            let pod_key = xray.path.as_ref();
+            let co = self
+                .snapshot
+                .rows
+                .iter()
+                .find_map(|r| {
+                    let xr = r.xray_data()?;
+                    (xr.is_container && xr.parent_path.as_deref() == Some(pod_key))
+                        .then(|| r.name.to_string())
+                })
+                .unwrap_or_else(|| "default".to_owned());
+            (row.name.to_string(), co)
+        } else {
+            return AppCommand::None;
+        };
+        let target = PodShellTarget {
+            namespace: row.namespace.to_string(),
+            pod,
+            container,
+        };
+        if attach {
+            AppCommand::Attach(target)
+        } else {
+            AppCommand::Shell(target)
+        }
+    }
+
+    fn handle_resource_s_key(&mut self, known_kind: Option<ResourceKind>) -> AppCommand {
+        if self.is_container_view() {
+            self.container_shell_action()
+        } else if known_kind == Some(ResourceKind::Pods) {
+            self.pod_shell_action()
+        } else if self.is_resource_view()
+            && known_kind == Some(ResourceKind::Nodes)
+            && self.user_config.node_shell_enabled(&self.context)
+        {
+            self.node_shell_action()
+        } else if self.is_resource_view() && self.kind.is_scalable() {
+            self.open_scale_dialog()
+        } else if self.is_resource_view() && self.kind.is_cron_job() {
+            self.open_suspend_toggle_confirmation()
+        } else {
+            AppCommand::None
         }
     }
 
@@ -1356,8 +2109,27 @@ impl App {
                 self.move_selection_up(self.viewport_height);
                 AppCommand::None
             }
-            KeyCode::Char('d') => self.open_delete_confirmation(),
-            KeyCode::Char('k') => self.immediate_delete(),
+            KeyCode::Char('d')
+                if !self.kind.is_subject()
+                    && !self.kind.is_helm_history()
+                    && !self.kind.is_dir()
+                    && !self.kind.is_pulses()
+                    && !self.kind.is_scans() =>
+            {
+                self.open_delete_confirmation()
+            }
+            KeyCode::Char('k')
+                if !self.kind.is_workloads()
+                    && !self.kind.is_subject()
+                    && !self.kind.is_helm()
+                    && !self.kind.is_helm_history()
+                    && !self.kind.is_dir()
+                    && !self.kind.is_benchmarks()
+                    && !self.kind.is_pulses()
+                    && !self.kind.is_scans() =>
+            {
+                self.immediate_delete()
+            }
             KeyCode::Char('z') => {
                 self.ui.toggle(UiFlags::FAULTS);
                 self.rebuild_filter(None);
@@ -1365,7 +2137,11 @@ impl App {
             }
             KeyCode::Char('w') => {
                 self.ui.toggle(UiFlags::WIDE);
+                self.select_workload_sort_column(SortField::ALL[self.selected_column]);
                 AppCommand::None
+            }
+            KeyCode::Char('l') if self.is_resource_view() && self.kind.is_apps_v1_replica_set() => {
+                self.open_rollback()
             }
             KeyCode::Char('l') => {
                 self.ui.toggle(UiFlags::LOGO);
@@ -1388,6 +2164,8 @@ impl App {
     fn handle_shift_key(&mut self, key: KeyEvent) -> AppCommand {
         let known_kind = self.kind.known_kind();
         match key.code {
+            KeyCode::Left if self.kind.is_workloads() => self.move_workload_sort_column(false),
+            KeyCode::Right if self.kind.is_workloads() => self.move_workload_sort_column(true),
             KeyCode::Left => {
                 self.selected_column = self.selected_column.saturating_sub(1);
             }
@@ -1399,18 +2177,32 @@ impl App {
                 self.cycle_filtered_selection(false);
             }
             KeyCode::Char('N') => self.set_sort(SortField::Name),
+            KeyCode::Char('K') if self.kind.is_workloads() => self.set_sort(SortField::Kind),
+            KeyCode::Char('R') if self.kind.is_workloads() => self.set_sort(SortField::Ready),
             KeyCode::Char('A') => self.set_sort(SortField::Age),
             KeyCode::Char('P') => self.set_sort(SortField::Namespace),
             KeyCode::Char('S') => self.set_sort(SortField::Status),
+            KeyCode::Char('L') if self.kind.is_scans() => self.set_sort(SortField::Details),
+            KeyCode::Char('F') if self.kind.is_scans() => self.set_sort(SortField::Ready),
+            KeyCode::Char('V') if self.kind.is_scans() => self.set_sort(SortField::Name),
+            KeyCode::Char('V')
+                if self.user_config.settings.image_scans.enable
+                    && (self.is_container_view()
+                        || (self.is_resource_view()
+                            && self.kind.supports_vulnerability_scans())) =>
+            {
+                self.set_sort(SortField::VulnScore);
+            }
             KeyCode::Char('F')
-                if matches!(
-                    known_kind,
-                    Some(ResourceKind::Pods | ResourceKind::Services)
-                ) =>
+                if self.is_container_view()
+                    || matches!(
+                        known_kind,
+                        Some(ResourceKind::Pods | ResourceKind::Services)
+                    ) =>
             {
                 return self.open_port_forward_dialog();
             }
-            KeyCode::Char('J') => {
+            KeyCode::Char('J') if !self.kind.is_workloads() && !self.kind.is_subject() => {
                 return self.open_owner_resource();
             }
             _ => return AppCommand::None,
@@ -1493,6 +2285,12 @@ impl App {
             Overlay::Details => self.handle_details_overlay(key),
             Overlay::PortForwardDialog => self.handle_port_forward_dialog(key),
             Overlay::PortForwards => self.handle_port_forwards_overlay(key),
+            Overlay::PluginDialog => self.handle_plugin_dialog(key),
+            Overlay::ScreenDumps => self.handle_screen_dumps_key(key),
+            Overlay::ImageDialog => self.handle_image_key(key),
+            Overlay::RollbackDialog => self.handle_rollback_key(key),
+            Overlay::TransferDialog => self.handle_transfer_key(key),
+            Overlay::SanitizeDialog => self.handle_sanitize_key(key),
             Overlay::None => self.close_overlay_on(key),
         }
     }
@@ -1501,13 +2299,80 @@ impl App {
         if self.read_only {
             return self.unsupported("Port forwarding is disabled in read-only mode");
         }
+        let default_addr = self
+            .user_config
+            .settings
+            .port_forward_address
+            .clone()
+            .or_else(|| {
+                std::env::var("K9S_DEFAULT_PF_ADDRESS")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .unwrap_or_else(|| "localhost".to_owned());
+        if self.is_container_view() {
+            let ListMode::Containers { namespace, pod } = &self.list_mode else {
+                return AppCommand::None;
+            };
+            let Some(row) = self.selected_row() else {
+                return AppCommand::None;
+            };
+            let target = ResourceTarget {
+                kind: ResourceDescriptor::from(ResourceKind::Pods),
+                namespace: Some(namespace.clone()),
+                name: pod.clone(),
+            };
+            let ports = row.port_forward_ports().to_vec();
+            self.port_forward_dialog =
+                Some(PortForwardDialog::new(target, ports, &default_addr, None));
+            self.overlay_selected = PORT_FORWARD_REMOTE_FIELD;
+            self.port_forward_value_edit_state = DrainValueEditState::Pristine;
+            self.notice = None;
+            self.overlay = Overlay::PortForwardDialog;
+            return AppCommand::None;
+        }
         let Some(target) = self.selected_target() else {
             return AppCommand::None;
         };
-        let ports = self
-            .selected_row()
-            .map_or_else(Vec::new, |row| row.port_forward_ports().to_vec());
-        self.port_forward_dialog = Some(PortForwardDialog::new(target, ports));
+        let (ports, auto_ann, pref_ann) = self.selected_row().map_or_else(
+            || (Vec::new(), None, None),
+            |row| {
+                let ports = row.port_forward_ports().to_vec();
+                let auto_ann = row
+                    .raw_object
+                    .as_deref()
+                    .and_then(|v| v.pointer("/metadata/annotations/k9scli.io~1auto-port-forwards"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                let pref_ann = row
+                    .raw_object
+                    .as_deref()
+                    .and_then(|v| v.pointer("/metadata/annotations/k9scli.io~1port-forwards"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                (ports, auto_ann, pref_ann)
+            },
+        );
+        if let Some(spec) = auto_ann.as_deref()
+            && let Some((remote_sel, local_str)) = resolve_pf_annotation(spec, &ports)
+        {
+            let dialog = PortForwardDialog {
+                target: target.clone(),
+                ports: ports.clone(),
+                remote_port: remote_sel,
+                local_port: local_str,
+                address: default_addr.clone(),
+            };
+            if let Ok(req) = dialog.request() {
+                return AppCommand::StartPortForward(req);
+            }
+        }
+        self.port_forward_dialog = Some(PortForwardDialog::new(
+            target,
+            ports,
+            &default_addr,
+            pref_ann.as_deref(),
+        ));
         self.overlay_selected = PORT_FORWARD_REMOTE_FIELD;
         self.port_forward_value_edit_state = DrainValueEditState::Pristine;
         self.notice = None;
@@ -1668,6 +2533,18 @@ impl App {
                 self.overlay_selected = self.port_forwards.len().saturating_sub(1);
                 AppCommand::None
             }
+            KeyCode::Char('b') => self.benchmark_selected_port_forward(),
+            KeyCode::Char('P') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.port_forwards
+                    .sort_by_key(|f| (f.local_port, f.remote_port));
+                AppCommand::None
+            }
+            KeyCode::Char('U') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.port_forwards
+                    .sort_by(|a, b| (&a.address, a.local_port).cmp(&(&b.address, b.local_port)));
+                AppCommand::None
+            }
+            KeyCode::Enter => self.open_selected_port_forward_benchmarks(),
             _ => AppCommand::None,
         }
     }
@@ -1765,6 +2642,7 @@ impl App {
                 self.overlay = Overlay::None;
                 self.request_view(
                     ViewState {
+                        instance: None,
                         context: self.context.clone(),
                         kind,
                         namespace,
@@ -1786,6 +2664,22 @@ impl App {
         match key.code {
             KeyCode::Char('y') => self.namespace_content_action(&visible),
             KeyCode::Char('e') => self.namespace_edit_action(&visible),
+            KeyCode::Char('u') => {
+                let Some(index) = visible
+                    .iter()
+                    .copied()
+                    .find(|index| *index == self.overlay_selected)
+                else {
+                    return AppCommand::None;
+                };
+                let namespace = self
+                    .namespace_options
+                    .get(index)
+                    .map(|value| value.name.clone())
+                    .and_then(|value| (value != "<all>").then_some(value));
+                self.use_active_namespace(namespace);
+                AppCommand::None
+            }
             KeyCode::Enter | KeyCode::Char('l') => {
                 let Some(index) = visible
                     .iter()
@@ -1802,6 +2696,7 @@ impl App {
                 self.overlay = Overlay::None;
                 self.request_view(
                     ViewState {
+                        instance: None,
                         context: self.context.clone(),
                         kind: self.kind.clone(),
                         namespace,
@@ -1819,11 +2714,7 @@ impl App {
         let Some(target) = self.selected_namespace_target(visible) else {
             return AppCommand::None;
         };
-        self.content_target = Some(target.clone());
-        AppCommand::Action(ActionIntent::Content {
-            target,
-            content: ContentKind::Yaml,
-        })
+        self.request_content(target, ContentKind::Yaml)
     }
 
     fn namespace_edit_action(&mut self, visible: &[usize]) -> AppCommand {
@@ -1878,15 +2769,8 @@ impl App {
             return AppCommand::None;
         }
         match key.code {
-            KeyCode::Char('c') => visible
-                .iter()
-                .copied()
-                .find(|index| *index == self.overlay_selected)
-                .and_then(|index| self.context_options.get(index))
-                .map_or(AppCommand::None, |context| {
-                    AppCommand::Copy(context.name.clone())
-                }),
-            KeyCode::Enter | KeyCode::Char('l') => {
+            KeyCode::Char('r') => self.open_context_rename_dialog(&visible),
+            KeyCode::Char('u' | 'l') | KeyCode::Enter => {
                 let Some(index) = visible
                     .iter()
                     .copied()
@@ -1904,6 +2788,7 @@ impl App {
                 self.overlay = Overlay::None;
                 self.request_view(
                     ViewState {
+                        instance: None,
                         context,
                         kind: self.kind.clone(),
                         namespace: self.namespace.clone(),
@@ -1913,13 +2798,36 @@ impl App {
                     true,
                 )
             }
+            KeyCode::Char('c') => visible
+                .iter()
+                .copied()
+                .find(|index| *index == self.overlay_selected)
+                .and_then(|index| self.context_options.get(index))
+                .map_or(AppCommand::None, |context| {
+                    AppCommand::Copy(context.name.clone())
+                }),
             _ => self.close_overlay_on(key),
         }
     }
 
     fn handle_confirm_overlay(&mut self, key: KeyEvent) -> AppCommand {
+        if self.read_only {
+            self.pending_delete = None;
+            self.confirm_armed = false;
+            self.overlay = Overlay::None;
+            return self.unsupported("Mutations are disabled in read-only mode");
+        }
         if matches!(self.pending_delete, Some(PendingDelete::DrainNode(_))) {
             return self.handle_drain_confirmation(key);
+        }
+        if matches!(self.pending_delete, Some(PendingDelete::Scale { .. })) {
+            return self.handle_scale_dialog(key);
+        }
+        if matches!(
+            self.pending_delete,
+            Some(PendingDelete::RenameContext { .. })
+        ) {
+            return self.handle_rename_context_dialog(key);
         }
         match key.code {
             KeyCode::Char('h') => {
@@ -1938,42 +2846,15 @@ impl App {
                 self.confirm_armed = false;
                 self.pending_delete
                     .take()
-                    .map_or(AppCommand::None, |target| match target {
-                        PendingDelete::Resources(targets) => {
-                            self.overlay = Overlay::None;
-                            self.marks.clear();
-                            self.mark_anchor = None;
-                            AppCommand::Action(ActionIntent::Delete {
-                                targets,
-                                immediate: false,
-                            })
-                        }
-                        PendingDelete::Restart(targets) => {
-                            self.overlay = Overlay::None;
-                            self.marks.clear();
-                            self.mark_anchor = None;
-                            AppCommand::Action(ActionIntent::Restart { targets })
-                        }
-                        PendingDelete::Context { name } => {
-                            self.overlay = Overlay::Contexts;
-                            AppCommand::Action(ActionIntent::DeleteContext { name })
-                        }
-                        PendingDelete::NodeScheduling {
-                            name,
-                            unschedulable,
-                        } => {
-                            self.overlay = Overlay::None;
-                            AppCommand::Action(ActionIntent::SetNodeUnschedulable {
-                                name,
-                                unschedulable,
-                            })
-                        }
-                        PendingDelete::DrainNode(_) => AppCommand::None,
+                    .map_or(AppCommand::None, |target| {
+                        self.execute_confirmed_action(target)
                     })
             }
             KeyCode::Esc | KeyCode::Char('q' | '?') => {
-                let return_to_contexts =
-                    matches!(self.pending_delete, Some(PendingDelete::Context { .. }));
+                let return_to_contexts = matches!(
+                    self.pending_delete,
+                    Some(PendingDelete::Context { .. } | PendingDelete::RenameContext { .. })
+                );
                 self.pending_delete = None;
                 self.confirm_armed = false;
                 self.notice = None;
@@ -1983,6 +2864,202 @@ impl App {
                     Overlay::None
                 };
                 AppCommand::None
+            }
+            _ => AppCommand::None,
+        }
+    }
+
+    fn execute_confirmed_action(&mut self, target: PendingDelete) -> AppCommand {
+        match target {
+            PendingDelete::Resources(targets) => {
+                self.overlay = Overlay::None;
+                self.marks.clear();
+                self.mark_anchor = None;
+                AppCommand::Action(ActionIntent::Delete {
+                    targets,
+                    immediate: false,
+                })
+            }
+            PendingDelete::Restart(targets) => {
+                self.overlay = Overlay::None;
+                self.marks.clear();
+                self.mark_anchor = None;
+                AppCommand::Action(ActionIntent::Restart { targets })
+            }
+            PendingDelete::TriggerCronJob(targets) => {
+                self.overlay = Overlay::None;
+                self.marks.clear();
+                self.mark_anchor = None;
+                AppCommand::Action(ActionIntent::TriggerCronJob { targets })
+            }
+            PendingDelete::ToggleCronJobSuspend { target, .. } => {
+                self.overlay = Overlay::None;
+                AppCommand::Action(ActionIntent::ToggleCronJobSuspend { target })
+            }
+            PendingDelete::SetSuspended { targets, suspended } => {
+                self.overlay = Overlay::None;
+                self.marks.clear();
+                self.mark_anchor = None;
+                AppCommand::Action(ActionIntent::SetSuspended { targets, suspended })
+            }
+            PendingDelete::Context { name } => {
+                self.overlay = Overlay::Contexts;
+                AppCommand::Action(ActionIntent::DeleteContext { name })
+            }
+            PendingDelete::NodeScheduling {
+                name,
+                unschedulable,
+            } => {
+                self.overlay = Overlay::None;
+                AppCommand::Action(ActionIntent::SetNodeUnschedulable {
+                    name,
+                    unschedulable,
+                })
+            }
+            PendingDelete::HelmRollback {
+                namespace,
+                release,
+                revision,
+            } => {
+                self.overlay = Overlay::None;
+                AppCommand::Action(ActionIntent::HelmRollback {
+                    namespace,
+                    release,
+                    revision,
+                })
+            }
+            PendingDelete::DirDelete { path } => {
+                self.overlay = Overlay::None;
+                AppCommand::Action(ActionIntent::DirDelete { path })
+            }
+            PendingDelete::DrainNode(_)
+            | PendingDelete::Scale { .. }
+            | PendingDelete::RenameContext { .. } => AppCommand::None,
+        }
+    }
+
+    fn handle_rename_context_dialog(&mut self, key: KeyEvent) -> AppCommand {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.pending_delete = None;
+                self.confirm_armed = false;
+                self.notice = None;
+                self.overlay = Overlay::Contexts;
+                AppCommand::None
+            }
+            KeyCode::Tab | KeyCode::Down => {
+                self.overlay_selected = (self.overlay_selected + 1) % 3;
+                AppCommand::None
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                self.overlay_selected = (self.overlay_selected + 2) % 3;
+                AppCommand::None
+            }
+            KeyCode::Char(character)
+                if self.overlay_selected == 0
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && !character.is_whitespace() =>
+            {
+                if let Some(PendingDelete::RenameContext { new_name, .. }) =
+                    self.pending_delete.as_mut()
+                {
+                    new_name.push(character);
+                }
+                AppCommand::None
+            }
+            KeyCode::Backspace if self.overlay_selected == 0 => {
+                if let Some(PendingDelete::RenameContext { new_name, .. }) =
+                    self.pending_delete.as_mut()
+                {
+                    new_name.pop();
+                }
+                AppCommand::None
+            }
+            KeyCode::Enter if self.overlay_selected == 1 => {
+                self.pending_delete = None;
+                self.confirm_armed = false;
+                self.notice = None;
+                self.overlay = Overlay::Contexts;
+                AppCommand::None
+            }
+            KeyCode::Enter if self.overlay_selected == 2 || self.overlay_selected == 0 => {
+                if self.read_only {
+                    self.pending_delete = None;
+                    self.overlay = Overlay::Contexts;
+                    return self.unsupported("Rename is disabled in read-only mode");
+                }
+                let Some(PendingDelete::RenameContext { old_name, new_name }) =
+                    self.pending_delete.as_ref()
+                else {
+                    return AppCommand::None;
+                };
+                let new_name = new_name.trim().to_owned();
+                if new_name.is_empty() {
+                    return self.unsupported("Context name cannot be empty");
+                }
+                let old_name = old_name.clone();
+                self.pending_delete = None;
+                self.overlay = Overlay::Contexts;
+                self.notice = None;
+                if old_name == new_name {
+                    return AppCommand::None;
+                }
+                AppCommand::Action(ActionIntent::RenameContext { old_name, new_name })
+            }
+            _ => AppCommand::None,
+        }
+    }
+
+    fn handle_scale_dialog(&mut self, key: KeyEvent) -> AppCommand {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.cancel_drain_confirmation(),
+            KeyCode::Tab | KeyCode::Down => {
+                self.overlay_selected = (self.overlay_selected + 1) % 3;
+                AppCommand::None
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                self.overlay_selected = (self.overlay_selected + 2) % 3;
+                AppCommand::None
+            }
+            KeyCode::Char(character)
+                if self.overlay_selected == 0 && character.is_ascii_digit() =>
+            {
+                if let Some(PendingDelete::Scale { replicas, .. }) = self.pending_delete.as_mut()
+                    && replicas.len() < 10
+                {
+                    replicas.push(character);
+                }
+                AppCommand::None
+            }
+            KeyCode::Backspace if self.overlay_selected == 0 => {
+                if let Some(PendingDelete::Scale { replicas, .. }) = self.pending_delete.as_mut() {
+                    replicas.pop();
+                }
+                AppCommand::None
+            }
+            KeyCode::Enter if self.overlay_selected == 1 => self.cancel_drain_confirmation(),
+            KeyCode::Enter if self.overlay_selected == 2 => {
+                if self.read_only {
+                    self.cancel_drain_confirmation();
+                    return self.unsupported("Scale is disabled in read-only mode");
+                }
+                let Some(PendingDelete::Scale { targets, replicas }) = self.pending_delete.as_ref()
+                else {
+                    return AppCommand::None;
+                };
+                let Ok(replicas) = replicas.parse::<i32>() else {
+                    return self
+                        .unsupported("Replicas must be a whole number from 0 to 2147483647");
+                };
+                let targets = targets.clone();
+                self.pending_delete = None;
+                self.overlay = Overlay::None;
+                self.marks.clear();
+                self.mark_anchor = None;
+                self.notice = None;
+                AppCommand::Action(ActionIntent::Scale { targets, replicas })
             }
             _ => AppCommand::None,
         }
@@ -2167,6 +3244,71 @@ impl App {
     }
 
     #[must_use]
+    pub fn log_display_line_at<'a>(&self, index: usize, line: &'a str) -> &'a str {
+        if self.ui.timestamps() {
+            line
+        } else {
+            self.log_view.as_ref().map_or_else(
+                || without_log_timestamp(line),
+                |view| view.without_timestamp(index, line),
+            )
+        }
+    }
+
+    #[must_use]
+    pub fn can_toggle_all_log_containers(&self) -> bool {
+        self.is_logs_view()
+            && self.log_view.as_ref().is_some_and(|view| {
+                view.request.target.container.is_none()
+                    && view.metadata.as_ref().is_some_and(|metadata| {
+                        metadata
+                            .default_container
+                            .as_deref()
+                            .is_some_and(|name| !name.is_empty())
+                    })
+            })
+    }
+
+    pub fn show_log_resolution(&mut self, id: u64, metadata: LogSessionMeta) {
+        if !self.is_logs_view() {
+            return;
+        }
+        let Some(view) = self.log_view.as_mut().filter(|view| view.request.id == id) else {
+            return;
+        };
+        view.request.all_containers = metadata.all_containers;
+        view.metadata = Some(metadata);
+        self.content_title = Self::log_title(&view.request, view.metadata.as_ref());
+    }
+
+    fn log_title(request: &LogRequest, metadata: Option<&LogSessionMeta>) -> String {
+        let label = if request.target.previous {
+            "Previous Logs"
+        } else {
+            "Logs"
+        };
+        let resolved_container =
+            metadata
+                .filter(|_| !request.all_containers)
+                .and_then(|metadata| {
+                    metadata
+                        .selected_container
+                        .as_deref()
+                        .or(metadata.default_container.as_deref())
+                });
+        let container = request.target.container.as_deref().or(resolved_container);
+        let container = container
+            .filter(|name| !name.is_empty())
+            .map(|name| format!(":{name}"))
+            .unwrap_or_default();
+        format!(
+            "{label}({}/{}{container})",
+            request.target.namespace(),
+            request.target.name()
+        )
+    }
+
+    #[must_use]
     pub fn log_status_label(&self) -> String {
         let Some(view) = &self.log_view else {
             return String::new();
@@ -2189,26 +3331,9 @@ impl App {
 
     fn open_logs(&mut self, target: LogTarget) -> AppCommand {
         self.next_log_id = self.next_log_id.wrapping_add(1);
-        let request = LogRequest {
-            id: self.next_log_id,
-            target,
-            range: LogRange::Tail,
-        };
-        let label = if request.target.previous {
-            "Previous Logs"
-        } else {
-            "Logs"
-        };
-        let container = request
-            .target
-            .container
-            .as_ref()
-            .map(|name| format!("/{name}"))
-            .unwrap_or_default();
-        let title = format!(
-            "{label}({}/{}{container})",
-            request.target.namespace, request.target.pod
-        );
+        let settings = self.user_config.settings.logger;
+        let request = LogRequest::new(self.next_log_id, target, &settings);
+        let title = Self::log_title(&request, None);
         self.show_content(
             title,
             "",
@@ -2221,8 +3346,14 @@ impl App {
                 ContentKind::Logs
             },
         );
-        self.log_view = Some(LogView::new(request.clone()));
-        self.content_scroll = u16::MAX;
+        self.ui.set(UiFlags::WRAP, settings.text_wrap);
+        self.ui.set(UiFlags::TIMESTAMPS, settings.show_time);
+        self.content_scroll = if settings.disable_autoscroll {
+            0
+        } else {
+            u16::MAX
+        };
+        self.log_view = Some(LogView::with_settings(request.clone(), &settings));
         self.notice = Some("Loading logs…".to_owned());
         AppCommand::Action(ActionIntent::StartLogs { request })
     }
@@ -2236,8 +3367,10 @@ impl App {
         view.request.range = range;
         view.finished = false;
         view.refresh_pending = true;
+        let metadata = view.metadata.take();
         view.clear();
         let request = view.request.clone();
+        self.content_title = Self::log_title(&request, metadata.as_ref());
         self.content_body.clear();
         self.reset_body_scroll();
         if self.log_view.as_ref().is_some_and(|view| view.auto_scroll) {
@@ -2253,10 +3386,30 @@ impl App {
         let matcher = FilterMatcher::new(self.body_filter());
         self.content_body
             .lines()
-            .map(|line| self.log_display_line(line))
+            .enumerate()
+            .map(|(index, line)| self.log_display_line_at(index, line))
             .filter(|line| matcher.matches_text(line))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn toggle_all_log_containers(&mut self) -> AppCommand {
+        if !self.can_toggle_all_log_containers() {
+            return AppCommand::None;
+        }
+        let Some(view) = &mut self.log_view else {
+            return AppCommand::None;
+        };
+        if view
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.single_container)
+        {
+            return AppCommand::None;
+        }
+        view.request.all_containers = !view.request.all_containers;
+        let range = view.request.range;
+        self.reload_logs(range)
     }
 
     fn handle_log_key(&mut self, key: KeyEvent) -> Option<AppCommand> {
@@ -2267,7 +3420,8 @@ impl App {
                     |view| {
                         format!(
                             "{}-{}",
-                            view.request.target.namespace, view.request.target.pod
+                            view.request.target.namespace(),
+                            view.request.target.name()
                         )
                     },
                 );
@@ -2281,6 +3435,7 @@ impl App {
             return None;
         }
         let command = match key.code {
+            KeyCode::Char('a') => self.toggle_all_log_containers(),
             KeyCode::Char('0') => self.reload_logs(LogRange::Tail),
             KeyCode::Char('1') => self.reload_logs(LogRange::Head),
             KeyCode::Char('2') => self.reload_logs(LogRange::SinceSeconds(60)),
@@ -2303,7 +3458,11 @@ impl App {
                 if !self.content_body.is_empty() && !self.content_body.ends_with('\n') {
                     self.content_body.push('\n');
                 }
-                append_display_lines(&mut self.content_body, &[mark]);
+                if let Some(view) = &mut self.log_view {
+                    view.insert_marker(&mut self.content_body, mark);
+                } else {
+                    append_display_lines(&mut self.content_body, &[mark], 5_000);
+                }
                 self.content_scroll = u16::MAX;
                 AppCommand::None
             }
@@ -2311,7 +3470,7 @@ impl App {
                 if let Some(view) = &mut self.log_view {
                     view.auto_scroll = !view.auto_scroll;
                     if view.auto_scroll {
-                        append_display_lines(&mut self.content_body, &view.take_pending());
+                        view.show_pending(&mut self.content_body);
                         self.content_scroll = u16::MAX;
                         if !view.column_lock {
                             self.content_horizontal_scroll = 0;
@@ -2357,7 +3516,7 @@ impl App {
     pub fn append_log_batch(
         &mut self,
         id: u64,
-        lines: Vec<String>,
+        lines: Vec<LogLine>,
         finished: bool,
         error: Option<String>,
     ) {
@@ -2369,12 +3528,20 @@ impl App {
         };
         let lines: Vec<_> = lines
             .into_iter()
-            .map(|line| plain_log_line(&line))
+            .map(|mut line| {
+                line.text = plain_log_line(&line.text);
+                if let Some(source) = &mut line.source {
+                    source.namespace = plain_log_line(&source.namespace);
+                    source.pod = plain_log_line(&source.pod);
+                    source.container = plain_log_line(&source.container);
+                }
+                line
+            })
             .collect();
         view.append(&lines);
         view.finished = finished;
         if view.auto_scroll || view.refresh_pending || view.request.range == LogRange::Head {
-            append_display_lines(&mut self.content_body, &view.take_pending());
+            view.show_pending(&mut self.content_body);
             if view.auto_scroll && !lines.is_empty() {
                 self.content_scroll = u16::MAX;
                 if !view.column_lock {
@@ -2394,6 +3561,11 @@ impl App {
     }
 
     fn handle_content_overlay(&mut self, key: KeyEvent) -> AppCommand {
+        if self.content_kind == Some(ContentKind::ScreenDump)
+            && matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
+        {
+            return self.leave_screen_dump_content();
+        }
         if self.is_logs_view()
             && let Some(command) = self.handle_log_key(key)
         {
@@ -2403,64 +3575,50 @@ impl App {
             return AppCommand::None;
         }
         match key.code {
-            KeyCode::Char('e') if self.content_kind == Some(ContentKind::Yaml) => {
-                let command = self.edit_content_action();
-                if matches!(&command, AppCommand::Edit(_)) {
-                    self.overlay = Overlay::None;
-                }
-                command
-            }
+            KeyCode::Char('r') if self.is_live_content() => self.toggle_content_refresh(),
+            KeyCode::Char('e') if self.is_live_content() => self.edit_content_action(),
             KeyCode::Char('c')
                 if matches!(
                     self.content_kind,
                     Some(
                         ContentKind::Yaml
                             | ContentKind::SecretData
+                            | ContentKind::HelmValues
                             | ContentKind::Logs
                             | ContentKind::PreviousLogs
+                            | ContentKind::Describe
+                            | ContentKind::ScreenDump
                     )
                 ) =>
             {
                 AppCommand::Copy(self.active_content_body().to_owned())
             }
             KeyCode::Char('m') if self.content_kind == Some(ContentKind::Yaml) => {
-                match self.content_managed_fields.as_deref() {
-                    Some("") => {
-                        let Some(target) = self.content_target.clone() else {
-                            return AppCommand::None;
-                        };
-                        // This action uses the current snapshot: invalidate an older refresh
-                        // and do not start another until managed fields have been inserted.
-                        self.yaml_refresh.id = self.yaml_refresh.id.wrapping_add(1);
-                        self.yaml_refresh.pending = true;
-                        AppCommand::Action(ActionIntent::ManagedYaml {
-                            target,
-                            body: self.content_body.clone(),
-                            decoded_body: self.content_decoded_body.clone(),
-                        })
-                    }
-                    Some(_) => {
-                        self.ui.toggle(UiFlags::MANAGED_FIELDS);
-                        AppCommand::None
-                    }
-                    None => self.unsupported("Selected resource has no managed fields"),
-                }
+                self.toggle_managed_fields_content()
             }
-            KeyCode::Char('x')
-                if self.content_kind == Some(ContentKind::Yaml)
+            KeyCode::Char('x' | 'v')
+                if matches!(
+                    self.content_kind,
+                    Some(ContentKind::Yaml | ContentKind::HelmValues)
+                ) && (key.code == KeyCode::Char('x')
+                    || self.content_kind == Some(ContentKind::HelmValues))
                     && self.content_decoded_body.is_some() =>
             {
                 self.ui.toggle(UiFlags::SECRET_DECODED);
                 self.reset_body_scroll();
                 self.scroll_to_first_content_match();
-                self.notice = Some(
+                let notice = if self.content_kind == Some(ContentKind::HelmValues) {
                     if self.ui.secret_decoded() {
-                        "Secret values decoded"
+                        "Showing all values (including defaults)"
                     } else {
-                        "Secret values encoded"
+                        "Showing user-supplied values"
                     }
-                    .to_owned(),
-                );
+                } else if self.ui.secret_decoded() {
+                    "Secret values decoded"
+                } else {
+                    "Secret values encoded"
+                };
+                self.notice = Some(notice.to_owned());
                 AppCommand::None
             }
             KeyCode::Char('f') => {
@@ -2476,6 +3634,29 @@ impl App {
                 AppCommand::None
             }
             _ => self.close_overlay_on(key),
+        }
+    }
+
+    fn toggle_managed_fields_content(&mut self) -> AppCommand {
+        match self.content_managed_fields.as_deref() {
+            Some("") => {
+                let Some(target) = self.content_target.clone() else {
+                    return AppCommand::None;
+                };
+                self.yaml_refresh.id = self.yaml_refresh.id.wrapping_add(1);
+                self.yaml_refresh.pending = true;
+                AppCommand::Action(ActionIntent::ManagedYaml {
+                    id: self.yaml_refresh.id,
+                    target,
+                    body: self.content_body.clone(),
+                    decoded_body: self.content_decoded_body.clone(),
+                })
+            }
+            Some(_) => {
+                self.ui.toggle(UiFlags::MANAGED_FIELDS);
+                AppCommand::None
+            }
+            None => self.unsupported("Selected resource has no managed fields"),
         }
     }
 
@@ -2639,6 +3820,7 @@ impl App {
                 | Overlay::Contexts
                 | Overlay::Content
                 | Overlay::Details
+                | Overlay::ScreenDumps
         )
     }
 
@@ -2656,12 +3838,17 @@ impl App {
             self.content_match_cursor = None;
             let matcher = FilterMatcher::new(&self.body_query);
             self.filter_error = matcher.error().map(str::to_owned);
-            if self.overlay == Overlay::Content && self.content_kind == Some(ContentKind::Yaml) {
+            if self.overlay == Overlay::Content
+                && matches!(
+                    self.content_kind,
+                    Some(ContentKind::Yaml | ContentKind::HelmValues)
+                )
+            {
                 self.scroll_to_first_content_match();
             }
             if matches!(
                 self.overlay,
-                Overlay::Aliases | Overlay::Namespaces | Overlay::Contexts
+                Overlay::Aliases | Overlay::Namespaces | Overlay::Contexts | Overlay::ScreenDumps
             ) {
                 self.select_first_visible_chooser_item();
             }
@@ -2688,7 +3875,10 @@ impl App {
 
     fn scroll_to_content_match(&mut self, forward: bool) {
         let matcher = FilterMatcher::new(&self.body_query);
-        let positions = if self.content_kind == Some(ContentKind::Yaml) {
+        let positions = if matches!(
+            self.content_kind,
+            Some(ContentKind::Yaml | ContentKind::HelmValues)
+        ) {
             self.active_content_body()
                 .lines()
                 .enumerate()
@@ -2699,9 +3889,10 @@ impl App {
             (0..self
                 .active_content_body()
                 .lines()
-                .map(|line| {
+                .enumerate()
+                .map(|(index, line)| {
                     if self.is_logs_view() {
-                        self.log_display_line(line)
+                        self.log_display_line_at(index, line)
                     } else {
                         line
                     }
@@ -2740,20 +3931,28 @@ impl App {
     }
 
     fn execute_command(&mut self) -> AppCommand {
-        let command = self.input.trim().to_owned();
+        let command = self.user_config.expand_command(self.input.trim());
         self.input.clear();
         self.input_mode = InputMode::Browse;
         self.reset_completion();
+        let command = match command {
+            Ok(command) => command,
+            Err(message) => return self.unsupported(&message),
+        };
         let mut parts = command.split_whitespace();
         let Some(name) = parts.next() else {
             return AppCommand::None;
         };
         match name.to_ascii_lowercase().as_str() {
             "q" | "quit" => AppCommand::Quit,
+            "help" => self.open_overlay(Overlay::Help),
+            "alias" | "aliases" => self.open_aliases(),
+            "screendump" | "screendumps" | "sd" => self.open_screen_dumps(),
             "ctx" | "context" | "contexts" => {
                 if let Some(context) = parts.next() {
                     self.request_view(
                         ViewState {
+                            instance: None,
                             context: context.to_owned(),
                             kind: self.kind.clone(),
                             namespace: self.namespace.clone(),
@@ -2771,6 +3970,7 @@ impl App {
                     let namespace = (namespace != "all").then(|| namespace.to_owned());
                     self.request_view(
                         ViewState {
+                            instance: None,
                             context: self.context.clone(),
                             kind: self.kind.clone(),
                             namespace,
@@ -2784,48 +3984,298 @@ impl App {
                 }
             }
             "pf" | "portforward" | "portforwards" => AppCommand::ShowPortForwards,
-            alias => {
-                let kind = match self.resolve_resource(alias) {
-                    Ok(kind) => kind,
-                    Err(message) => {
-                        self.notice = Some(message);
-                        return AppCommand::None;
-                    }
-                };
-                let mut namespace = if kind.is_namespaced() {
-                    self.namespace.clone()
-                } else {
-                    None
-                };
-                let mut requested_filter = None;
-                if let Some(argument) = parts.next() {
-                    if let Some(filter) = argument.strip_prefix('/') {
-                        requested_filter = Some(filter.to_owned());
-                    } else {
-                        namespace = (argument != "all").then(|| argument.to_owned());
-                    }
-                }
-                let command = self.request_view(
-                    ViewState {
-                        context: self.context.clone(),
-                        kind,
-                        namespace,
-                        field_selector: None,
-                        label_selector: None,
-                    },
-                    true,
-                );
-                if let Some(filter) = requested_filter {
-                    self.query = filter;
-                    self.filter_error = None;
-                }
-                command
+            "cow" => {
+                let says = parts.collect::<Vec<_>>().join(" ");
+                "Cow".clone_into(&mut self.content_title);
+                self.content_body = cow_talk(&says);
+                self.content_managed_fields = None;
+                self.content_decoded_body = None;
+                self.content_decoded_managed_fields = None;
+                self.content_kind = Some(ContentKind::Describe);
+                self.reset_body_scroll();
+                self.overlay = Overlay::Content;
+                AppCommand::None
             }
+            "dir" | "ls" => self.execute_dir_command(&parts.collect::<Vec<_>>()),
+            "xray" | "xr" => self.execute_xray_command(&parts.collect::<Vec<_>>()),
+            "can" => self.execute_can_command(&parts.collect::<Vec<_>>()),
+            "suspend" => self.open_suspend_confirmation(true),
+            "resume" => self.open_suspend_confirmation(false),
+            alias => self.execute_resource_command(alias, &parts.collect::<Vec<_>>()),
         }
+    }
+
+    fn execute_dir_command(&mut self, arguments: &[&str]) -> AppCommand {
+        let path = arguments
+            .first()
+            .copied()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(".");
+        let expanded = if let Some(rest) = path.strip_prefix("~/")
+            && let Ok(home) = std::env::var("HOME")
+        {
+            format!("{home}/{rest}")
+        } else {
+            path.to_owned()
+        };
+        self.request_view(
+            ViewState {
+                instance: None,
+                context: self.context.clone(),
+                kind: ResourceDescriptor::dir(),
+                namespace: None,
+                field_selector: Some(expanded),
+                label_selector: None,
+            },
+            true,
+        )
+    }
+
+    fn execute_xray_command(&mut self, arguments: &[&str]) -> AppCommand {
+        let Some(raw_target) = arguments.first().copied().filter(|s| !s.trim().is_empty()) else {
+            return self.unsupported(
+                "You must provide a valid resource type (po, svc, deploy, sts, ds, rs)",
+            );
+        };
+        let Some(target_kind) =
+            crate::source::kubernetes::xray::resolve_xray_target_kind(raw_target)
+        else {
+            return self.unsupported(&format!(
+                "`xray` command is not supported on {raw_target}; expected po, svc, deploy, sts, ds, or rs"
+            ));
+        };
+        let mut requested_context = self.context.clone();
+        let mut explicit_namespace = None;
+        let mut requested_filter = None;
+        let mut index = 1;
+        while index < arguments.len() {
+            let arg = arguments[index];
+            if arg == "-n"
+                && let Some(ns) = arguments.get(index + 1)
+            {
+                explicit_namespace = Some(*ns);
+                index += 2;
+                continue;
+            } else if arg == "-f"
+                && let Some(f) = arguments.get(index + 1)
+            {
+                requested_filter = Some((*f).to_owned());
+                index += 2;
+                continue;
+            } else if let Some(ctx) = arg.strip_prefix('@') {
+                let ctx = ctx.trim();
+                if !ctx.is_empty() {
+                    ctx.clone_into(&mut requested_context);
+                }
+            } else if let Some(f) = arg.strip_prefix('/') {
+                requested_filter = Some(f.to_owned());
+            } else if explicit_namespace.is_none() {
+                explicit_namespace = Some(arg);
+            }
+            index += 1;
+        }
+        let namespace = if let Some(ns) = explicit_namespace {
+            (!matches!(ns, "all" | "-")).then(|| ns.to_owned())
+        } else {
+            self.namespace.clone()
+        };
+        self.xray_collapsed.clear();
+        let command = self.request_view(
+            ViewState {
+                instance: None,
+                context: requested_context,
+                kind: ResourceDescriptor::xray(),
+                namespace,
+                field_selector: Some(target_kind.gvr()),
+                label_selector: None,
+            },
+            true,
+        );
+        if let Some(filter) = requested_filter {
+            self.query = filter;
+            self.filter_error = None;
+        }
+        command
+    }
+
+    fn execute_can_command(&mut self, arguments: &[&str]) -> AppCommand {
+        let Some(subject) = arguments.first() else {
+            return self.unsupported(
+                "Usage: :can u:<user> | :can g:<group> | :can s:[namespace/]serviceaccount",
+            );
+        };
+        let Some((prefix, raw_name)) = subject.split_once(':') else {
+            return self.unsupported(
+                "Usage: :can u:<user> | :can g:<group> | :can s:[namespace/]serviceaccount",
+            );
+        };
+        let raw_name = raw_name.trim();
+        if raw_name.is_empty() {
+            return self.unsupported("Subject name cannot be empty");
+        }
+        let target = match prefix.to_ascii_lowercase().as_str() {
+            "u" | "user" | "usr" => ResourceTarget {
+                kind: ResourceDescriptor::users(),
+                namespace: None,
+                name: raw_name.to_owned(),
+            },
+            "g" | "group" | "grp" => ResourceTarget {
+                kind: ResourceDescriptor::groups(),
+                namespace: None,
+                name: raw_name.to_owned(),
+            },
+            "s" | "sa" | "serviceaccount" => {
+                let (namespace, name) = if let Some((ns, sa)) = raw_name.split_once('/') {
+                    let ns = ns.trim();
+                    let sa = sa.trim();
+                    if ns.is_empty() || sa.is_empty() {
+                        return self.unsupported("ServiceAccount subject must be [namespace/]name");
+                    }
+                    (ns.to_owned(), sa.to_owned())
+                } else {
+                    (
+                        self.namespace
+                            .clone()
+                            .unwrap_or_else(|| "default".to_owned()),
+                        raw_name.to_owned(),
+                    )
+                };
+                let kind = self
+                    .resource_options
+                    .iter()
+                    .find(|resource| {
+                        resource.group.is_empty() && resource.kind.as_ref() == "ServiceAccount"
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        ResourceDescriptor::new(
+                            "",
+                            "v1",
+                            "v1",
+                            "ServiceAccount",
+                            "serviceaccounts",
+                            true,
+                            ResourceOperations::all(),
+                        )
+                        .with_short_names(["sa"])
+                    });
+                ResourceTarget {
+                    kind,
+                    namespace: Some(namespace),
+                    name,
+                }
+            }
+            _ => {
+                return self.unsupported(
+                    "Unknown subject type; expected u:<user>, g:<group>, or s:<serviceaccount>",
+                );
+            }
+        };
+        self.overlay = Overlay::None;
+        self.pending_policy = Some(target.clone());
+        AppCommand::Action(ActionIntent::AuthorizationPolicy { target })
+    }
+
+    fn execute_resource_command(&mut self, alias: &str, arguments: &[&str]) -> AppCommand {
+        let kind = match self.resolve_resource(alias) {
+            Ok(kind) => kind,
+            Err(message) => {
+                self.notice = Some(message);
+                return AppCommand::None;
+            }
+        };
+        let mut requested_context = self.context.clone();
+        let mut explicit_namespace = None;
+        let mut requested_filter = None;
+        let mut label_parts = Vec::new();
+        let mut index = 0;
+        while index < arguments.len() {
+            let argument = arguments[index];
+            match argument {
+                "-n" => {
+                    if let Some(ns) = arguments.get(index + 1) {
+                        explicit_namespace = Some(*ns);
+                        index += 2;
+                        continue;
+                    }
+                }
+                "-l" => {
+                    if let Some(label) = arguments.get(index + 1) {
+                        label_parts.push(*label);
+                        index += 2;
+                        continue;
+                    }
+                }
+                "-f" => {
+                    if let Some(filter) = arguments.get(index + 1) {
+                        requested_filter = Some((*filter).to_owned());
+                        index += 2;
+                        continue;
+                    }
+                }
+                _ => {
+                    if let Some(context) = argument.strip_prefix('@') {
+                        let context = context.trim();
+                        if !context.is_empty() {
+                            context.clone_into(&mut requested_context);
+                        }
+                    } else if let Some(filter) = argument.strip_prefix('/') {
+                        requested_filter = Some(
+                            std::iter::once(filter)
+                                .chain(arguments.iter().skip(index + 1).copied())
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                        );
+                        break;
+                    } else if argument.contains('=')
+                        || argument.contains('!')
+                        || argument.contains('(')
+                        || arguments
+                            .get(index + 1)
+                            .is_some_and(|next| matches!(*next, "in" | "notin"))
+                        || !label_parts.is_empty()
+                    {
+                        label_parts.push(argument);
+                    } else if explicit_namespace.is_none() {
+                        explicit_namespace = Some(argument);
+                    } else {
+                        label_parts.push(argument);
+                    }
+                }
+            }
+            index += 1;
+        }
+        let namespace = if kind.is_namespaced() {
+            if let Some(ns) = explicit_namespace {
+                (ns != "all").then(|| ns.to_owned())
+            } else {
+                self.namespace.clone()
+            }
+        } else {
+            None
+        };
+        let label_selector = (!label_parts.is_empty()).then(|| label_parts.join(" "));
+        let command = self.request_view(
+            ViewState {
+                instance: None,
+                context: requested_context,
+                kind,
+                namespace,
+                field_selector: None,
+                label_selector,
+            },
+            true,
+        );
+        if let Some(filter) = requested_filter {
+            self.query = filter;
+            self.filter_error = None;
+        }
+        command
     }
 
     fn current_view(&self) -> ViewState {
         ViewState {
+            instance: self.instance.clone(),
             context: self.context.clone(),
             kind: self.kind.clone(),
             namespace: self.namespace.clone(),
@@ -2834,19 +4284,30 @@ impl App {
         }
     }
 
+    pub fn reload_current_view(&mut self) -> AppCommand {
+        let notice = self.notice.take();
+        let command = self.request_view(self.current_view(), false);
+        self.notice = notice;
+        command
+    }
+
     fn request_view(&mut self, view: ViewState, push_history: bool) -> AppCommand {
-        let resource_kind_changed = self.kind != view.kind;
+        self.clear_restored_workload_selection();
+        self.references_view_requested(&view);
+        self.clear_pending_navigation();
+        let resource_kind_changed = self.kind != view.kind
+            || ((self.kind.is_dir() || self.kind.is_xray())
+                && self.field_selector != view.field_selector);
         if push_history && self.current_view() != view {
+            self.save_workloads_history();
+            self.truncate_workloads_history();
             self.history.truncate(self.history_cursor + 1);
             self.history.push(view.clone());
             self.history_cursor = self.history.len() - 1;
         }
         if self.context != view.context {
             self.namespace_options.clear();
-            self.resource_options = ResourceKind::ALL
-                .into_iter()
-                .map(ResourceDescriptor::from)
-                .collect();
+            self.resource_options = default_resource_options();
             "detecting…".clone_into(&mut self.server_version);
         }
         self.context.clone_from(&view.context);
@@ -2861,7 +4322,28 @@ impl App {
                 .sort_unstable_by(|left, right| left.name.cmp(&right.name));
         }
         self.kind = view.kind.clone();
+        self.instance.clone_from(&view.instance);
         self.namespace.clone_from(&view.namespace);
+        if resource_kind_changed && self.kind.is_workloads() {
+            self.sort_field = SortField::Kind;
+            self.sort_descending = false;
+        } else if resource_kind_changed && self.kind.is_helm_history() {
+            self.sort_field = SortField::Ready;
+            self.sort_descending = true;
+        } else if resource_kind_changed && self.kind.is_benchmarks() {
+            self.sort_field = SortField::Age;
+            self.sort_descending = false;
+        } else if resource_kind_changed && self.kind.is_scans() {
+            self.sort_field = SortField::Status;
+            self.sort_descending = false;
+        } else if resource_kind_changed
+            && matches!(self.sort_field, SortField::Kind | SortField::Ready)
+        {
+            self.sort_field = SortField::Name;
+            self.sort_descending = false;
+        }
+        self.apply_custom_view_sort();
+        self.select_workload_sort_column(self.sort_field);
         self.field_selector.clone_from(&view.field_selector);
         self.label_selector.clone_from(&view.label_selector);
         self.list_horizontal_scroll = 0;
@@ -2916,6 +4398,7 @@ impl App {
         }
         self.request_view(
             ViewState {
+                instance: None,
                 context: self.context.clone(),
                 kind: self.kind.clone(),
                 namespace,
@@ -2932,6 +4415,25 @@ impl App {
             self.recent_namespaces.insert(0, namespace);
         }
         self.recent_namespaces.truncate(9);
+    }
+
+    fn use_selected_namespace_row(&mut self) -> AppCommand {
+        let Some(name) = self.selected_row().map(|row| row.name.to_string()) else {
+            return AppCommand::None;
+        };
+        let namespace = (!matches!(name.as_str(), "all" | "<all>")).then_some(name);
+        self.use_active_namespace(namespace);
+        AppCommand::None
+    }
+
+    fn use_active_namespace(&mut self, namespace: Option<String>) {
+        if self.namespace == namespace {
+            return;
+        }
+        let label = namespace.as_deref().unwrap_or("all").to_owned();
+        self.namespace.clone_from(&namespace);
+        self.remember_namespace(namespace);
+        self.show_transient_notice(format!("Active namespace set to {label}"));
     }
 
     fn reset_completion(&mut self) {
@@ -2981,10 +4483,18 @@ impl App {
         let input = input.trim_start();
         let Some(separator) = input.find(char::is_whitespace) else {
             let prefix = input.to_ascii_lowercase();
+            if prefix.contains('/') {
+                return self
+                    .resource_options
+                    .iter()
+                    .map(ResourceDescriptor::gvr)
+                    .filter(|candidate| candidate.starts_with(&prefix))
+                    .collect();
+            }
             return self
                 .command_names()
                 .into_iter()
-                .filter(|candidate| candidate.starts_with(&prefix))
+                .filter(|candidate| candidate.to_ascii_lowercase().starts_with(&prefix))
                 .collect();
         };
         let command = &input[..separator];
@@ -2992,7 +4502,19 @@ impl App {
         if argument.contains(char::is_whitespace) {
             return Vec::new();
         }
-        let candidates = match command.to_ascii_lowercase().as_str() {
+        let Ok(expanded) = self.user_config.expand_command(command) else {
+            return Vec::new();
+        };
+        let mut expanded_parts = expanded.split_whitespace();
+        let Some(expanded_command) = expanded_parts.next() else {
+            return Vec::new();
+        };
+        // An alias with an existing namespace, context, or selector has already
+        // supplied this argument; offering it again would alter the command.
+        if expanded_parts.next().is_some() {
+            return Vec::new();
+        }
+        let candidates = match expanded_command.to_ascii_lowercase().as_str() {
             "ctx" | "context" | "contexts" => self
                 .context_options
                 .iter()
@@ -3028,6 +4550,7 @@ impl App {
                     .command_aliases()
                     .iter()
                     .any(|candidate| candidate.eq_ignore_ascii_case(&alias))
+                    || resource.gvr().eq_ignore_ascii_case(&alias)
             })
             .cloned()
             .collect();
@@ -3058,6 +4581,8 @@ impl App {
 
     fn command_names(&self) -> Vec<String> {
         let mut commands = BTreeSet::from([
+            "screendump".to_owned(),
+            "sd".to_owned(),
             "ctx".to_owned(),
             "context".to_owned(),
             "contexts".to_owned(),
@@ -3067,12 +4592,24 @@ impl App {
             "pf".to_owned(),
             "portforward".to_owned(),
             "portforwards".to_owned(),
+            "can".to_owned(),
+            "dir".to_owned(),
+            "ls".to_owned(),
+            "xray".to_owned(),
+            "xr".to_owned(),
+            "cow".to_owned(),
             "q".to_owned(),
             "quit".to_owned(),
+            "help".to_owned(),
+            "alias".to_owned(),
+            "aliases".to_owned(),
+            "suspend".to_owned(),
+            "resume".to_owned(),
         ]);
         for resource in &self.resource_options {
             commands.extend(resource.command_aliases());
         }
+        commands.extend(self.user_config.aliases.keys().cloned());
         commands.into_iter().collect()
     }
 
@@ -3103,11 +4640,23 @@ impl App {
         if next == self.history_cursor {
             return AppCommand::None;
         }
+        self.save_workloads_history();
         self.history_cursor = next;
-        self.request_view(self.history[next].clone(), false)
+        let command = self.request_view(self.history[next].clone(), false);
+        self.restore_workloads_history();
+        command
     }
 
     fn escape_view(&mut self) -> AppCommand {
+        if let Some(command) = self.cancel_initial_reference_scan() {
+            return command;
+        }
+        if let Some(command) = self.restore_references_on_escape() {
+            return command;
+        }
+        if let Some(command) = self.cancel_pending_navigation() {
+            return command;
+        }
         if !self.is_resource_view() {
             return self.restore_resource_list();
         }
@@ -3177,11 +4726,13 @@ impl App {
             .iter()
             .enumerate()
             .filter(|(_, resource)| {
-                let searchable = format!(
-                    "{} {}",
-                    resource.qualified_name(),
-                    resource.command_aliases().join(" ")
-                );
+                let mut aliases = resource.command_aliases();
+                for (custom_alias, target) in &self.user_config.aliases {
+                    if target == &resource.gvr() || target == &resource.qualified_name() {
+                        aliases.push(custom_alias.clone());
+                    }
+                }
+                let searchable = format!("{} {}", resource.qualified_name(), aliases.join(" "));
                 matcher.matches_text(&searchable)
             })
             .map(|(index, _)| index)
@@ -3204,6 +4755,7 @@ impl App {
             Overlay::Aliases => self.visible_resource_indices().first().copied(),
             Overlay::Namespaces => self.visible_namespace_indices().first().copied(),
             Overlay::Contexts => self.visible_context_indices().first().copied(),
+            Overlay::ScreenDumps => self.visible_dump_indices().first().copied(),
             _ => None,
         }
         .unwrap_or(NO_CHOOSER_SELECTION);
@@ -3249,6 +4801,7 @@ impl App {
     }
 
     fn set_sort(&mut self, field: SortField) {
+        self.select_workload_sort_column(field);
         if self.sort_field == field {
             self.sort_descending = !self.sort_descending;
         } else {
@@ -3261,6 +4814,7 @@ impl App {
 
     fn rebuild_filter(&mut self, selected_key: Option<&str>) {
         let matcher = FilterMatcher::new(&self.query);
+        let faults_only = self.ui.faults() && !self.is_reference_view();
         self.filter_error = matcher.error().map(str::to_owned);
         self.filtered.clear();
         self.filtered.extend(
@@ -3269,21 +4823,54 @@ impl App {
                 .iter()
                 .enumerate()
                 .filter(|(_, row)| matcher.matches(row))
-                .filter(|(_, row)| !self.ui.faults() || row_is_fault(&self.kind, row))
+                .filter(|(_, row)| !faults_only || row_is_fault(&self.kind, row))
                 .map(|(index, _)| index),
         );
 
         let rows = &self.snapshot.rows;
         let sort_field = self.sort_field;
         let descending = self.sort_descending;
-        self.filtered.sort_unstable_by(|left, right| {
-            let ordering = compare_rows(&rows[*left], &rows[*right], sort_field);
-            if descending {
-                ordering.reverse()
-            } else {
-                ordering
-            }
-        });
+        let workloads = self.kind.is_workloads();
+        let pulses = self.kind.is_pulses();
+        let xray = self.kind.is_xray();
+        let scans = self.kind.is_scans();
+        let scan_settings = &self.user_config.settings.image_scans;
+        if xray && !self.xray_collapsed.is_empty() {
+            self.filtered.retain(|index| {
+                let Some(xr) = self.snapshot.rows[*index].xray_data() else {
+                    return true;
+                };
+                !self.xray_collapsed.iter().any(|collapsed| {
+                    xr.path.len() > collapsed.len() + 2
+                        && xr.path.starts_with(collapsed.as_ref())
+                        && xr.path.as_bytes()[collapsed.len()..].starts_with(b"::")
+                })
+            });
+        }
+        let now = self.now_unix;
+        if !pulses && !xray {
+            self.filtered.sort_unstable_by(|left, right| {
+                let ordering = if workloads {
+                    navigation::compare_workload_rows(&rows[*left], &rows[*right], sort_field, now)
+                } else if scans && sort_field == SortField::Status {
+                    crate::scans::sev_rank(&rows[*left].status)
+                        .cmp(&crate::scans::sev_rank(&rows[*right].status))
+                        .then_with(|| rows[*left].details.cmp(&rows[*right].details))
+                        .then_with(|| rows[*left].name.cmp(&rows[*right].name))
+                } else if sort_field == SortField::VulnScore {
+                    row_vuln_score(&rows[*left], scan_settings)
+                        .cmp(&row_vuln_score(&rows[*right], scan_settings))
+                        .then_with(|| rows[*left].key.cmp(&rows[*right].key))
+                } else {
+                    compare_rows(&rows[*left], &rows[*right], sort_field)
+                };
+                if descending {
+                    ordering.reverse()
+                } else {
+                    ordering
+                }
+            });
+        }
 
         self.selected = selected_key
             .and_then(|key| {
@@ -3364,15 +4951,33 @@ impl App {
         self.mark_anchor = Some(self.selected);
     }
 
+    fn row_target(&self, row: &ResourceRow) -> Option<ResourceTarget> {
+        let kind = if self.kind.is_workloads() {
+            let ResourceData::Workload { kind } = &row.data else {
+                return None;
+            };
+            kind.clone()
+        } else if self.kind.is_xray() {
+            let xray = row.xray_data()?;
+            if xray.is_container {
+                return None;
+            }
+            xray.target_kind.clone()
+        } else {
+            self.kind.clone()
+        };
+        Some(ResourceTarget {
+            kind,
+            namespace: (row.namespace.as_ref() != "-").then(|| row.namespace.to_string()),
+            name: row.name.to_string(),
+        })
+    }
+
     fn selected_target(&self) -> Option<ResourceTarget> {
         if !self.is_resource_view() {
             return None;
         }
-        self.selected_row().map(|row| ResourceTarget {
-            kind: self.kind.clone(),
-            namespace: (row.namespace.as_ref() != "-").then(|| row.namespace.to_string()),
-            name: row.name.to_string(),
-        })
+        self.selected_row().and_then(|row| self.row_target(row))
     }
 
     fn selected_or_marked_targets(&self) -> Vec<ResourceTarget> {
@@ -3384,11 +4989,7 @@ impl App {
             .rows
             .iter()
             .filter(|row| self.marks.contains(&row.key))
-            .map(|row| ResourceTarget {
-                kind: self.kind.clone(),
-                namespace: (row.namespace.as_ref() != "-").then(|| row.namespace.to_string()),
-                name: row.name.to_string(),
-            })
+            .filter_map(|row| self.row_target(row))
             .collect::<Vec<_>>();
         if marked.is_empty() {
             self.selected_target().into_iter().collect()
@@ -3397,12 +4998,48 @@ impl App {
         }
     }
 
+    fn open_virtual_selected(&mut self) -> Option<AppCommand> {
+        if !self.is_resource_view() {
+            return None;
+        }
+        if self.kind.is_workloads() {
+            Some(self.open_workload_instance())
+        } else if self.kind.is_pulses() {
+            Some(self.open_pulse_target())
+        } else if self.kind.is_helm() {
+            Some(self.open_helm_releases())
+        } else if self.kind.is_helm_history() {
+            Some(self.open_helm_rollback_confirmation())
+        } else if self.kind.is_dir() {
+            Some(self.open_dir_entry())
+        } else if self.kind.is_benchmarks() {
+            Some(self.content_action(ContentKind::Yaml))
+        } else if self.kind.is_xray() {
+            Some(self.open_xray_node())
+        } else if self.kind.is_scans() {
+            Some(self.open_scan_cve())
+        } else if self.kind.is_skins() {
+            Some(self.apply_selected_skin())
+        } else {
+            None
+        }
+    }
+
     fn open_selected(&mut self) -> AppCommand {
+        if let Some(command) = self.open_virtual_selected() {
+            return command;
+        }
         if self.is_container_view() {
             return self.container_log_action(false);
         }
         if self.is_policy_view() {
             return AppCommand::None;
+        }
+        if self.kind.known_kind() == Some(ResourceKind::Deployments) {
+            return self.open_deployment_pods();
+        }
+        if self.kind.is_cron_job() || self.kind.is_job() {
+            return self.open_batch_children();
         }
         if self.kind.is_authorization_resource() {
             let Some(target) = self.selected_target() else {
@@ -3410,6 +5047,28 @@ impl App {
             };
             self.pending_policy = Some(target.clone());
             return AppCommand::Action(ActionIntent::AuthorizationPolicy { target });
+        }
+        if self.kind.is_core_v1_namespace() {
+            let Some(name) = self.selected_row().map(|row| row.name.to_string()) else {
+                return AppCommand::None;
+            };
+            let namespace = (!matches!(name.as_str(), "all" | "<all>")).then_some(name);
+            self.use_active_namespace(namespace.clone());
+            self.query.clear();
+            return self.request_view(
+                ViewState {
+                    instance: None,
+                    context: self.context.clone(),
+                    kind: ResourceDescriptor::from(ResourceKind::Pods),
+                    namespace,
+                    field_selector: None,
+                    label_selector: None,
+                },
+                true,
+            );
+        }
+        if let Some(command) = self.open_custom_jump() {
+            return command;
         }
         if let Some(command) = self.open_child_resource() {
             return command;
@@ -3425,6 +5084,7 @@ impl App {
                 self.query.clear();
                 self.request_view(
                     ViewState {
+                        instance: None,
                         context: self.context.clone(),
                         kind: ResourceDescriptor::from(ResourceKind::Pods),
                         namespace: None,
@@ -3457,6 +5117,400 @@ impl App {
         }
     }
 
+    fn open_pulse_target(&mut self) -> AppCommand {
+        let Some(pulse) = self.selected_row().and_then(ResourceRow::pulse_data) else {
+            return AppCommand::None;
+        };
+        let target_kind = pulse.target_kind.clone();
+        let namespace = target_kind
+            .is_namespaced()
+            .then(|| self.namespace.clone())
+            .flatten();
+        if !self.resource_options.contains(&target_kind) {
+            self.resource_options.push(target_kind.clone());
+        }
+        self.request_view(
+            ViewState {
+                instance: None,
+                context: self.context.clone(),
+                kind: target_kind,
+                namespace,
+                field_selector: None,
+                label_selector: None,
+            },
+            true,
+        )
+    }
+
+    fn open_xray_node(&mut self) -> AppCommand {
+        let Some(row) = self.selected_row() else {
+            return AppCommand::None;
+        };
+        let Some(xray) = row.xray_data() else {
+            return AppCommand::None;
+        };
+        if xray.is_container {
+            return self.xray_log_action(false);
+        }
+        if xray.is_namespace {
+            let ns = row.name.to_string();
+            return self.request_view(
+                ViewState {
+                    instance: None,
+                    context: self.context.clone(),
+                    kind: ResourceDescriptor::from(ResourceKind::Pods),
+                    namespace: Some(ns),
+                    field_selector: None,
+                    label_selector: None,
+                },
+                true,
+            );
+        }
+        let target_kind = xray.target_kind.clone();
+        let ns = (row.namespace.as_ref() != "-").then(|| row.namespace.to_string());
+        let name = row.name.to_string();
+        if !self.resource_options.contains(&target_kind) {
+            self.resource_options.push(target_kind.clone());
+        }
+        self.request_view(
+            ViewState {
+                instance: Some(ResourceTarget {
+                    kind: target_kind.clone(),
+                    namespace: ns.clone(),
+                    name,
+                }),
+                context: self.context.clone(),
+                kind: target_kind,
+                namespace: ns,
+                field_selector: None,
+                label_selector: None,
+            },
+            true,
+        )
+    }
+
+    fn open_vulnerability_scans(&mut self) -> AppCommand {
+        let Some(row) = self.selected_row() else {
+            return AppCommand::None;
+        };
+        if self
+            .user_config
+            .settings
+            .image_scans
+            .should_exclude(&row.namespace, &row.labels)
+        {
+            return self
+                .unsupported("Selected resource is excluded from image vulnerability scans");
+        }
+        let images = row.extract_container_images();
+        if images.is_empty() {
+            return self.unsupported("Selected resource has no container images to scan");
+        }
+        self.request_view(
+            ViewState {
+                instance: None,
+                context: self.context.clone(),
+                kind: ResourceDescriptor::scans(),
+                namespace: None,
+                field_selector: Some(images.join("\n")),
+                label_selector: None,
+            },
+            true,
+        )
+    }
+
+    fn open_scan_cve(&mut self) -> AppCommand {
+        let Some(row) = self.selected_row() else {
+            return AppCommand::None;
+        };
+        let url = crate::scans::cve_advisory_url(&row.name);
+        self.show_transient_notice(format!("Opening advisory {url}"));
+        AppCommand::OpenUrl(url)
+    }
+
+    fn apply_selected_skin(&mut self) -> AppCommand {
+        let Some(name) = self.selected_row().map(|row| row.name.to_string()) else {
+            return AppCommand::None;
+        };
+        let paths = crate::config::ConfigPaths::from_env().unwrap_or_else(|_| {
+            crate::config::ConfigPaths::new("/tmp/kux/config", "/tmp/kux/data")
+        });
+        match crate::theme::Skin::load_named(&paths, &name) {
+            Ok(skin) => {
+                self.theme = skin.clone();
+                self.user_config.theme = skin;
+                self.user_config.settings.ui.skin = Some(name.clone());
+                self.show_transient_notice(format!("Applied skin {name}"));
+            }
+            Err(error) => {
+                self.show_transient_notice(error);
+            }
+        }
+        AppCommand::None
+    }
+
+    fn open_helm_releases(&mut self) -> AppCommand {
+        let Some(row) = self.selected_row() else {
+            return AppCommand::None;
+        };
+        let namespace = if row.namespace.as_ref() == "-" {
+            self.namespace
+                .clone()
+                .unwrap_or_else(|| "default".to_owned())
+        } else {
+            row.namespace.to_string()
+        };
+        let release = row.name.to_string();
+        self.request_view(
+            ViewState {
+                instance: None,
+                context: self.context.clone(),
+                kind: ResourceDescriptor::helm_history(),
+                namespace: Some(namespace.clone()),
+                field_selector: Some(format!("{namespace}/{release}")),
+                label_selector: None,
+            },
+            true,
+        )
+    }
+
+    fn open_helm_rollback_confirmation(&mut self) -> AppCommand {
+        if self.read_only {
+            return self.unsupported("Helm rollback is disabled in read-only mode");
+        }
+        let Some(row) = self.selected_row() else {
+            return AppCommand::None;
+        };
+        let namespace = if row.namespace.as_ref() == "-" {
+            self.namespace
+                .clone()
+                .unwrap_or_else(|| "default".to_owned())
+        } else {
+            row.namespace.to_string()
+        };
+        let (release, revision) = row
+            .name
+            .split_once(':')
+            .map_or((row.name.as_ref(), row.ready.as_ref()), |(r, rev)| (r, rev));
+        self.open_action_confirmation(PendingDelete::HelmRollback {
+            namespace,
+            release: release.to_owned(),
+            revision: revision.to_owned(),
+        })
+    }
+
+    fn open_dir_entry(&mut self) -> AppCommand {
+        let Some(row) = self.selected_row() else {
+            return AppCommand::None;
+        };
+        if row.status.as_ref() != "dir" {
+            return self.unsupported("You must select a directory");
+        }
+        let path = row.name.to_string();
+        self.request_view(
+            ViewState {
+                instance: None,
+                context: self.context.clone(),
+                kind: ResourceDescriptor::dir(),
+                namespace: None,
+                field_selector: Some(path),
+                label_selector: None,
+            },
+            true,
+        )
+    }
+
+    fn dir_edit_action(&mut self) -> AppCommand {
+        if self.read_only {
+            return self.unsupported("Edit is disabled in read-only mode");
+        }
+        let Some(row) = self.selected_row() else {
+            return AppCommand::None;
+        };
+        if row.status.as_ref() == "dir" {
+            return self.unsupported("You must select a manifest");
+        }
+        AppCommand::EditDump(std::path::PathBuf::from(row.name.as_ref()))
+    }
+
+    fn dir_apply_action(&mut self) -> AppCommand {
+        if self.read_only {
+            return self.unsupported("Apply is disabled in read-only mode");
+        }
+        let Some(row) = self.selected_row() else {
+            return AppCommand::None;
+        };
+        AppCommand::Action(ActionIntent::DirApply {
+            path: row.name.to_string(),
+        })
+    }
+
+    fn open_dir_delete_confirmation(&mut self) -> AppCommand {
+        if self.read_only {
+            return self.unsupported("Delete is disabled in read-only mode");
+        }
+        let Some(row) = self.selected_row() else {
+            return AppCommand::None;
+        };
+        self.open_action_confirmation(PendingDelete::DirDelete {
+            path: row.name.to_string(),
+        })
+    }
+
+    fn benchmark_service_action(&mut self) -> AppCommand {
+        let Some(row) = self.selected_row() else {
+            return AppCommand::None;
+        };
+        let svc_type = row.status.as_ref();
+        if !matches!(svc_type, "NodePort" | "LoadBalancer") {
+            return self
+                .unsupported("You must select a reachable service (NodePort or LoadBalancer)");
+        }
+        let Some(port) = row
+            .port_forward_ports
+            .as_ref()
+            .and_then(|ports| ports.first())
+            .map(|p| p.port)
+        else {
+            return self.unsupported("Service exposes no TCP ports to benchmark");
+        };
+        let non_empty_json = |path: &str| {
+            let val = row.json_path_value(path);
+            (!val.is_empty() && val != "<none>" && val != "-").then_some(val)
+        };
+        let ip = non_empty_json(".status.loadBalancer.ingress[0].ip")
+            .or_else(|| non_empty_json(".status.loadBalancer.ingress[0].hostname"))
+            .or_else(|| non_empty_json(".spec.externalIPs[0]"))
+            .unwrap_or_else(|| {
+                if row.details.as_ref() != "-" && !row.details.is_empty() {
+                    row.details.to_string()
+                } else {
+                    "127.0.0.1".to_owned()
+                }
+            });
+        let namespace = if row.namespace.as_ref() == "-" {
+            self.namespace
+                .clone()
+                .unwrap_or_else(|| "default".to_owned())
+        } else {
+            row.namespace.to_string()
+        };
+        let name = row.name.to_string();
+        let fqn = format!("{namespace}/{name}");
+        let cfg = self.user_config.bench_config_for_service(&fqn);
+        let path = if cfg.http.path.starts_with('/') {
+            cfg.http.path.clone()
+        } else {
+            format!("/{}", cfg.http.path)
+        };
+        let base_url = format!("http://{ip}:{port}{path}");
+        let cluster = self.active_context_info().cluster.clone();
+        AppCommand::RunBenchmark(crate::benchmarks::BenchmarkRunRequest {
+            cluster,
+            context: self.context.clone(),
+            namespace,
+            target_name: format!("{name}:{port}"),
+            base_url,
+            config: cfg,
+        })
+    }
+
+    fn benchmark_selected_port_forward(&mut self) -> AppCommand {
+        let Some(forward) = self.port_forwards.get(self.overlay_selected) else {
+            return AppCommand::None;
+        };
+        let namespace = forward
+            .target
+            .namespace
+            .clone()
+            .unwrap_or_else(|| "default".to_owned());
+        let name = forward.target.name.clone();
+        let remote_port = forward.remote_port;
+        let local_port = forward.local_port;
+        let address = forward.address.clone();
+        let key = format!("{namespace}/{name}:{remote_port}");
+        let cfg = self.user_config.bench_config_for_container(&key);
+        let path = if cfg.http.path.starts_with('/') {
+            cfg.http.path.clone()
+        } else {
+            format!("/{}", cfg.http.path)
+        };
+        let base_url = format!("http://{address}:{local_port}{path}");
+        let cluster = self.active_context_info().cluster.clone();
+        AppCommand::RunBenchmark(crate::benchmarks::BenchmarkRunRequest {
+            cluster,
+            context: self.context.clone(),
+            namespace,
+            target_name: format!("{name}:{remote_port}"),
+            base_url,
+            config: cfg,
+        })
+    }
+
+    fn open_selected_port_forward_benchmarks(&mut self) -> AppCommand {
+        let Some(forward) = self.port_forwards.get(self.overlay_selected) else {
+            return AppCommand::None;
+        };
+        let namespace = forward
+            .target
+            .namespace
+            .clone()
+            .unwrap_or_else(|| "default".to_owned());
+        let prefix = format!(
+            "{namespace}/{}:{}",
+            forward.target.name, forward.remote_port
+        );
+        self.port_forwards.clear();
+        self.overlay = Overlay::None;
+        self.request_view(
+            ViewState {
+                instance: None,
+                context: self.context.clone(),
+                kind: ResourceDescriptor::benchmarks(),
+                namespace: None,
+                field_selector: Some(prefix),
+                label_selector: None,
+            },
+            true,
+        )
+    }
+
+    fn open_custom_jump(&mut self) -> Option<AppCommand> {
+        let jump = self.user_config.custom_jump_for(&self.kind)?.clone();
+        let row = self.selected_row()?;
+        let row_name = row.name.to_string();
+        let row_namespace = (row.namespace.as_ref() != "-").then(|| row.namespace.to_string());
+        let kind = match self.resolve_resource(&jump.resource) {
+            Ok(kind) => kind,
+            Err(message) => {
+                return Some(self.unsupported(&message));
+            }
+        };
+        let namespace = if kind.is_namespaced() {
+            if let Some(ns) = &jump.namespace {
+                (!matches!(ns.as_str(), "all" | "*" | "-A")).then(|| ns.clone())
+            } else {
+                row_namespace.or_else(|| self.namespace.clone())
+            }
+        } else {
+            None
+        };
+        let command = self.request_view(
+            ViewState {
+                instance: None,
+                context: self.context.clone(),
+                kind,
+                namespace,
+                field_selector: None,
+                label_selector: None,
+            },
+            true,
+        );
+        self.query = row_name;
+        self.filter_error = None;
+        Some(command)
+    }
+
     fn open_child_resource(&mut self) -> Option<AppCommand> {
         let child = self.selected_row().and_then(|row| {
             row.child_resource_data()
@@ -3465,6 +5519,7 @@ impl App {
         let namespace = (child.0 != "-").then_some(child.0);
         Some(self.request_view(
             ViewState {
+                instance: None,
                 context: self.context.clone(),
                 kind: child.1.kind,
                 namespace,
@@ -3490,6 +5545,7 @@ impl App {
             .clone();
         Some(self.request_view(
             ViewState {
+                instance: None,
                 context: self.context.clone(),
                 kind,
                 namespace: None,
@@ -3516,6 +5572,7 @@ impl App {
             .flatten();
         self.request_view(
             ViewState {
+                instance: None,
                 context: self.context.clone(),
                 kind,
                 namespace,
@@ -3589,6 +5646,7 @@ impl App {
         let namespace = namespace.filter(|_| kind.is_namespaced());
         self.request_view(
             ViewState {
+                instance: None,
                 context: self.context.clone(),
                 kind,
                 namespace,
@@ -3615,34 +5673,26 @@ impl App {
         let Some(row) = self.selected_row() else {
             return AppCommand::None;
         };
-        let target = LogTarget {
-            namespace: namespace.clone(),
-            pod: pod.clone(),
-            container: Some(row.name.to_string()),
+        let target = LogTarget::pod(
+            namespace.clone(),
+            pod.clone(),
+            Some(row.name.to_string()),
             previous,
-        };
+        );
         self.open_logs(target)
     }
 
-    fn pod_log_action(&mut self, previous: bool) -> AppCommand {
-        let Some(row) = self.selected_row() else {
+    fn resource_log_action(&mut self, previous: bool) -> AppCommand {
+        if !self.is_resource_view() || !supports_logs(&self.kind) {
+            return AppCommand::None;
+        }
+        let Some(target) = self.selected_target() else {
             return AppCommand::None;
         };
-        let Some(container) = row
-            .pod_data()
-            .map(|data| data.default_container.to_string())
-            .filter(|container| !container.is_empty())
-        else {
-            return self.unsupported("Pod has no regular containers");
-        };
-        let namespace = row.namespace.to_string();
-        let pod = row.name.to_string();
-        self.open_logs(LogTarget {
-            namespace,
-            pod,
-            container: Some(container),
-            previous,
-        })
+        if target.namespace.as_deref().is_none_or(str::is_empty) {
+            return self.unsupported("Log target namespace is unavailable; refresh and retry");
+        }
+        self.open_logs(LogTarget::workload(target, previous))
     }
 
     fn open_pod_node(&mut self) -> AppCommand {
@@ -3656,6 +5706,7 @@ impl App {
         };
         self.request_view(
             ViewState {
+                instance: None,
                 context: self.context.clone(),
                 kind: ResourceKind::Nodes.into(),
                 namespace: None,
@@ -3664,6 +5715,19 @@ impl App {
             },
             true,
         )
+    }
+
+    fn node_shell_action(&mut self) -> AppCommand {
+        if self.read_only {
+            return self.unsupported("Node shell is disabled in read-only mode");
+        }
+        let Some(node) = self.selected_row().map(|row| row.name.to_string()) else {
+            return AppCommand::None;
+        };
+        AppCommand::NodeShell(NodeShellTarget {
+            node,
+            settings: self.user_config.shell_pod_for(&self.context).clone(),
+        })
     }
 
     fn pod_shell_action(&mut self) -> AppCommand {
@@ -3689,6 +5753,21 @@ impl App {
             pod: target.name,
             container,
         })
+    }
+
+    fn attach_action(&mut self) -> AppCommand {
+        if self.read_only {
+            return self.unsupported("Attach is disabled in read-only mode");
+        }
+        let command = if self.is_container_view() {
+            self.container_shell_action()
+        } else {
+            self.pod_shell_action()
+        };
+        match command {
+            AppCommand::Shell(target) => AppCommand::Attach(target),
+            other => other,
+        }
     }
 
     fn container_shell_action(&mut self) -> AppCommand {
@@ -3822,6 +5901,34 @@ impl App {
         AppCommand::None
     }
 
+    fn open_context_rename_dialog(&mut self, visible: &[usize]) -> AppCommand {
+        if self.read_only {
+            return self.unsupported("Rename is disabled in read-only mode");
+        }
+        let Some(index) = visible
+            .iter()
+            .copied()
+            .find(|index| *index == self.overlay_selected)
+        else {
+            return AppCommand::None;
+        };
+        let Some(context) = self.context_options.get(index) else {
+            return AppCommand::None;
+        };
+        if !context.kubeconfig_backed {
+            return self.unsupported("Only kubeconfig contexts can be renamed");
+        }
+        self.pending_delete = Some(PendingDelete::RenameContext {
+            old_name: context.name.clone(),
+            new_name: context.name.clone(),
+        });
+        self.confirm_armed = false;
+        self.overlay_selected = 0;
+        self.notice = None;
+        self.overlay = Overlay::ConfirmDelete;
+        AppCommand::None
+    }
+
     fn open_workload_restart_confirmation(&mut self) -> AppCommand {
         if self.read_only {
             return self.unsupported("Restart is disabled in read-only mode");
@@ -3835,6 +5942,98 @@ impl App {
         self.notice = None;
         self.overlay = Overlay::ConfirmDelete;
         AppCommand::None
+    }
+
+    fn open_scale_dialog(&mut self) -> AppCommand {
+        if self.read_only {
+            return self.unsupported("Scale is disabled in read-only mode");
+        }
+        let targets = self.selected_or_marked_targets();
+        if targets.is_empty() {
+            return AppCommand::None;
+        }
+        let replicas = if targets.len() == 1 {
+            self.selected_row()
+                .and_then(|row| {
+                    let (_, desired) = row.ready.split_once('/')?;
+                    let desired = desired.trim_end_matches(['↑', '↓']);
+                    desired.parse::<u32>().ok().map(|n| n.to_string())
+                })
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        self.pending_delete = Some(PendingDelete::Scale { targets, replicas });
+        self.confirm_armed = false;
+        self.overlay_selected = 0;
+        self.notice = None;
+        self.overlay = Overlay::ConfirmDelete;
+        AppCommand::None
+    }
+
+    fn open_cronjob_trigger_confirmation(&mut self) -> AppCommand {
+        if self.read_only {
+            return self.unsupported("Trigger is disabled in read-only mode");
+        }
+        let targets = self.selected_or_marked_targets();
+        if targets.is_empty() {
+            return AppCommand::None;
+        }
+        self.open_action_confirmation(PendingDelete::TriggerCronJob(targets))
+    }
+
+    fn open_suspend_toggle_confirmation(&mut self) -> AppCommand {
+        if self.read_only {
+            return self.unsupported("Suspend/resume is disabled in read-only mode");
+        }
+        let Some(target) = self.selected_target() else {
+            return AppCommand::None;
+        };
+        let suspend = self.selected_row().and_then(|row| {
+            let col_idx = self
+                .snapshot
+                .table_columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case("suspend"));
+            let text = col_idx
+                .and_then(|i| row.table_cells.get(i))
+                .map(|c| c.text.as_ref().trim())
+                .or_else(|| {
+                    row.raw_object
+                        .as_deref()
+                        .and_then(|v| v.pointer("/spec/suspend"))
+                        .and_then(serde_json::Value::as_bool)
+                        .map(|b| if b { "true" } else { "false" })
+                })?;
+            match text.to_ascii_lowercase().as_str() {
+                "true" => Some(false),
+                "false" => Some(true),
+                _ => None,
+            }
+        });
+        self.open_action_confirmation(PendingDelete::ToggleCronJobSuspend { target, suspend })
+    }
+
+    fn open_action_confirmation(&mut self, action: PendingDelete) -> AppCommand {
+        self.pending_delete = Some(action);
+        self.confirm_armed = false;
+        self.notice = None;
+        self.overlay = Overlay::ConfirmDelete;
+        AppCommand::None
+    }
+
+    fn open_suspend_confirmation(&mut self, suspended: bool) -> AppCommand {
+        if self.read_only {
+            return self.unsupported("Suspend/resume is disabled in read-only mode");
+        }
+        if !self.is_resource_view() || !self.kind.is_suspendable() {
+            return self.unsupported("Suspend/resume requires a CronJob or Job view");
+        }
+        let targets = self.selected_or_marked_targets();
+        if targets.is_empty() {
+            return AppCommand::None;
+        }
+        self.open_action_confirmation(PendingDelete::SetSuspended { targets, suspended })
     }
 
     fn open_node_drain_confirmation(&mut self) -> AppCommand {
@@ -3875,6 +6074,23 @@ impl App {
         AppCommand::None
     }
 
+    fn open_node_cordon_confirmation(&mut self, unschedulable: bool) -> AppCommand {
+        if self.read_only {
+            return self.unsupported("Cordon/uncordon is disabled in read-only mode");
+        }
+        let Some(name) = self.selected_row().map(|row| row.name.to_string()) else {
+            return AppCommand::None;
+        };
+        self.pending_delete = Some(PendingDelete::NodeScheduling {
+            name,
+            unschedulable,
+        });
+        self.confirm_armed = false;
+        self.notice = None;
+        self.overlay = Overlay::ConfirmDelete;
+        AppCommand::None
+    }
+
     fn immediate_delete(&mut self) -> AppCommand {
         if !self.is_resource_view() {
             return self.unsupported("Synthetic rows cannot be deleted");
@@ -3894,8 +6110,7 @@ impl App {
         let Some(target) = self.selected_target() else {
             return AppCommand::None;
         };
-        self.content_target = Some(target.clone());
-        AppCommand::Action(ActionIntent::Content { target, content })
+        self.request_content(target, content)
     }
 
     fn edit_action(&mut self) -> AppCommand {
@@ -3933,6 +6148,7 @@ impl App {
         namespace.map_or(AppCommand::None, |namespace| {
             self.request_view(
                 ViewState {
+                    instance: None,
                     context: self.context.clone(),
                     kind: self.kind.clone(),
                     namespace: Some(namespace),
@@ -3958,9 +6174,9 @@ impl App {
         decoded_managed_fields: Option<String>,
         content: ContentKind,
     ) {
-        self.yaml_refresh.id = self.yaml_refresh.id.wrapping_add(1);
-        self.yaml_refresh.pending = false;
-        self.yaml_refresh.due = Instant::now() + YAML_REFRESH_INTERVAL;
+        self.reset_live_refresh(content);
+        self.ui
+            .set(UiFlags::FULLSCREEN, self.user_config.settings.ui.fullscreen);
         self.log_view = None;
         self.content_title = title.into();
         self.content_body = body.into();
@@ -3978,28 +6194,6 @@ impl App {
         self.overlay = Overlay::Content;
         self.body_query.clear();
         self.filter_error = None;
-        self.notice = None;
-    }
-
-    pub fn show_managed_yaml(
-        &mut self,
-        target: &ResourceTarget,
-        body: String,
-        decoded_body: Option<String>,
-    ) {
-        if self.overlay != Overlay::Content
-            || self.content_kind != Some(ContentKind::Yaml)
-            || self.content_target.as_ref() != Some(target)
-        {
-            return;
-        }
-        self.content_managed_fields = Some(body);
-        self.yaml_refresh.pending = false;
-        self.yaml_refresh.due = Instant::now() + YAML_REFRESH_INTERVAL;
-        self.content_decoded_managed_fields = decoded_body;
-        if !self.ui.managed_fields() {
-            self.ui.toggle(UiFlags::MANAGED_FIELDS);
-        }
         self.notice = None;
     }
 
@@ -4051,6 +6245,7 @@ impl App {
     }
 
     pub fn show_port_forwards(&mut self, forwards: Vec<PortForwardInfo>) {
+        self.active_port_forwards.clone_from(&forwards);
         self.port_forwards = forwards;
         self.overlay_selected = 0;
         self.notice = None;
@@ -4058,6 +6253,7 @@ impl App {
     }
 
     pub fn refresh_port_forwards(&mut self, forwards: Vec<PortForwardInfo>) {
+        self.active_port_forwards.clone_from(&forwards);
         if self.overlay != Overlay::PortForwards {
             return;
         }
@@ -4250,16 +6446,62 @@ fn fuzzy_match(haystack: &str, needle: &str) -> bool {
 }
 
 fn row_is_fault(kind: &ResourceDescriptor, row: &ResourceRow) -> bool {
+    if kind.is_workloads() {
+        return row.status.as_ref() == "DEGRADED";
+    }
+    if kind.is_helm() {
+        return row.status.as_ref() != "deployed";
+    }
+    if kind.is_helm_history() {
+        return !matches!(row.status.as_ref(), "deployed" | "superseded");
+    }
+    if kind.is_benchmarks() {
+        return row.status.as_ref() != "pass";
+    }
+    if kind.is_pulses() {
+        return row.status.as_ref() == "DEGRADED";
+    }
+    if kind.is_xray() {
+        return !matches!(row.status.as_ref(), "ok" | "completed");
+    }
+    if kind.is_dir() || kind.is_subject() || kind.is_skins() {
+        return false;
+    }
     if row.policy_data().is_some() {
         return false;
     }
     if kind.is_api_service() {
         return row.status.as_ref() != "True";
     }
+    if kind.group.is_empty() && kind.kind.as_ref() == "Event" {
+        return row.status.as_ref() != "Normal";
+    }
+    if kind.group.is_empty()
+        && matches!(
+            kind.kind.as_ref(),
+            "PersistentVolume" | "PersistentVolumeClaim"
+        )
+    {
+        return !matches!(
+            row.status.as_ref(),
+            "-" | "Ready" | "Running" | "Active" | "Bound" | "Available"
+        );
+    }
+    if kind.is_job() {
+        return row.status.as_ref() == "Failed"
+            || (!row.ready.is_empty()
+                && row.ready.as_ref() != "-"
+                && row
+                    .ready
+                    .split_once('/')
+                    .is_some_and(|(a, b)| a != b || a == "0"));
+    }
     match kind.known_kind() {
         Some(ResourceKind::Services) => false,
         Some(ResourceKind::Nodes) => row.status.as_ref() != "Ready",
-        Some(ResourceKind::Pods) => !matches!(row.status.as_ref(), "Running" | "Succeeded"),
+        Some(ResourceKind::Pods) => {
+            !matches!(row.status.as_ref(), "Running" | "Succeeded" | "Completed")
+        }
         Some(ResourceKind::Deployments | ResourceKind::StatefulSets | ResourceKind::DaemonSets) => {
             row.status.as_ref() != "Ready"
         }
@@ -4267,11 +6509,50 @@ fn row_is_fault(kind: &ResourceDescriptor, row: &ResourceRow) -> bool {
     }
 }
 
+fn resource_gvr_bytes(resource: &ResourceDescriptor) -> impl Iterator<Item = u8> + '_ {
+    resource
+        .api_version
+        .bytes()
+        .chain((!resource.api_version.is_empty()).then_some(b'/'))
+        .chain(resource.plural.bytes())
+}
+
+#[must_use]
+pub(crate) fn row_vuln_score(
+    row: &ResourceRow,
+    settings: &crate::config::ImageScansSettings,
+) -> String {
+    if !settings.enable || settings.should_exclude(&row.namespace, &row.labels) {
+        return "n/a".to_owned();
+    }
+    let images = row.extract_container_images();
+    if images.is_empty() {
+        return "n/a".to_owned();
+    }
+    crate::scans::score_images(images)
+}
+
 fn compare_rows(left: &ResourceRow, right: &ResourceRow, field: SortField) -> Ordering {
     let primary = match field {
+        SortField::Kind => match (&left.data, &right.data) {
+            (ResourceData::Workload { kind: left }, ResourceData::Workload { kind: right }) => {
+                resource_gvr_bytes(left).cmp(resource_gvr_bytes(right))
+            }
+            _ => left.details.cmp(&right.details),
+        },
         SortField::Namespace => left.namespace.cmp(&right.namespace),
         SortField::Name => left.name.cmp(&right.name),
-        SortField::Ready | SortField::Binding => left.ready.cmp(&right.ready),
+        SortField::Validity => {
+            (left.status.as_ref() == "DEGRADED").cmp(&(right.status.as_ref() == "DEGRADED"))
+        }
+        SortField::VulnScore => Ordering::Equal,
+        SortField::Ready | SortField::Binding => {
+            if let (Ok(l), Ok(r)) = (left.ready.parse::<i64>(), right.ready.parse::<i64>()) {
+                l.cmp(&r)
+            } else {
+                left.ready.cmp(&right.ready)
+            }
+        }
         SortField::Status | SortField::ApiGroup => left.status.cmp(&right.status),
         SortField::Node => row_node(left).cmp(row_node(right)),
         SortField::Version => row_version(left).cmp(row_version(right)),
@@ -4531,7 +6812,7 @@ mod tests {
         );
         assert!(!app.ui.header());
         assert_eq!(app.input_mode, InputMode::Command);
-        assert!(app.input.is_empty());
+        assert_eq!(app.input.len(), 0);
     }
 
     #[test]
@@ -4579,7 +6860,7 @@ mod tests {
         list.query = "api".to_owned();
         list.rebuild_filter(None);
         list.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
-        assert!(list.query.is_empty());
+        assert_eq!(list.query.len(), 0);
 
         let widget = descriptor(
             "example.io",
@@ -4741,7 +7022,7 @@ mod tests {
             FilterMatcher::new("-l env=prod").match_ranges("app=api,ENV=PROD"),
             [(8, 16)]
         );
-        assert!(FilterMatcher::new("!api").match_ranges("worker").is_empty());
+        assert_eq!(FilterMatcher::new("!api").match_ranges("worker").len(), 0);
     }
 
     #[test]
@@ -4766,20 +7047,20 @@ mod tests {
     }
 
     #[test]
-    fn pod_log_hotkeys_target_the_resolved_container_for_current_and_previous_logs() {
+    fn pod_log_hotkeys_defer_container_selection_to_the_resolver() {
         let mut pods = app_with_rows();
         assert!(matches!(
             pods.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)),
             AppCommand::Action(ActionIntent::StartLogs {
                 request: LogRequest { target: LogTarget { ref container, previous: false, .. }, .. },
-            }) if container.as_deref() == Some("api")
+            }) if container.is_none()
         ));
         pods.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(matches!(
             pods.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)),
             AppCommand::Action(ActionIntent::StartLogs {
                 request: LogRequest { target: LogTarget { ref container, previous: true, .. }, .. },
-            }) if container.as_deref() == Some("api")
+            }) if container.is_none()
         ));
     }
 
@@ -4857,6 +7138,7 @@ mod tests {
             let mut app = app_with_rows();
             app.request_view(
                 ViewState {
+                    instance: None,
                     context: "demo".to_owned(),
                     kind: ResourceKind::Services.into(),
                     namespace: None,
@@ -4922,7 +7204,7 @@ mod tests {
         let mut app = app_with_rows();
         let prod = vec![NamespaceInfo::discovered("payments", "Active", Some(100))];
         app.set_namespace_options("other", prod.clone());
-        assert!(app.namespace_options.is_empty());
+        assert_eq!(app.namespace_options.len(), 0);
         app.set_namespace_options("demo", prod);
         assert_eq!(app.namespace_options[0], NamespaceInfo::all());
         assert_eq!(app.namespace_options[1].name, "payments");
@@ -4967,7 +7249,7 @@ mod tests {
         assert_eq!(app.query, "api");
 
         app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
-        assert!(app.input.is_empty());
+        assert_eq!(app.input.len(), 0);
         assert_eq!(app.query, "api");
         assert_eq!(app.previous_filter_hint(), Some("api"));
 
@@ -4976,8 +7258,8 @@ mod tests {
         assert_eq!(app.query, "api");
 
         app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        assert!(app.input.is_empty());
-        assert!(app.query.is_empty());
+        assert_eq!(app.input.len(), 0);
+        assert_eq!(app.query.len(), 0);
         assert_eq!(app.previous_filter_hint(), Some("api"));
     }
 
@@ -4988,6 +7270,7 @@ mod tests {
         assert_eq!(
             command,
             AppCommand::Request(ViewState {
+                instance: None,
                 context: "demo".to_owned(),
                 kind: ResourceKind::Deployments.into(),
                 namespace: Some("kube-system".to_owned()),
@@ -4995,6 +7278,24 @@ mod tests {
                 label_selector: None,
             })
         );
+
+        let command = type_input(
+            &mut app,
+            ':',
+            "po -n staging -l app=api,tier=web -f worker @prod-ctx",
+        );
+        assert_eq!(
+            command,
+            AppCommand::Request(ViewState {
+                instance: None,
+                context: "prod-ctx".to_owned(),
+                kind: ResourceKind::Pods.into(),
+                namespace: Some("staging".to_owned()),
+                field_selector: None,
+                label_selector: Some("app=api,tier=web".to_owned()),
+            })
+        );
+        assert_eq!(app.query, "worker");
     }
 
     #[test]
@@ -5010,7 +7311,7 @@ mod tests {
             AppCommand::Request(ViewState { kind, .. })
                 if kind.known_kind() == Some(ResourceKind::Services)
         ));
-        assert!(app.query.is_empty());
+        assert_eq!(app.query.len(), 0);
 
         assert!(matches!(
             type_input(&mut app, ':', "pods /worker"),
@@ -5036,16 +7337,15 @@ mod tests {
             AppCommand::Request(ViewState { kind, .. })
                 if kind.known_kind() == Some(ResourceKind::Services)
         ));
-        assert!(app.query.is_empty());
+        assert_eq!(app.query.len(), 0);
     }
 
     #[test]
-    fn enter_on_a_parent_resource_opens_its_label_selected_child_view() {
+    fn deployment_enter_opens_pods_with_its_label_selector() {
         let deployment = ResourceDescriptor::from(ResourceKind::Deployments);
-        let replica_set = descriptor("apps", "v1", "apps/v1", "ReplicaSet", "replicasets", true);
         let row = ResourceRow::new("prod", "api", "Ready", "3/3", "3 available", 0)
             .with_child_resource_data(crate::model::ChildResourceData {
-                kind: replica_set.clone(),
+                kind: ResourceKind::Pods.into(),
                 label_selector: Arc::from("app=api,tier=backend"),
             });
         let mut app = app_with_descriptor(deployment, Some("prod"), row);
@@ -5054,14 +7354,15 @@ mod tests {
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             AppCommand::Request(ViewState {
+                instance: None,
                 context: "demo".to_owned(),
-                kind: replica_set,
+                kind: ResourceKind::Pods.into(),
                 namespace: Some("prod".to_owned()),
                 field_selector: None,
                 label_selector: Some("app=api,tier=backend".to_owned()),
             })
         );
-        assert!(app.query.is_empty());
+        assert_eq!(app.query.len(), 0);
         assert_eq!(app.label_selector.as_deref(), Some("app=api,tier=backend"));
         assert_eq!(app.overlay, Overlay::None);
     }
@@ -5091,6 +7392,7 @@ mod tests {
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             AppCommand::Request(ViewState {
+                instance: None,
                 context: "demo".to_owned(),
                 kind: widget,
                 namespace: None,
@@ -5129,6 +7431,7 @@ mod tests {
         assert_eq!(
             app.show_discovered_child(&target, gadget.clone(), "parent-uid"),
             AppCommand::Request(ViewState {
+                instance: None,
                 context: "demo".to_owned(),
                 kind: gadget,
                 namespace: Some("prod".to_owned()),
@@ -5154,6 +7457,7 @@ mod tests {
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT)),
             AppCommand::Request(ViewState {
+                instance: None,
                 context: "demo".to_owned(),
                 kind: replica_set,
                 namespace: Some("prod".to_owned()),
@@ -5212,6 +7516,7 @@ mod tests {
                 }),
             ),
             AppCommand::Request(ViewState {
+                instance: None,
                 context: "demo".to_owned(),
                 kind: node_claim,
                 namespace: None,
@@ -5234,6 +7539,7 @@ mod tests {
         assert_eq!(
             command,
             AppCommand::Request(ViewState {
+                instance: None,
                 context: "staging".to_owned(),
                 kind: ResourceKind::Pods.into(),
                 namespace: None,
@@ -5252,6 +7558,7 @@ mod tests {
         assert_eq!(
             back,
             AppCommand::Request(ViewState {
+                instance: None,
                 context: "demo".to_owned(),
                 kind: ResourceKind::Pods.into(),
                 namespace: None,
@@ -5269,6 +7576,7 @@ mod tests {
         assert_eq!(
             command,
             AppCommand::Request(ViewState {
+                instance: None,
                 context: "demo".to_owned(),
                 kind: ResourceKind::Pods.into(),
                 namespace: None,
@@ -5793,7 +8101,7 @@ mod tests {
             panic!("confirmed batch delete should produce one delete action");
         };
         assert_eq!(targets.len(), 2);
-        assert!(app.marks.is_empty());
+        assert_eq!(app.marks.len(), 0);
         assert_eq!(app.overlay, Overlay::None);
     }
 
@@ -5829,6 +8137,7 @@ mod tests {
             assert_eq!(
                 app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
                 AppCommand::Action(ActionIntent::Content {
+                    id: app.yaml_refresh.id,
                     target: ResourceTarget {
                         kind,
                         namespace: expected_namespace,
@@ -5894,6 +8203,34 @@ mod tests {
     }
 
     #[test]
+    fn pod_fault_filter_excludes_completed_but_retains_unready_and_failed_pods() {
+        let mut app = app_with_rows();
+        app.apply_snapshot(snapshot(
+            [
+                ("completed", "Completed"),
+                ("succeeded", "Succeeded"),
+                ("running", "Running"),
+                ("unready", "NoReady"),
+                ("crashing", "CrashLoopBackOff"),
+            ]
+            .into_iter()
+            .map(|(name, status)| ResourceRow::new("prod", name, status, "0/1", "-", 0))
+            .collect(),
+            app.generation,
+            ResourceKind::Pods,
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        let names = app
+            .filtered
+            .iter()
+            .map(|index| app.snapshot.rows[*index].name.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["crashing", "unready"]);
+        app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        assert_eq!(app.filtered.len(), 5);
+    }
+
+    #[test]
     fn clicking_a_column_header_sorts_and_reverses_direction() {
         let mut app = app_with_rows();
         app.set_column_hitboxes(vec![ColumnHitbox {
@@ -5955,6 +8292,7 @@ mod tests {
         assert_eq!(
             command,
             AppCommand::Request(ViewState {
+                instance: None,
                 context: "demo".to_owned(),
                 kind: ResourceKind::Pods.into(),
                 namespace: None,
@@ -6031,13 +8369,14 @@ mod tests {
         }
         assert_eq!(app.overlay, Overlay::Namespaces);
         assert_eq!(app.body_query, "Terminating");
-        assert!(app.query.is_empty());
+        assert_eq!(app.query.len(), 0);
         assert_eq!(app.visible_namespace_indices(), vec![1]);
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             AppCommand::Request(ViewState {
+                instance: None,
                 context: "demo".to_owned(),
                 kind: ResourceKind::Pods.into(),
                 namespace: Some("dev".to_owned()),
@@ -6068,6 +8407,7 @@ mod tests {
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
             AppCommand::Action(ActionIntent::Content {
+                id: app.yaml_refresh.id,
                 target: ResourceTarget {
                     kind: namespace,
                     namespace: None,
@@ -6104,6 +8444,58 @@ mod tests {
                 name: "prod".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn namespace_u_uses_selected_namespace_and_enter_on_namespace_resource_opens_pods() {
+        let namespace = descriptor("", "v1", "v1", "Namespace", "namespaces", false);
+        let mut app = app_with_descriptor(
+            namespace.clone(),
+            Some("default"),
+            ResourceRow::new("-", "prod", "Active", "-", "", 0),
+        );
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)),
+            AppCommand::None
+        );
+        assert_eq!(app.namespace.as_deref(), Some("prod"));
+        assert_eq!(
+            app.recent_namespaces.first().map(String::as_str),
+            Some("prod")
+        );
+        assert_eq!(app.kind, namespace);
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppCommand::Request(ViewState {
+                instance: None,
+                context: "demo".to_owned(),
+                kind: ResourceKind::Pods.into(),
+                namespace: Some("prod".to_owned()),
+                field_selector: None,
+                label_selector: None,
+            })
+        );
+
+        app.set_namespace_options(
+            "demo",
+            vec![
+                NamespaceInfo::discovered("dev", "Active", None),
+                NamespaceInfo::discovered("prod", "Active", None),
+            ],
+        );
+        assert_eq!(type_input(&mut app, ':', "ns"), AppCommand::None);
+        app.overlay_selected = app
+            .namespace_options
+            .iter()
+            .position(|option| option.name == "dev")
+            .expect("dev namespace");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)),
+            AppCommand::None
+        );
+        assert_eq!(app.namespace.as_deref(), Some("dev"));
+        assert_eq!(app.overlay, Overlay::Namespaces);
     }
 
     #[test]
@@ -6145,6 +8537,7 @@ mod tests {
         assert_eq!(
             app.content_action(ContentKind::Yaml),
             AppCommand::Action(ActionIntent::Content {
+                id: app.yaml_refresh.id,
                 target: target.clone(),
                 content: ContentKind::Yaml,
             })
@@ -6163,7 +8556,7 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)),
             AppCommand::Edit(target)
         );
-        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(app.overlay, Overlay::Content);
     }
 
     #[test]
@@ -6215,7 +8608,7 @@ mod tests {
         );
 
         app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
-        assert!(app.visible_resource_indices().is_empty());
+        assert_eq!(app.visible_resource_indices().len(), 0);
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.overlay, Overlay::Aliases);
 
@@ -6242,7 +8635,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.input_mode, InputMode::Browse);
         assert_eq!(app.overlay, Overlay::Aliases);
-        assert!(app.body_query.is_empty());
+        assert_eq!(app.body_query.len(), 0);
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.overlay, Overlay::None);
@@ -6389,6 +8782,40 @@ mod tests {
         assert_eq!(app.input, "ctx demo");
     }
 
+    #[test]
+    fn custom_alias_argument_completion_preserves_alias_and_existing_arguments() {
+        let mut app = app_with_rows();
+        app.user_config.aliases.extend([
+            ("PP".to_owned(), "pods".to_owned()),
+            ("chain".to_owned(), "PP".to_owned()),
+            ("cx".to_owned(), "ctx".to_owned()),
+            ("production".to_owned(), "pods prod".to_owned()),
+            ("labeled".to_owned(), "pods app=api".to_owned()),
+            ("loop".to_owned(), "loop".to_owned()),
+        ]);
+        assert!(app.command_completions_for("pp").contains(&"PP".to_owned()));
+        assert_eq!(app.command_completions_for("PP pr"), ["PP prod"]);
+        assert_eq!(app.command_completions_for("chain pr"), ["chain prod"]);
+        assert_eq!(app.command_completions_for("cx de"), ["cx demo"]);
+        assert_eq!(
+            app.command_completions_for("production "),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            app.command_completions_for("labeled "),
+            Vec::<String>::new()
+        );
+        assert_eq!(app.command_completions_for("loop "), Vec::<String>::new());
+
+        enter_command(&mut app, "PP pr");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input, "PP prod");
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppCommand::Request(ViewState { namespace: Some(namespace), .. }) if namespace == "prod"
+        ));
+    }
+
     fn enter_command(app: &mut App, value: &str) {
         app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
         for character in value.chars() {
@@ -6441,9 +8868,9 @@ mod tests {
     #[test]
     fn log_ranges_preserve_pause_and_reject_previous_session_batches() {
         let mut app = app_with_rows();
-        app.pod_log_action(false);
+        app.resource_log_action(false);
         let initial_id = app.log_view.as_ref().unwrap().request.id;
-        app.append_log_batch(initial_id, vec!["initial".to_owned()], false, None);
+        app.append_log_batch(initial_id, vec!["initial".into()], false, None);
         app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
         let generation = app.generation;
         for (key, range) in [
@@ -6464,17 +8891,17 @@ mod tests {
                 "log range digits must not switch namespaces"
             );
             assert!(!app.log_view.as_ref().unwrap().auto_scroll);
-            app.append_log_batch(initial_id, vec!["stale".to_owned()], false, None);
-            assert!(app.content_body.is_empty());
+            app.append_log_batch(initial_id, vec!["stale".into()], false, None);
+            assert_eq!(app.content_body.len(), 0);
         }
         let id = app.log_view.as_ref().unwrap().request.id;
-        app.append_log_batch(id, vec!["refreshed".to_owned()], false, None);
+        app.append_log_batch(id, vec!["refreshed".into()], false, None);
         assert_eq!(
             app.content_body, "refreshed\n",
             "paused ranges get one refresh"
         );
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        app.append_log_batch(id, vec!["late".to_owned()], false, None);
+        app.append_log_batch(id, vec!["late".into()], false, None);
         assert_eq!(app.overlay, Overlay::None);
         assert!(!app.content_body.contains("late"));
     }
@@ -6482,17 +8909,17 @@ mod tests {
     #[test]
     fn log_pause_mark_resume_clear_and_column_lock_preserve_stream_state() {
         let mut app = app_with_rows();
-        app.pod_log_action(false);
+        app.resource_log_action(false);
         let id = app.log_view.as_ref().unwrap().request.id;
-        app.append_log_batch(id, vec!["one".to_owned()], false, None);
+        app.append_log_batch(id, vec!["one".into()], false, None);
         app.content_horizontal_scroll = 12;
         app.handle_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT));
-        app.append_log_batch(id, vec!["two".to_owned()], false, None);
+        app.append_log_batch(id, vec!["two".into()], false, None);
         assert_eq!(app.content_horizontal_scroll, 12);
         app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
         assert!(!app.log_view.as_ref().unwrap().auto_scroll);
-        app.append_log_batch(id, vec!["three".to_owned()], false, None);
+        app.append_log_batch(id, vec!["three".into()], false, None);
         assert!(!app.content_body.contains("three"));
         assert!(app.content_body.contains("────"));
         app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
@@ -6500,26 +8927,26 @@ mod tests {
         assert!(app.content_body.contains("────"));
         app.handle_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT));
         app.show_transient_notice("Logs saved to example.log");
-        app.append_log_batch(id, vec!["four".to_owned()], false, None);
+        app.append_log_batch(id, vec!["four".into()], false, None);
         assert_eq!(app.content_horizontal_scroll, 0);
         assert_eq!(app.notice.as_deref(), Some("Logs saved to example.log"));
         app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT));
-        assert!(app.content_body.is_empty());
+        assert_eq!(app.content_body.len(), 0);
         assert_eq!(app.log_view.as_ref().unwrap().request.id, id);
-        app.append_log_batch(id, vec!["after clear".to_owned()], false, None);
+        app.append_log_batch(id, vec!["after clear".into()], false, None);
         assert_eq!(app.content_body, "after clear\n");
     }
 
     #[test]
     fn log_save_exports_filtered_display_and_escape_clears_filter_before_closing() {
         let mut app = app_with_rows();
-        app.pod_log_action(false);
+        app.resource_log_action(false);
         let id = app.log_view.as_ref().unwrap().request.id;
         app.append_log_batch(
             id,
             vec![
-                "2026-09-07T00:00:00Z \x1b[31mERROR example\x1b[0m".to_owned(),
-                "2026-09-07T00:00:01Z INFO running".to_owned(),
+                "2026-09-07T00:00:00Z \x1b[31mERROR example\x1b[0m".into(),
+                "2026-09-07T00:00:01Z INFO running".into(),
             ],
             false,
             None,
@@ -6531,7 +8958,7 @@ mod tests {
         );
         app.append_log_batch(
             id,
-            vec!["2026-09-07T00:00:02Z ERROR second".to_owned()],
+            vec!["2026-09-07T00:00:02Z ERROR second".into()],
             false,
             None,
         );
@@ -6542,7 +8969,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT));
         assert_eq!(app.content_scroll, 0);
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(app.body_query.is_empty());
+        assert_eq!(app.body_query.len(), 0);
         assert!(app.is_logs_view());
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
@@ -6572,6 +8999,7 @@ mod tests {
     #[test]
     fn yaml_auto_refresh_preserves_view_state_and_uses_the_opened_target() {
         let mut app = app_with_rows();
+        app.user_config.settings.live_view_auto_refresh = true;
         let AppCommand::Action(ActionIntent::Content { target, .. }) =
             app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
         else {
@@ -6635,6 +9063,7 @@ mod tests {
     #[test]
     fn yaml_refresh_errors_retry_and_stale_results_cannot_replace_a_reopened_view() {
         let mut app = app_with_rows();
+        app.user_config.settings.live_view_auto_refresh = true;
         let AppCommand::Action(ActionIntent::Content { target, .. }) =
             app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
         else {
@@ -6691,12 +9120,16 @@ mod tests {
         assert_eq!(app.content_body, "reopened");
         app.content_kind = Some(ContentKind::Describe);
         app.yaml_refresh.due = Instant::now();
-        assert_eq!(app.poll_yaml_refresh(), AppCommand::None);
+        assert!(matches!(
+            app.poll_yaml_refresh(),
+            AppCommand::Action(ActionIntent::RefreshDescribe { .. })
+        ));
     }
 
     #[test]
     fn yaml_managed_fields_load_lazily_and_ignore_stale_results() {
         let mut app = app_with_rows();
+        app.user_config.settings.live_view_auto_refresh = true;
         let target = match app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)) {
             AppCommand::Action(ActionIntent::Content { target, .. }) => target,
             command => panic!("expected YAML action, got {command:?}"),
@@ -6720,6 +9153,7 @@ mod tests {
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)),
             AppCommand::Action(ActionIntent::ManagedYaml {
+                id: app.yaml_refresh.id,
                 target: target.clone(),
                 body: "kind: Pod".to_owned(),
                 decoded_body: None,
@@ -6736,16 +9170,19 @@ mod tests {
 
         let mut stale = target.clone();
         stale.name.push_str("-stale");
-        app.show_managed_yaml(&stale, "stale".to_owned(), None);
+        app.show_managed_yaml(app.yaml_refresh.id, &stale, Ok(("stale".to_owned(), None)));
         assert!(!app.ui.managed_fields());
 
         app.content_scroll = 7;
         app.content_horizontal_scroll = 3;
         app.body_query = "metadata".to_owned();
         app.show_managed_yaml(
+            app.yaml_refresh.id,
             &target,
-            "metadata:\n  managedFields:\n  - manager: kubelet".to_owned(),
-            None,
+            Ok((
+                "metadata:\n  managedFields:\n  - manager: kubelet".to_owned(),
+                None,
+            )),
         );
         assert!(app.ui.managed_fields());
         assert!(app.active_content_body().contains("managedFields"));
@@ -6800,6 +9237,7 @@ mod tests {
         assert_eq!(
             command,
             AppCommand::Request(ViewState {
+                instance: None,
                 context: "demo".to_owned(),
                 kind: widget,
                 namespace: Some("prod".to_owned()),
@@ -6821,6 +9259,7 @@ mod tests {
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
             AppCommand::Action(ActionIntent::Content {
+                id: app.yaml_refresh.id,
                 target: ResourceTarget {
                     kind: secret,
                     namespace: Some("prod".to_owned()),
@@ -6894,6 +9333,32 @@ mod tests {
     }
 
     #[test]
+    fn subject_aliases_request_cluster_wide_subject_views() {
+        for (alias, subject_kind) in [
+            ("users", ResourceDescriptor::users()),
+            ("usr", ResourceDescriptor::users()),
+            ("user", ResourceDescriptor::users()),
+            ("groups", ResourceDescriptor::groups()),
+            ("grp", ResourceDescriptor::groups()),
+            ("group", ResourceDescriptor::groups()),
+        ] {
+            let mut app = app_with_rows();
+            assert_eq!(
+                type_input(&mut app, ':', alias),
+                AppCommand::Request(ViewState {
+                    instance: None,
+                    context: "demo".to_owned(),
+                    kind: subject_kind.clone(),
+                    namespace: None,
+                    field_selector: None,
+                    label_selector: None,
+                }),
+                "command alias {alias}"
+            );
+        }
+    }
+
+    #[test]
     fn policy_child_view_filters_and_escape_restores_the_parent_list() {
         let service_account = descriptor("", "v1", "v1", "ServiceAccount", "serviceaccounts", true);
         let mut app = app_with_descriptor(
@@ -6958,6 +9423,7 @@ mod tests {
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             AppCommand::Request(ViewState {
+                instance: None,
                 context: "demo".to_owned(),
                 kind: ResourceKind::Pods.into(),
                 namespace: None,
@@ -6972,6 +9438,7 @@ mod tests {
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             AppCommand::Request(ViewState {
+                instance: None,
                 context: "demo".to_owned(),
                 kind: ResourceKind::Nodes.into(),
                 namespace: None,
@@ -6988,6 +9455,7 @@ mod tests {
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)),
             AppCommand::Request(ViewState {
+                instance: None,
                 context: "demo".to_owned(),
                 kind: ResourceKind::Nodes.into(),
                 namespace: None,
@@ -6999,6 +9467,7 @@ mod tests {
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             AppCommand::Request(ViewState {
+                instance: None,
                 context: "demo".to_owned(),
                 kind: ResourceKind::Pods.into(),
                 namespace: None,
@@ -7037,6 +9506,7 @@ mod tests {
                 image: Arc::from("example/api:v1"),
                 kind: Arc::from("container"),
                 restarts: 2,
+                ..crate::model::ContainerData::default()
             });
         app.show_containers(target, vec![Arc::new(container)]);
         assert!(app.is_container_view());
@@ -7047,12 +9517,9 @@ mod tests {
                 request: LogRequest {
                     id: 1,
                     range: LogRange::Tail,
-                    target: LogTarget {
-                        namespace: "prod".to_owned(),
-                        pod: "api-0".to_owned(),
-                        container: Some("api".to_owned()),
-                        previous: false,
-                    },
+                    tail_count: 100,
+                    target: LogTarget::pod("prod", "api-0", Some("api".to_owned()), false),
+                    all_containers: false,
                 },
             })
         );
@@ -7131,6 +9598,165 @@ mod tests {
             app.notice.as_deref(),
             Some("Shell is disabled in read-only mode")
         );
+    }
+
+    #[test]
+    fn attach_uses_pod_default_or_selected_container_and_respects_read_only() {
+        let mut app = app_with_rows();
+        let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert_eq!(
+            app.handle_key(key),
+            AppCommand::Attach(PodShellTarget {
+                namespace: "prod".to_owned(),
+                pod: "api-0".to_owned(),
+                container: "api".to_owned(),
+            })
+        );
+        let AppCommand::Action(ActionIntent::Containers { target }) = app.open_selected() else {
+            panic!("containers")
+        };
+        app.show_containers(
+            target,
+            vec![Arc::new(ResourceRow::new(
+                "prod", "sidecar", "Running", "true", "image", 0,
+            ))],
+        );
+        assert!(
+            matches!(app.handle_key(key), AppCommand::Attach(PodShellTarget { container, .. }) if container == "sidecar")
+        );
+        app.read_only = true;
+        assert_eq!(app.handle_key(key), AppCommand::None);
+        assert!(app.notice.as_deref().unwrap().contains("read-only"));
+    }
+
+    #[test]
+    fn scale_requires_valid_explicit_count_confirmation_and_keeps_marked_targets() {
+        let mut app = app_with_rows();
+        app.kind = ResourceKind::Deployments.into();
+        for row in app.snapshot.rows.iter() {
+            app.marks.insert(row.key.clone());
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert!(
+            matches!(&app.pending_delete, Some(PendingDelete::Scale { targets, .. }) if targets.len() == 2)
+        );
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppCommand::None
+        );
+        app.overlay_selected = 2;
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppCommand::None
+        );
+        assert!(app.notice.as_deref().unwrap().contains("Replicas"));
+        app.overlay_selected = 0;
+        app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(
+            matches!(app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppCommand::Action(ActionIntent::Scale { targets, replicas: 0 }) if targets.len() == 2)
+        );
+        assert_eq!(app.marks.len(), 0);
+    }
+
+    #[test]
+    fn cronjob_trigger_batches_but_toggle_uses_only_current_selection() {
+        let mut app = app_with_rows();
+        app.kind = descriptor("batch", "v1", "batch/v1", "CronJob", "cronjobs", true);
+        for row in app.snapshot.rows.iter() {
+            app.marks.insert(row.key.clone());
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert!(
+            matches!(&app.pending_delete, Some(PendingDelete::ToggleCronJobSuspend { target, .. }) if target.name == "api-0")
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppCommand::Action(ActionIntent::ToggleCronJobSuspend { .. })
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppCommand::None
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(
+            matches!(app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), AppCommand::Action(ActionIntent::TriggerCronJob { targets }) if targets.len() == 2)
+        );
+    }
+
+    #[test]
+    fn read_only_blocks_all_new_workload_actions() {
+        for (kind, key) in [
+            (ResourceKind::Deployments.into(), 's'),
+            (
+                descriptor("batch", "v1", "batch/v1", "CronJob", "cronjobs", true),
+                't',
+            ),
+            (
+                descriptor("batch", "v1", "batch/v1", "CronJob", "cronjobs", true),
+                's',
+            ),
+        ] {
+            let mut app = app_with_rows();
+            app.kind = kind;
+            app.read_only = true;
+            assert_eq!(
+                app.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)),
+                AppCommand::None
+            );
+            assert!(app.pending_delete.is_none());
+            assert!(app.notice.as_deref().unwrap().contains("read-only"));
+            assert_eq!(type_input(&mut app, ':', "suspend"), AppCommand::None);
+            assert!(app.pending_delete.is_none());
+        }
+    }
+
+    #[test]
+    fn custom_aliases_resolve_gvr_and_server_label_selector() {
+        let mut app = app_with_rows();
+        app.user_config.aliases.insert(
+            "backend".to_owned(),
+            "apps/v1/deployments prod app in (api,worker),tier=backend".to_owned(),
+        );
+        let AppCommand::Request(view) = type_input(&mut app, ':', "backend") else {
+            panic!("resource request")
+        };
+        assert_eq!(view.kind, ResourceKind::Deployments.into());
+        assert_eq!(view.namespace.as_deref(), Some("prod"));
+        assert_eq!(
+            view.label_selector.as_deref(),
+            Some("app in (api,worker),tier=backend")
+        );
+        app.user_config
+            .aliases
+            .insert("cycle".to_owned(), "cycle".to_owned());
+        assert_eq!(type_input(&mut app, ':', "cycle"), AppCommand::None);
+        assert!(app.notice.is_some());
+    }
+
+    #[test]
+    fn config_read_only_cancels_pending_actions_and_cli_floor_cannot_be_disabled() {
+        let mut app = app_with_rows();
+        app.kind = ResourceKind::Deployments.into();
+        app.open_scale_dialog();
+        let mut config = UserConfig::default();
+        config.settings.read_only = true;
+        config.settings.no_exit_on_ctrl_c = true;
+        app.apply_user_config(config);
+        assert!(app.pending_delete.is_none());
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            AppCommand::None
+        );
+        assert_eq!(type_input(&mut app, ':', "q"), AppCommand::Quit);
+        app.cli_access = AccessMode::ReadOnly;
+        app.apply_user_config(UserConfig::default());
+        assert!(app.read_only);
     }
 
     #[test]
@@ -7239,7 +9865,7 @@ mod tests {
         assert!(app.command_names().contains(&"portforwards".to_owned()));
         app.show_port_forwards(Vec::new());
         assert_eq!(app.overlay, Overlay::PortForwards);
-        assert!(app.port_forwards.is_empty());
+        assert_eq!(app.port_forwards.len(), 0);
     }
 
     #[test]
@@ -7259,5 +9885,955 @@ mod tests {
             },
         );
         assert_eq!(compare_rows(&low, &high, SortField::Taints), Ordering::Less);
+    }
+
+    #[test]
+    fn can_command_resolves_user_group_and_service_account_policies() {
+        let mut app = app_with_rows();
+        app.namespace = Some("prod".to_owned());
+
+        assert_eq!(
+            type_input(&mut app, ':', "can u:alice@example.com"),
+            AppCommand::Action(ActionIntent::AuthorizationPolicy {
+                target: ResourceTarget {
+                    kind: ResourceDescriptor::users(),
+                    namespace: None,
+                    name: "alice@example.com".to_owned(),
+                },
+            })
+        );
+        assert_eq!(
+            type_input(&mut app, ':', "can g:system:masters"),
+            AppCommand::Action(ActionIntent::AuthorizationPolicy {
+                target: ResourceTarget {
+                    kind: ResourceDescriptor::groups(),
+                    namespace: None,
+                    name: "system:masters".to_owned(),
+                },
+            })
+        );
+        let AppCommand::Action(ActionIntent::AuthorizationPolicy { target }) =
+            type_input(&mut app, ':', "can s:builder")
+        else {
+            panic!("service account policy action");
+        };
+        assert_eq!(target.kind.kind.as_ref(), "ServiceAccount");
+        assert_eq!(target.namespace.as_deref(), Some("prod"));
+        assert_eq!(target.name, "builder");
+
+        let AppCommand::Action(ActionIntent::AuthorizationPolicy { target }) =
+            type_input(&mut app, ':', "can sa:kube-system/coredns")
+        else {
+            panic!("explicit namespace service account policy action");
+        };
+        assert_eq!(target.kind.kind.as_ref(), "ServiceAccount");
+        assert_eq!(target.namespace.as_deref(), Some("kube-system"));
+        assert_eq!(target.name, "coredns");
+
+        assert_eq!(type_input(&mut app, ':', "can"), AppCommand::None);
+        assert!(app.notice.as_deref().unwrap().contains("Usage: :can"));
+        assert_eq!(type_input(&mut app, ':', "can u:"), AppCommand::None);
+        assert!(app.notice.as_deref().unwrap().contains("cannot be empty"));
+        assert_eq!(type_input(&mut app, ':', "can x:bob"), AppCommand::None);
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("Unknown subject type")
+        );
+    }
+
+    #[test]
+    fn subject_views_open_policy_and_suppress_object_mutations() {
+        for kind in [ResourceDescriptor::users(), ResourceDescriptor::groups()] {
+            let row = crate::source::project_subject_row(
+                "alice@example.com".to_owned(),
+                "ClusterRoleBinding",
+                "cluster-admin".to_owned(),
+            );
+            let mut app = app_with_descriptor(kind.clone(), None, row);
+            assert!(app.command_names().contains(&kind.gvr()));
+            for blocked in [
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT),
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+                KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            ] {
+                assert_eq!(app.handle_key(blocked), AppCommand::None);
+            }
+            let expected = ResourceTarget {
+                kind: kind.clone(),
+                namespace: None,
+                name: "alice@example.com".to_owned(),
+            };
+            assert_eq!(
+                app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                AppCommand::Action(ActionIntent::AuthorizationPolicy {
+                    target: expected.clone(),
+                })
+            );
+            app.show_policy(
+                &expected,
+                "Policy(User:alice@example.com)".to_owned(),
+                Vec::new(),
+            );
+            assert!(app.is_policy_view());
+        }
+    }
+
+    #[test]
+    fn custom_jumps_context_rename_and_node_shell_gate_behave_like_k9s() {
+        let mut app = app_with_rows();
+        let mut config = UserConfig::default();
+        config.jumps.insert(
+            "v1/pods".to_owned(),
+            crate::config::CustomJumpSpec {
+                resource: "services".to_owned(),
+                namespace: Some("kube-system".to_owned()),
+            },
+        );
+        app.apply_user_config(config);
+        let selected_name = app.selected_row().unwrap().name.to_string();
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppCommand::Request(ViewState {
+                instance: None,
+                context: "demo".to_owned(),
+                kind: ResourceDescriptor::from(ResourceKind::Services),
+                namespace: Some("kube-system".to_owned()),
+                field_selector: None,
+                label_selector: None,
+            })
+        );
+        assert_eq!(app.query, selected_name);
+
+        let node_row = ResourceRow::new("-", "worker-0", "Ready", "worker", "v1.32.0", 0);
+        let mut node_app = app_with_descriptor(ResourceKind::Nodes.into(), None, node_row);
+        assert_eq!(
+            node_app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+            AppCommand::None
+        );
+        let mut gate_config = UserConfig::default();
+        gate_config.settings.feature_gates.insert(
+            "default".to_owned(),
+            crate::config::FeatureGates { node_shell: true },
+        );
+        node_app.apply_user_config(gate_config);
+        assert_eq!(
+            node_app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+            AppCommand::NodeShell(NodeShellTarget {
+                node: "worker-0".to_owned(),
+                settings: crate::config::ShellPodSettings::default(),
+            })
+        );
+
+        node_app.set_context_options(vec![ContextInfo {
+            name: "demo".to_owned(),
+            cluster: Some("demo-cluster".to_owned()),
+            user: Some("demo-user".to_owned()),
+            namespace: Some("default".to_owned()),
+            kubeconfig_backed: true,
+        }]);
+        type_input(&mut node_app, ':', "ctx");
+        assert_eq!(node_app.overlay, Overlay::Contexts);
+        assert_eq!(
+            node_app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+            AppCommand::None
+        );
+        assert_eq!(node_app.overlay, Overlay::ConfirmDelete);
+        node_app.handle_key(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE));
+        node_app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert_eq!(
+            node_app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppCommand::Action(ActionIntent::RenameContext {
+                old_name: "demo".to_owned(),
+                new_name: "demo-2".to_owned(),
+            })
+        );
+        node_app.apply_context_options(
+            "demo-2",
+            vec![ContextInfo {
+                name: "demo-2".to_owned(),
+                cluster: Some("demo-cluster".to_owned()),
+                user: Some("demo-user".to_owned()),
+                namespace: Some("default".to_owned()),
+                kubeconfig_backed: true,
+            }],
+            "Renamed context demo to demo-2",
+        );
+        assert_eq!(node_app.context, "demo-2");
+    }
+
+    #[test]
+    fn helm_views_support_values_history_and_rollback() {
+        let helm_row = crate::source::kubernetes::resource_views::project_helm_row(
+            "default".to_owned(),
+            "ingress-nginx".to_owned(),
+            "2".to_owned(),
+            "deployed".to_owned(),
+            "ingress-nginx-4.10.0".to_owned(),
+            "1.10.0",
+            100,
+        );
+        let mut app = app_with_descriptor(ResourceDescriptor::helm(), Some("default"), helm_row);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE)),
+            AppCommand::Action(ActionIntent::Content {
+                id: 1,
+                target: ResourceTarget {
+                    kind: ResourceDescriptor::helm(),
+                    namespace: Some("default".to_owned()),
+                    name: "ingress-nginx".to_owned(),
+                },
+                content: ContentKind::HelmValues,
+            })
+        );
+        app.show_content(
+            "Values(default/ingress-nginx)",
+            "replicaCount: 2",
+            None,
+            Some("replicaCount: 2\nimage:\n  tag: latest".to_owned()),
+            None,
+            ContentKind::HelmValues,
+        );
+        assert_eq!(app.active_content_body(), "replicaCount: 2");
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app.active_content_body().contains("image:"));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppCommand::Request(ViewState {
+                instance: None,
+                context: "demo".to_owned(),
+                kind: ResourceDescriptor::helm_history(),
+                namespace: Some("default".to_owned()),
+                field_selector: Some("default/ingress-nginx".to_owned()),
+                label_selector: None,
+            })
+        );
+
+        let hist_row = crate::source::kubernetes::resource_views::project_helm_history_row(
+            "default".to_owned(),
+            "ingress-nginx",
+            "1".to_owned(),
+            "superseded".to_owned(),
+            "ingress-nginx-4.9.0",
+            "1.9.0",
+            "Install complete".to_owned(),
+            50,
+        );
+        app.apply_snapshot(ResourceSnapshot {
+            generation: app.generation,
+            kind: ResourceDescriptor::helm_history(),
+            rows: Arc::new(vec![Arc::new(hist_row)]),
+            table_columns: crate::source::kubernetes::resource_views::helm_history_columns(),
+            state: SourceState::Ready,
+            revision: 1,
+            emitted_at: Instant::now(),
+        });
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppCommand::None
+        );
+        assert_eq!(app.overlay, Overlay::ConfirmDelete);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppCommand::Action(ActionIntent::HelmRollback {
+                namespace: "default".to_owned(),
+                release: "ingress-nginx".to_owned(),
+                revision: "1".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn dir_view_supports_navigation_apply_edit_and_delete() {
+        let mut app = App::new(
+            "demo",
+            Some("default".to_owned()),
+            ResourceKind::Pods,
+            false,
+            vec!["demo".to_owned()],
+        );
+        let cmd = type_input(&mut app, ':', "dir /tmp/manifests");
+        assert_eq!(
+            cmd,
+            AppCommand::Request(ViewState {
+                instance: None,
+                context: "demo".to_owned(),
+                kind: ResourceDescriptor::dir(),
+                namespace: None,
+                field_selector: Some("/tmp/manifests".to_owned()),
+                label_selector: None,
+            })
+        );
+        let dir_row = crate::source::kubernetes::resource_views::project_dir_row(
+            "/tmp/manifests/deploy.yaml".to_owned(),
+            "deploy.yaml",
+            false,
+        );
+        app.apply_snapshot(ResourceSnapshot {
+            generation: app.generation,
+            kind: ResourceDescriptor::dir(),
+            rows: Arc::new(vec![Arc::new(dir_row)]),
+            table_columns: crate::source::kubernetes::resource_views::dir_columns(),
+            state: SourceState::Ready,
+            revision: 2,
+            emitted_at: Instant::now(),
+        });
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            AppCommand::Action(ActionIntent::DirApply {
+                path: "/tmp/manifests/deploy.yaml".to_owned(),
+            })
+        );
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)),
+            AppCommand::EditDump(std::path::PathBuf::from("/tmp/manifests/deploy.yaml"))
+        );
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
+            AppCommand::None
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppCommand::Action(ActionIntent::DirDelete {
+                path: "/tmp/manifests/deploy.yaml".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn benchmark_service_command_validates_type_and_builds_request() {
+        let mut app = App::new(
+            "demo",
+            Some("default".to_owned()),
+            ResourceKind::Services,
+            false,
+            vec!["demo".to_owned()],
+        );
+        app.user_config.benchmarks.services.insert(
+            "default/edge".to_owned(),
+            crate::config::BenchConfig {
+                concurrency: 4,
+                requests: 250,
+                http: crate::config::BenchHttp {
+                    method: "POST".to_owned(),
+                    path: "/v1/bench".to_owned(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let port = vec![crate::model::PortForwardPort {
+            container: None,
+            name: Arc::from("http"),
+            port: 8080,
+        }];
+        let cluster_ip_svc = ResourceRow::new(
+            "default",
+            "internal",
+            "ClusterIP",
+            "1 ports",
+            "10.96.0.10",
+            0,
+        )
+        .with_port_forward_ports(port.clone());
+        let lb_svc = ResourceRow::new(
+            "default",
+            "edge",
+            "LoadBalancer",
+            "1 ports",
+            "10.96.0.11",
+            0,
+        )
+        .with_port_forward_ports(port)
+        .with_raw_object(serde_json::json!({
+            "status": {"loadBalancer": {"ingress": [{"ip": "198.51.100.10"}]}}
+        }));
+        app.apply_snapshot(ResourceSnapshot {
+            generation: app.generation,
+            kind: ResourceKind::Services.into(),
+            rows: Arc::new(vec![Arc::new(cluster_ip_svc), Arc::new(lb_svc)]),
+            table_columns: Arc::from([]),
+            state: SourceState::Ready,
+            revision: 1,
+            emitted_at: Instant::now(),
+        });
+        assert_eq!(app.selected_row().unwrap().name.as_ref(), "edge");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)),
+            AppCommand::RunBenchmark(crate::benchmarks::BenchmarkRunRequest {
+                cluster: None,
+                context: "demo".to_owned(),
+                namespace: "default".to_owned(),
+                target_name: "edge:8080".to_owned(),
+                base_url: "http://198.51.100.10:8080/v1/bench".to_owned(),
+                config: app.user_config.bench_config_for_service("default/edge"),
+            })
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)),
+            AppCommand::None
+        );
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("reachable service")
+        );
+    }
+
+    #[test]
+    fn benchmark_port_forward_commands_work() {
+        let mut app = App::new(
+            "demo",
+            Some("default".to_owned()),
+            ResourceKind::Pods,
+            false,
+            vec!["demo".to_owned()],
+        );
+        app.show_port_forwards(vec![PortForwardInfo {
+            id: 1,
+            context: "demo".to_owned(),
+            target: ResourceTarget {
+                kind: ResourceKind::Pods.into(),
+                namespace: Some("default".to_owned()),
+                name: "api-0".to_owned(),
+            },
+            address: "127.0.0.1".to_owned(),
+            local_port: 18080,
+            remote_port: 8080,
+            state: PortForwardState::Running,
+        }]);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)),
+            AppCommand::RunBenchmark(crate::benchmarks::BenchmarkRunRequest {
+                cluster: None,
+                context: "demo".to_owned(),
+                namespace: "default".to_owned(),
+                target_name: "api-0:8080".to_owned(),
+                base_url: "http://127.0.0.1:18080/".to_owned(),
+                config: crate::config::BenchConfig::default(),
+            })
+        );
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppCommand::Request(ViewState {
+                instance: None,
+                context: "demo".to_owned(),
+                kind: ResourceDescriptor::benchmarks(),
+                namespace: None,
+                field_selector: Some("default/api-0:8080".to_owned()),
+                label_selector: None,
+            })
+        );
+    }
+
+    #[test]
+    fn pulses_command_grid_navigation_and_drilldown_work() {
+        let mut app = App::new(
+            "demo",
+            Some("default".to_owned()),
+            ResourceKind::Pods,
+            false,
+            vec!["demo".to_owned()],
+        );
+        for alias in ["pulses", "pu", "hz"] {
+            let cmd = type_input(&mut app, ':', alias);
+            assert_eq!(
+                cmd,
+                AppCommand::Request(ViewState {
+                    instance: None,
+                    context: "demo".to_owned(),
+                    kind: ResourceDescriptor::pulses(),
+                    namespace: Some("default".to_owned()),
+                    field_selector: None,
+                    label_selector: None,
+                })
+            );
+        }
+        let specs = crate::source::kubernetes::resource_views::pulse_gauge_specs(false);
+        assert_eq!(specs.len(), 12);
+        let mut rows = Vec::new();
+        for (idx, (kind, title)) in specs.into_iter().enumerate() {
+            let gvr = kind.gvr();
+            rows.push(Arc::new(
+                crate::source::kubernetes::resource_views::project_pulse_row(
+                    "default",
+                    &gvr,
+                    title,
+                    kind,
+                    false,
+                    10,
+                    u64::from(idx == 0),
+                    0,
+                    0,
+                    0,
+                    0,
+                    Arc::from([]),
+                ),
+            ));
+        }
+        rows.push(Arc::new(
+            crate::source::kubernetes::resource_views::project_pulse_row(
+                "default",
+                "cpu",
+                "Cpu",
+                ResourceDescriptor::from(ResourceKind::Pods),
+                true,
+                0,
+                0,
+                0,
+                0,
+                500,
+                2_000,
+                Arc::from([400, 500]),
+            ),
+        ));
+        app.apply_snapshot(ResourceSnapshot {
+            generation: app.generation,
+            kind: ResourceDescriptor::pulses(),
+            rows: Arc::new(rows),
+            table_columns: crate::source::kubernetes::resource_views::pulse_columns(),
+            state: SourceState::Ready,
+            revision: 1,
+            emitted_at: Instant::now(),
+        });
+        assert_eq!(app.selected, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.selected, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.selected, 5);
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.selected, 1);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppCommand::Request(ViewState {
+                instance: None,
+                context: "demo".to_owned(),
+                kind: ResourceDescriptor::from(ResourceKind::Deployments),
+                namespace: Some("default".to_owned()),
+                field_selector: None,
+                label_selector: None,
+            })
+        );
+    }
+
+    #[test]
+    fn xray_command_collapse_shell_logs_and_drilldown_work() {
+        let mut app = App::new(
+            "demo",
+            None,
+            ResourceKind::Pods,
+            false,
+            vec!["demo".to_owned()],
+        );
+        let cmd = type_input(&mut app, ':', "xray deploy prod");
+        assert_eq!(
+            cmd,
+            AppCommand::Request(ViewState {
+                instance: None,
+                context: "demo".to_owned(),
+                kind: ResourceDescriptor::xray(),
+                namespace: Some("prod".to_owned()),
+                field_selector: Some("apps/v1/deployments".to_owned()),
+                label_selector: None,
+            })
+        );
+        let rows =
+            crate::source::kubernetes::xray::build_demo_xray_rows(&crate::source::WatchRequest {
+                instance: None,
+                generation: app.generation,
+                context: "demo".to_owned(),
+                kind: ResourceDescriptor::xray(),
+                namespace: Some("prod".to_owned()),
+                field_selector: Some("apps/v1/deployments".to_owned()),
+                label_selector: None,
+            });
+        assert_eq!(rows.len(), 7);
+        app.apply_snapshot(ResourceSnapshot {
+            generation: app.generation,
+            kind: ResourceDescriptor::xray(),
+            rows: Arc::new(rows),
+            table_columns: crate::source::kubernetes::xray::xray_columns(),
+            state: SourceState::Ready,
+            revision: 1,
+            emitted_at: Instant::now(),
+        });
+        assert_eq!(app.filtered.len(), 7);
+        // Move to deployment node (index 1) and collapse it with `x`
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.selected, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(app.filtered.len(), 2);
+        // Expand again with `x`
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(app.filtered.len(), 7);
+        // Move to container node (index 3) and test `s` shell and `Enter` logs
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.selected, 3);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+            AppCommand::Shell(PodShellTarget {
+                namespace: "prod".to_owned(),
+                pod: "pod-0000000".to_owned(),
+                container: "app".to_owned(),
+            })
+        );
+        // Move to configmap leaf (index 4) and press Enter to open instance view
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.selected, 4);
+        let enter_cmd = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            enter_cmd,
+            AppCommand::Request(ViewState {
+                instance: Some(ResourceTarget { ref name, .. }),
+                ..
+            }) if name == "app-config"
+        ));
+    }
+
+    #[test]
+    fn vulnerability_scans_extender_and_scan_table_sorting_work() {
+        let mut app = App::new(
+            "demo",
+            Some("default".to_owned()),
+            ResourceKind::Pods,
+            false,
+            vec!["demo".to_owned()],
+        );
+        let mut cfg = crate::config::UserConfig::default();
+        cfg.settings.image_scans.enable = true;
+        cfg.settings.image_scans.exclusions.namespaces = vec!["kube-system".to_owned()];
+        app.apply_user_config(cfg);
+
+        let pod_row = ResourceRow::new("default", "api-0", "Running", "1/1", "0", 0)
+            .with_raw_object(serde_json::json!({
+                "spec": {
+                    "containers": [
+                        { "name": "api", "image": "nginx:1.25" }
+                    ]
+                }
+            }));
+        app.apply_snapshot(ResourceSnapshot {
+            generation: app.generation,
+            kind: ResourceDescriptor::from(ResourceKind::Pods),
+            rows: Arc::new(vec![Arc::new(pod_row)]),
+            table_columns: Arc::from([]),
+            state: SourceState::Ready,
+            revision: 1,
+            emitted_at: Instant::now(),
+        });
+
+        // Sort by VS (`Shift-V`) on Pod table
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT));
+        assert_eq!(app.sort_field, SortField::VulnScore);
+
+        // Press `v` to open `:scans` for the selected Pod's image
+        let cmd = app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert_eq!(
+            cmd,
+            AppCommand::Request(ViewState {
+                instance: None,
+                context: "demo".to_owned(),
+                kind: ResourceDescriptor::scans(),
+                namespace: None,
+                field_selector: Some("nginx:1.25".to_owned()),
+                label_selector: None,
+            })
+        );
+        let scan_rows = crate::source::kubernetes::resource_views::read_scan_rows("nginx:1.25");
+        assert_eq!(scan_rows.len(), 2);
+        app.apply_snapshot(ResourceSnapshot {
+            generation: app.generation,
+            kind: ResourceDescriptor::scans(),
+            rows: Arc::new(scan_rows),
+            table_columns: crate::scans::scan_columns(),
+            state: SourceState::Ready,
+            revision: 1,
+            emitted_at: Instant::now(),
+        });
+        assert_eq!(app.sort_field, SortField::Status);
+        app.handle_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT));
+        assert_eq!(app.sort_field, SortField::Details);
+        app.handle_key(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::SHIFT));
+        assert_eq!(app.sort_field, SortField::Ready);
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT));
+        assert_eq!(app.sort_field, SortField::Name);
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppCommand::OpenUrl(url) if url.starts_with("https://")
+        ));
+    }
+
+    #[test]
+    fn cow_command_and_container_port_forward_work() {
+        let mut app = App::new(
+            "demo",
+            Some("default".to_owned()),
+            ResourceKind::Pods,
+            false,
+            vec!["demo".to_owned()],
+        );
+        app.user_config.settings.port_forward_address = Some("127.0.0.2".to_owned());
+        app.run_command("cow Hello Kux");
+        assert_eq!(app.overlay, Overlay::Content);
+        assert_eq!(app.content_title, "Cow");
+        assert!(app.content_body.contains("< Ruroh? Hello Kux >"));
+        assert!(app.content_body.contains("(oo)\\_______"));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.overlay, Overlay::None);
+
+        let container_row = ResourceRow::new("default", "app", "Running", "true", "nginx:1.25", 10)
+            .with_container_data(crate::model::ContainerData {
+                image: Arc::from("nginx:1.25"),
+                kind: Arc::from("container"),
+                restarts: 0,
+                ..crate::model::ContainerData::default()
+            })
+            .with_port_forward_ports(vec![PortForwardPort {
+                container: Some(Arc::from("app")),
+                name: Arc::from("http"),
+                port: 8080,
+            }]);
+        app.apply_snapshot(ResourceSnapshot {
+            generation: app.generation,
+            kind: ResourceDescriptor::from(ResourceKind::Pods),
+            rows: Arc::new(vec![Arc::new(container_row)]),
+            table_columns: Arc::from([]),
+            state: SourceState::Ready,
+            revision: 1,
+            emitted_at: Instant::now(),
+        });
+        app.list_mode = ListMode::Containers {
+            namespace: "default".to_owned(),
+            pod: "api-0".to_owned(),
+        };
+        assert!(app.is_container_view());
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)),
+            AppCommand::ShowPortForwards
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::SHIFT));
+        assert_eq!(app.overlay, Overlay::PortForwardDialog);
+        let dialog = app.port_forward_dialog.as_ref().unwrap();
+        assert_eq!(dialog.target.name, "api-0");
+        assert_eq!(dialog.remote_port, "app::8080");
+        assert_eq!(dialog.local_port, "8080");
+        assert_eq!(dialog.address, "127.0.0.2");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn fast_forward_annotations_node_cordon_and_pf_sort_work() {
+        let mut app = App::new(
+            "demo",
+            Some("default".to_owned()),
+            ResourceKind::Pods,
+            false,
+            vec!["demo".to_owned()],
+        );
+        let pod_row = ResourceRow::new("default", "api-0", "Running", "1/1", "0", 10)
+            .with_port_forward_ports(vec![
+                PortForwardPort {
+                    container: Some(Arc::from("admin")),
+                    name: Arc::from("metrics"),
+                    port: 9090,
+                },
+                PortForwardPort {
+                    container: Some(Arc::from("app")),
+                    name: Arc::from("http"),
+                    port: 8080,
+                },
+            ])
+            .with_raw_object(serde_json::json!({
+                "metadata": {
+                    "annotations": {
+                        "k9scli.io/port-forwards": "app::18080:http"
+                    }
+                }
+            }));
+        app.apply_snapshot(ResourceSnapshot {
+            generation: app.generation,
+            kind: ResourceDescriptor::from(ResourceKind::Pods),
+            rows: Arc::new(vec![Arc::new(pod_row)]),
+            table_columns: Arc::from([]),
+            state: SourceState::Ready,
+            revision: 1,
+            emitted_at: Instant::now(),
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::SHIFT));
+        assert_eq!(app.overlay, Overlay::PortForwardDialog);
+        let dialog = app.port_forward_dialog.as_ref().unwrap();
+        assert_eq!(dialog.remote_port, "app::8080");
+        assert_eq!(dialog.local_port, "18080");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        // Auto port-forward starts immediately without opening dialog
+        let auto_pod = ResourceRow::new("default", "api-1", "Running", "1/1", "0", 10)
+            .with_port_forward_ports(vec![PortForwardPort {
+                container: Some(Arc::from("app")),
+                name: Arc::from("http"),
+                port: 8080,
+            }])
+            .with_raw_object(serde_json::json!({
+                "metadata": {
+                    "annotations": {
+                        "k9scli.io/auto-port-forwards": "app::28080:http"
+                    }
+                }
+            }));
+        app.apply_snapshot(ResourceSnapshot {
+            generation: app.generation,
+            kind: ResourceDescriptor::from(ResourceKind::Pods),
+            rows: Arc::new(vec![Arc::new(auto_pod)]),
+            table_columns: Arc::from([]),
+            state: SourceState::Ready,
+            revision: 2,
+            emitted_at: Instant::now(),
+        });
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::SHIFT)),
+            AppCommand::StartPortForward(PortForwardRequest {
+                target: ResourceTarget {
+                    kind: ResourceDescriptor::from(ResourceKind::Pods),
+                    namespace: Some("default".to_owned()),
+                    name: "api-1".to_owned(),
+                },
+                remote_port: 8080,
+                local_port: 28080,
+                address: "localhost".to_owned(),
+            })
+        );
+
+        // PortForward overlay sorting (`Shift-P`, `Shift-U`)
+        app.show_port_forwards(vec![
+            PortForwardInfo {
+                id: 1,
+                context: "demo".to_owned(),
+                target: ResourceTarget {
+                    kind: ResourceDescriptor::from(ResourceKind::Pods),
+                    namespace: Some("default".to_owned()),
+                    name: "b".to_owned(),
+                },
+                remote_port: 8080,
+                local_port: 9000,
+                address: "127.0.0.2".to_owned(),
+                state: PortForwardState::Running,
+            },
+            PortForwardInfo {
+                id: 2,
+                context: "demo".to_owned(),
+                target: ResourceTarget {
+                    kind: ResourceDescriptor::from(ResourceKind::Pods),
+                    namespace: Some("default".to_owned()),
+                    name: "a".to_owned(),
+                },
+                remote_port: 8080,
+                local_port: 8000,
+                address: "127.0.0.1".to_owned(),
+                state: PortForwardState::Running,
+            },
+        ]);
+        app.handle_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT));
+        assert_eq!(app.port_forwards[0].local_port, 8000);
+        app.handle_key(KeyEvent::new(KeyCode::Char('U'), KeyModifiers::SHIFT));
+        assert_eq!(app.port_forwards[0].address, "127.0.0.1");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        // Node `c` explicit Cordon
+        let node_row = ResourceRow::new("-", "node-1", "Ready", "worker", "v1.32.0", 0)
+            .with_node_data(crate::model::NodeData::default());
+        let mut node_app = app_with_descriptor(ResourceKind::Nodes.into(), None, node_row);
+        node_app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert_eq!(
+            node_app.pending_delete,
+            Some(PendingDelete::NodeScheduling {
+                name: "node-1".to_owned(),
+                unschedulable: true,
+            })
+        );
+
+        // `:skin` / `:skins` command and interactive skin selection
+        let cmd = app.run_command("skin");
+        assert!(matches!(cmd, AppCommand::Request(_)));
+        assert!(app.kind.is_skins());
+        let skin_rows = crate::source::kubernetes::resource_views::read_skin_rows();
+        assert!(skin_rows.iter().any(|r| r.name.as_ref() == "default"));
+        app.apply_snapshot(ResourceSnapshot {
+            generation: app.generation,
+            kind: ResourceDescriptor::skins(),
+            rows: Arc::new(skin_rows),
+            table_columns: crate::source::kubernetes::resource_views::skin_columns(),
+            state: SourceState::Ready,
+            revision: 1,
+            emitted_at: Instant::now(),
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.user_config.settings.ui.skin.as_deref(), Some("default"));
+
+        // Event fault filtering (`Ctrl-Z`)
+        let ev_desc = ResourceDescriptor::new(
+            "",
+            "v1",
+            "v1",
+            "Event",
+            "events",
+            true,
+            ResourceOperations::all(),
+        );
+        let normal_ev = ResourceRow::new("default", "ev-1", "Normal", "Scheduled", "ok", 10);
+        let warn_ev = ResourceRow::new("default", "ev-2", "Warning", "Failed", "oom", 10);
+        let mut ev_app = app_with_descriptor(ev_desc.clone(), None, normal_ev.clone());
+        ev_app.apply_snapshot(ResourceSnapshot {
+            generation: ev_app.generation,
+            kind: ev_desc,
+            rows: Arc::new(vec![Arc::new(normal_ev), Arc::new(warn_ev)]),
+            table_columns: Arc::from([]),
+            state: SourceState::Ready,
+            revision: 1,
+            emitted_at: Instant::now(),
+        });
+        assert_eq!(ev_app.filtered.len(), 2);
+        ev_app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        assert_eq!(ev_app.filtered.len(), 1);
+        assert_eq!(ev_app.selected_row().unwrap().name.as_ref(), "ev-2");
+
+        // Scale dialog single-target replica prefill from `READY`
+        let deploy_row = ResourceRow::new("default", "web", "Ready", "3/5", "-", 10);
+        let mut scale_app = app_with_descriptor(ResourceKind::Deployments.into(), None, deploy_row);
+        scale_app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert!(matches!(
+            &scale_app.pending_delete,
+            Some(PendingDelete::Scale { replicas, .. }) if replicas == "5"
+        ));
+
+        // CronJob suspend/resume confirmation state preview
+        let cj_desc = descriptor("batch", "v1", "batch/v1", "CronJob", "cronjobs", true);
+        let cj_row = ResourceRow::new("default", "nightly", "Active", "-", "-", 10)
+            .with_raw_object(serde_json::json!({
+                "spec": { "suspend": false }
+            }));
+        let mut cj_app = app_with_descriptor(cj_desc, None, cj_row);
+        cj_app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(
+            cj_app.pending_delete,
+            Some(PendingDelete::ToggleCronJobSuspend {
+                target: ResourceTarget {
+                    kind: descriptor("batch", "v1", "batch/v1", "CronJob", "cronjobs", true),
+                    namespace: Some("default".to_owned()),
+                    name: "nightly".to_owned(),
+                },
+                suspend: Some(true),
+            })
+        );
     }
 }

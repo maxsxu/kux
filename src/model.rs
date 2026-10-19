@@ -144,6 +144,7 @@ impl ResourceOperations {
     const WATCH: u8 = 1 << 0;
     const GET: u8 = 1 << 1;
     const DELETE: u8 = 1 << 2;
+    const SCALE: u8 = 1 << 3;
 
     #[must_use]
     pub const fn new(watchable: bool, gettable: bool, deletable: bool) -> Self {
@@ -157,6 +158,16 @@ impl ResourceOperations {
     #[must_use]
     pub const fn all() -> Self {
         Self(Self::WATCH | Self::GET | Self::DELETE)
+    }
+
+    #[must_use]
+    pub const fn with_scale(self, scalable: bool) -> Self {
+        Self((self.0 & !Self::SCALE) | ((scalable as u8) * Self::SCALE))
+    }
+
+    #[must_use]
+    pub const fn scalable(self) -> bool {
+        self.0 & Self::SCALE != 0
     }
 
     #[must_use]
@@ -175,7 +186,331 @@ impl ResourceOperations {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubjectKind {
+    User,
+    Group,
+}
+
+impl SubjectKind {
+    #[must_use]
+    pub const fn gvr(self) -> &'static str {
+        match self {
+            Self::User => "users",
+            Self::Group => "groups",
+        }
+    }
+
+    #[must_use]
+    pub const fn subject_kind(self) -> &'static str {
+        match self {
+            Self::User => "User",
+            Self::Group => "Group",
+        }
+    }
+}
+
 impl ResourceDescriptor {
+    /// Virtual collection used by the Workloads browser, never an API endpoint.
+    #[must_use]
+    pub fn workloads() -> Self {
+        Self::new(
+            "",
+            "",
+            "",
+            "Workload",
+            "workloads",
+            true,
+            ResourceOperations::all(),
+        )
+        .with_short_names(["wk"])
+    }
+
+    /// Virtual collection used by the RBAC Users browser, never an API endpoint.
+    #[must_use]
+    pub fn users() -> Self {
+        Self::new(
+            "",
+            "",
+            "",
+            "User",
+            "users",
+            false,
+            ResourceOperations::new(false, false, false),
+        )
+        .with_short_names(["usr"])
+    }
+
+    /// Virtual collection used by the RBAC Groups browser, never an API endpoint.
+    #[must_use]
+    pub fn groups() -> Self {
+        Self::new(
+            "",
+            "",
+            "",
+            "Group",
+            "groups",
+            false,
+            ResourceOperations::new(false, false, false),
+        )
+        .with_short_names(["grp"])
+    }
+
+    /// Virtual collection used by the Helm Charts browser (`:helm` / `:hm`).
+    #[must_use]
+    pub fn helm() -> Self {
+        Self::new(
+            "",
+            "",
+            "",
+            "Helm",
+            "helm",
+            true,
+            ResourceOperations::new(false, true, true),
+        )
+        .with_short_names(["hm"])
+    }
+
+    /// Virtual collection used by the Helm History browser (`helm-history` / `hmh`).
+    #[must_use]
+    pub fn helm_history() -> Self {
+        Self::new(
+            "",
+            "",
+            "",
+            "HelmHistory",
+            "helm-history",
+            true,
+            ResourceOperations::new(false, true, false),
+        )
+        .with_short_names(["hmh"])
+    }
+
+    /// Virtual collection used by the skin chooser (`:skin` / `:skins`).
+    #[must_use]
+    pub fn skins() -> Self {
+        Self::new(
+            "",
+            "",
+            "",
+            "Skin",
+            "skins",
+            false,
+            ResourceOperations::new(false, false, false),
+        )
+        .with_short_names(["skin", "skins"])
+    }
+
+    #[must_use]
+    pub fn is_skins(&self) -> bool {
+        self.group.is_empty()
+            && self.version.is_empty()
+            && self.api_version.is_empty()
+            && self.kind.as_ref() == "Skin"
+            && self.plural.as_ref() == "skins"
+            && !self.namespaced
+    }
+
+    /// Virtual collection used by the local manifest directory browser (`:dir`).
+    #[must_use]
+    pub fn dir() -> Self {
+        Self::new(
+            "",
+            "",
+            "",
+            "Dir",
+            "dirs",
+            false,
+            ResourceOperations::new(false, true, true),
+        )
+        .with_short_names(["dir", "ls"])
+    }
+
+    /// Virtual collection used by the HTTP Benchmarks browser (`:benchmarks` / `:be` / `:bench`).
+    #[must_use]
+    pub fn benchmarks() -> Self {
+        Self::new(
+            "",
+            "",
+            "",
+            "Benchmark",
+            "benchmarks",
+            false,
+            ResourceOperations::new(false, true, true),
+        )
+        .with_short_names(["be", "bench"])
+    }
+
+    /// Virtual collection used by the Pulses cluster/namespace health dashboard (`:pulses` / `:pu` / `:hz`).
+    #[must_use]
+    pub fn pulses() -> Self {
+        Self::new(
+            "",
+            "",
+            "",
+            "Pulse",
+            "pulses",
+            true,
+            ResourceOperations::new(false, false, false),
+        )
+        .with_short_names(["pu", "pulse", "hz"])
+    }
+
+    /// Virtual collection used by the `XRay` dependency tree viewer (`:xray <resource> [namespace]`).
+    #[must_use]
+    pub fn xray() -> Self {
+        Self::new(
+            "",
+            "",
+            "",
+            "XRay",
+            "xray",
+            true,
+            ResourceOperations::new(false, true, true),
+        )
+        .with_short_names(["xr"])
+    }
+
+    /// Virtual collection used by the image vulnerability scans table (`:scans` / `v`).
+    #[must_use]
+    pub fn scans() -> Self {
+        Self::new(
+            "",
+            "",
+            "",
+            "Scan",
+            "scans",
+            false,
+            ResourceOperations::new(false, false, false),
+        )
+        .with_short_names(["scn", "scan"])
+    }
+
+    #[must_use]
+    pub fn is_scans(&self) -> bool {
+        self.group.is_empty()
+            && self.version.is_empty()
+            && self.api_version.is_empty()
+            && self.kind.as_ref() == "Scan"
+            && self.plural.as_ref() == "scans"
+            && !self.namespaced
+    }
+
+    #[must_use]
+    pub fn supports_vulnerability_scans(&self) -> bool {
+        matches!(
+            self.known_kind(),
+            Some(
+                ResourceKind::Pods
+                    | ResourceKind::Deployments
+                    | ResourceKind::StatefulSets
+                    | ResourceKind::DaemonSets
+            )
+        ) || self.is_apps_v1_replica_set()
+            || self.is_job()
+            || self.is_cron_job()
+    }
+
+    #[must_use]
+    pub fn is_xray(&self) -> bool {
+        self.group.is_empty()
+            && self.version.is_empty()
+            && self.api_version.is_empty()
+            && self.kind.as_ref() == "XRay"
+            && self.plural.as_ref() == "xray"
+            && self.namespaced
+    }
+
+    #[must_use]
+    pub fn is_pulses(&self) -> bool {
+        self.group.is_empty()
+            && self.version.is_empty()
+            && self.api_version.is_empty()
+            && self.kind.as_ref() == "Pulse"
+            && self.plural.as_ref() == "pulses"
+            && self.namespaced
+    }
+
+    #[must_use]
+    pub fn is_benchmarks(&self) -> bool {
+        self.group.is_empty()
+            && self.version.is_empty()
+            && self.api_version.is_empty()
+            && self.kind.as_ref() == "Benchmark"
+            && self.plural.as_ref() == "benchmarks"
+            && !self.namespaced
+    }
+
+    #[must_use]
+    pub fn is_helm(&self) -> bool {
+        self.group.is_empty()
+            && self.version.is_empty()
+            && self.api_version.is_empty()
+            && self.kind.as_ref() == "Helm"
+            && self.plural.as_ref() == "helm"
+            && self.namespaced
+    }
+
+    #[must_use]
+    pub fn is_helm_history(&self) -> bool {
+        self.group.is_empty()
+            && self.version.is_empty()
+            && self.api_version.is_empty()
+            && self.kind.as_ref() == "HelmHistory"
+            && self.plural.as_ref() == "helm-history"
+            && self.namespaced
+    }
+
+    #[must_use]
+    pub fn is_dir(&self) -> bool {
+        self.group.is_empty()
+            && self.version.is_empty()
+            && self.api_version.is_empty()
+            && self.kind.as_ref() == "Dir"
+            && self.plural.as_ref() == "dirs"
+            && !self.namespaced
+    }
+
+    #[must_use]
+    pub fn subject_kind(&self) -> Option<SubjectKind> {
+        if !self.group.is_empty()
+            || !self.version.is_empty()
+            || !self.api_version.is_empty()
+            || self.namespaced
+        {
+            return None;
+        }
+        match (self.kind.as_ref(), self.plural.as_ref()) {
+            ("User", "users") => Some(SubjectKind::User),
+            ("Group", "groups") => Some(SubjectKind::Group),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn is_subject(&self) -> bool {
+        self.subject_kind().is_some()
+    }
+
+    #[must_use]
+    pub fn is_workloads(&self) -> bool {
+        self.group.is_empty()
+            && self.version.is_empty()
+            && self.api_version.is_empty()
+            && self.kind.as_ref() == "Workload"
+            && self.plural.as_ref() == "workloads"
+            && self.namespaced
+    }
+
+    #[must_use]
+    pub fn gvr(&self) -> String {
+        if self.api_version.is_empty() {
+            self.plural.to_string()
+        } else {
+            format!("{}/{}", self.api_version, self.plural)
+        }
+    }
+
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -306,6 +641,16 @@ impl ResourceDescriptor {
         aliases
     }
 
+    /// Namespaces chooser (`:ns`) or discovered `v1/namespaces` table.
+    #[must_use]
+    pub fn is_core_v1_namespace(&self) -> bool {
+        self.group.is_empty()
+            && self.version.as_ref() == "v1"
+            && self.kind.as_ref() == "Namespace"
+            && self.plural.as_ref() == "namespaces"
+            && !self.namespaced
+    }
+
     #[must_use]
     pub fn is_core_v1_secret(&self) -> bool {
         self.group.is_empty()
@@ -330,6 +675,47 @@ impl ResourceDescriptor {
     }
 
     #[must_use]
+    pub fn is_scalable(&self) -> bool {
+        self.operations.scalable()
+            || (self.version.as_ref() == "v1"
+                && self.namespaced
+                && matches!(
+                    (
+                        self.group.as_ref(),
+                        self.kind.as_ref(),
+                        self.plural.as_ref()
+                    ),
+                    ("apps", "Deployment", "deployments")
+                        | ("apps", "StatefulSet", "statefulsets")
+                        | ("apps", "ReplicaSet", "replicasets")
+                        | ("", "ReplicationController", "replicationcontrollers")
+                ))
+    }
+
+    #[must_use]
+    pub fn is_cron_job(&self) -> bool {
+        self.group.as_ref() == "batch"
+            && self.version.as_ref() == "v1"
+            && self.kind.as_ref() == "CronJob"
+            && self.plural.as_ref() == "cronjobs"
+            && self.namespaced
+    }
+
+    #[must_use]
+    pub fn is_job(&self) -> bool {
+        self.group.as_ref() == "batch"
+            && self.version.as_ref() == "v1"
+            && self.kind.as_ref() == "Job"
+            && self.plural.as_ref() == "jobs"
+            && self.namespaced
+    }
+
+    #[must_use]
+    pub fn is_suspendable(&self) -> bool {
+        self.is_cron_job() || self.is_job()
+    }
+
+    #[must_use]
     pub fn is_custom_resource_definition(&self) -> bool {
         self.group.as_ref() == "apiextensions.k8s.io"
             && self.kind.as_ref() == "CustomResourceDefinition"
@@ -338,7 +724,8 @@ impl ResourceDescriptor {
 
     #[must_use]
     pub fn is_authorization_resource(&self) -> bool {
-        (self.group.is_empty() && self.kind.as_ref() == "ServiceAccount")
+        self.is_subject()
+            || (self.group.is_empty() && self.kind.as_ref() == "ServiceAccount")
             || (self.group.as_ref() == "rbac.authorization.k8s.io"
                 && matches!(
                     self.kind.as_ref(),
@@ -387,9 +774,11 @@ pub struct ResourceRow {
     pub created_unix: i64,
     pub search: Arc<str>,
     pub owner: Option<OwnerReferenceData>,
-    port_forward_ports: Option<Arc<Vec<PortForwardPort>>>,
+    pub owner_names: Arc<[Arc<str>]>,
+    pub port_forward_ports: Option<Arc<Vec<PortForwardPort>>>,
     pub data: ResourceData,
     pub table_cells: Arc<[TableCell]>,
+    pub raw_object: Option<Arc<serde_json::Value>>,
 }
 
 /// A declared TCP port that can be selected by the port-forward dialog.
@@ -444,6 +833,12 @@ pub struct TableCell {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ResourceData {
+    Workload {
+        kind: ResourceDescriptor,
+    },
+    Reference {
+        kind: ResourceDescriptor,
+    },
     #[default]
     Generic,
     ChildResource(ChildResourceData),
@@ -451,6 +846,38 @@ pub enum ResourceData {
     Node(NodeData),
     Container(ContainerData),
     Policy(PolicyData),
+    Pulse(PulseData),
+    XRay(XRayData),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XRayData {
+    pub path: Arc<str>,
+    pub parent_path: Option<Arc<str>>,
+    pub depth: usize,
+    pub target_kind: ResourceDescriptor,
+    pub is_container: bool,
+    pub is_namespace: bool,
+    pub pod_name: Option<Arc<str>>,
+    pub children_count: usize,
+    pub emoji: Arc<str>,
+    pub info: Arc<str>,
+    pub status: Arc<str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PulseData {
+    pub gvr: Arc<str>,
+    pub title: Arc<str>,
+    pub target_kind: ResourceDescriptor,
+    pub is_sparkline: bool,
+    pub total: u64,
+    pub faults: u64,
+    pub delta_total: i8,
+    pub delta_faults: i8,
+    pub current: u64,
+    pub capacity: u64,
+    pub series: Arc<[u64]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -464,6 +891,10 @@ pub struct PodData {
     pub restarts: u32,
     pub node: Arc<str>,
     pub default_container: Arc<str>,
+    pub qos: Arc<str>,
+    pub ip: Arc<str>,
+    pub nominated_node: Arc<str>,
+    pub readiness_gates: Arc<str>,
     pub cpu_millis: Option<u64>,
     pub cpu_request_millis: u64,
     pub cpu_limit_millis: u64,
@@ -478,6 +909,12 @@ pub struct NodeData {
     pub taints: Arc<str>,
     pub taint_count: u32,
     pub version: Arc<str>,
+    pub kernel: Arc<str>,
+    pub os_image: Arc<str>,
+    pub arch: Arc<str>,
+    pub runtime: Arc<str>,
+    pub internal_ip: Arc<str>,
+    pub external_ip: Arc<str>,
     pub pods: u32,
     pub cpu_millis: Option<u64>,
     pub cpu_allocatable_millis: u64,
@@ -490,6 +927,16 @@ pub struct ContainerData {
     pub image: Arc<str>,
     pub kind: Arc<str>,
     pub restarts: u32,
+    pub index: Arc<str>,
+    pub init: Arc<str>,
+    pub probes: Arc<str>,
+    pub ports: Arc<str>,
+    pub cpu_millis: Option<u64>,
+    pub cpu_request_millis: u64,
+    pub cpu_limit_millis: u64,
+    pub memory_bytes: Option<u64>,
+    pub memory_request_bytes: u64,
+    pub memory_limit_bytes: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -507,6 +954,15 @@ impl PolicyData {
 }
 
 impl ResourceRow {
+    #[must_use]
+    pub fn with_workload_kind(mut self, kind: ResourceDescriptor) -> Self {
+        let gvr = kind.gvr();
+        self.key = Arc::from(format!("{gvr}|{}|{}", self.namespace, self.name));
+        self.search = Arc::from(format!("{}\n{gvr}", self.search).to_lowercase());
+        self.data = ResourceData::Workload { kind };
+        self
+    }
+
     #[must_use]
     pub fn new(
         namespace: impl Into<String>,
@@ -534,10 +990,52 @@ impl ResourceRow {
             created_unix,
             search: Arc::from(search),
             owner: None,
+            owner_names: Arc::from([]),
             port_forward_ports: None,
             data: ResourceData::Generic,
             table_cells: Arc::from([]),
+            raw_object: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_raw_object(mut self, value: serde_json::Value) -> Self {
+        self.raw_object = Some(Arc::new(value));
+        self
+    }
+
+    #[must_use]
+    pub fn extract_container_images(&self) -> Vec<String> {
+        if let Some(co) = self.container_data() {
+            return vec![co.image.to_string()];
+        }
+        let Some(root) = self.raw_object.as_deref() else {
+            return Vec::new();
+        };
+        let mut images = Vec::new();
+        for path in [
+            "spec.containers[*].image",
+            "spec.template.spec.containers[*].image",
+            "spec.jobTemplate.spec.template.spec.containers[*].image",
+        ] {
+            let text = extract_json_path_text(root, path);
+            if text != "<none>" {
+                for img in text.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    if !images.iter().any(|existing| existing == img) {
+                        images.push(img.to_owned());
+                    }
+                }
+            }
+        }
+        images
+    }
+
+    #[must_use]
+    pub fn json_path_value(&self, path: &str) -> String {
+        let Some(root) = self.raw_object.as_deref() else {
+            return "<none>".to_owned();
+        };
+        extract_json_path_text(root, path)
     }
 
     #[must_use]
@@ -563,6 +1061,7 @@ impl ResourceRow {
 
     #[must_use]
     pub fn with_owner_reference_data(mut self, owner: OwnerReferenceData) -> Self {
+        self.owner_names = Arc::from([Arc::clone(&owner.name)]);
         self.search = Arc::from(
             format!(
                 "{}\n{}\n{}\n{}",
@@ -622,6 +1121,38 @@ impl ResourceRow {
         self.search = Arc::from(format!("{}\n{verbs}", self.search).to_lowercase());
         self.data = ResourceData::Policy(data);
         self
+    }
+
+    #[must_use]
+    pub fn with_pulse_data(mut self, data: PulseData) -> Self {
+        self.key = Arc::clone(&data.gvr);
+        self.search = Arc::from(format!("{}\n{}", data.gvr, data.title).to_lowercase());
+        self.data = ResourceData::Pulse(data);
+        self
+    }
+
+    #[must_use]
+    pub const fn pulse_data(&self) -> Option<&PulseData> {
+        match &self.data {
+            ResourceData::Pulse(data) => Some(data),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_xray_data(mut self, data: XRayData) -> Self {
+        self.key = Arc::clone(&data.path);
+        self.search = Arc::from(format!("{}\n{}", data.path, data.status).to_lowercase());
+        self.data = ResourceData::XRay(data);
+        self
+    }
+
+    #[must_use]
+    pub const fn xray_data(&self) -> Option<&XRayData> {
+        match &self.data {
+            ResourceData::XRay(data) => Some(data),
+            _ => None,
+        }
     }
 
     #[must_use]
@@ -865,6 +1396,163 @@ pub fn format_kubectl_age(total_seconds: u64) -> String {
     format!("{}y", hours / 24 / 365)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PathSegment {
+    Key(String),
+    Index(usize),
+    Wildcard,
+}
+
+fn parse_json_path_segments(path: &str) -> Vec<PathSegment> {
+    let mut trimmed = path.trim();
+    if let Some(rest) = trimmed.strip_prefix('{')
+        && let Some(inner) = rest.strip_suffix('}')
+    {
+        trimmed = inner.trim();
+    }
+    trimmed = trimmed.strip_prefix('$').unwrap_or(trimmed);
+    trimmed = trimmed.strip_prefix('.').unwrap_or(trimmed);
+    let mut segments = Vec::new();
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '.' {
+            i += 1;
+            continue;
+        }
+        if chars[i] == '[' {
+            i += 1;
+            let mut token = String::new();
+            let quote = if i < chars.len() && (chars[i] == '\'' || chars[i] == '"') {
+                let q = chars[i];
+                i += 1;
+                Some(q)
+            } else {
+                None
+            };
+            while i < chars.len() {
+                if let Some(q) = quote {
+                    if chars[i] == '\\' && i + 1 < chars.len() {
+                        i += 1;
+                        token.push(chars[i]);
+                        i += 1;
+                        continue;
+                    }
+                    if chars[i] == q {
+                        i += 1;
+                        break;
+                    }
+                } else if chars[i] == ']' {
+                    break;
+                }
+                token.push(chars[i]);
+                i += 1;
+            }
+            while i < chars.len() && chars[i] != ']' {
+                i += 1;
+            }
+            if i < chars.len() && chars[i] == ']' {
+                i += 1;
+            }
+            if quote.is_none() {
+                let t = token.trim();
+                if t == "*" {
+                    segments.push(PathSegment::Wildcard);
+                } else if let Ok(idx) = t.parse::<usize>() {
+                    segments.push(PathSegment::Index(idx));
+                } else if !t.is_empty() {
+                    segments.push(PathSegment::Key(t.to_owned()));
+                }
+            } else {
+                segments.push(PathSegment::Key(token));
+            }
+        } else {
+            let mut token = String::new();
+            while i < chars.len() && chars[i] != '.' && chars[i] != '[' {
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    i += 1;
+                }
+                token.push(chars[i]);
+                i += 1;
+            }
+            if !token.is_empty() {
+                segments.push(PathSegment::Key(token));
+            }
+        }
+    }
+    segments
+}
+
+fn evaluate_json_path<'a>(
+    current: &'a serde_json::Value,
+    segments: &[PathSegment],
+    out: &mut Vec<&'a serde_json::Value>,
+) {
+    let Some((first, rest)) = segments.split_first() else {
+        out.push(current);
+        return;
+    };
+    match first {
+        PathSegment::Key(key) => {
+            if let Some(next) = current.get(key.as_str()) {
+                evaluate_json_path(next, rest, out);
+            }
+        }
+        PathSegment::Index(index) => {
+            if let Some(next) = current.as_array().and_then(|arr| arr.get(*index)) {
+                evaluate_json_path(next, rest, out);
+            }
+        }
+        PathSegment::Wildcard => match current {
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    evaluate_json_path(item, rest, out);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for item in map.values() {
+                    evaluate_json_path(item, rest, out);
+                }
+            }
+            _ => {}
+        },
+    }
+}
+
+fn format_json_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Bool(flag) => Some(flag.to_string()),
+        serde_json::Value::Number(num) => Some(num.to_string()),
+        serde_json::Value::Array(items) => {
+            let parts: Vec<String> = items.iter().filter_map(format_json_value).collect();
+            (!parts.is_empty()).then(|| parts.join(","))
+        }
+        serde_json::Value::Object(_) => serde_json::to_string(value).ok(),
+    }
+}
+
+#[must_use]
+pub fn extract_json_path_text(root: &serde_json::Value, path: &str) -> String {
+    let segments = parse_json_path_segments(path);
+    if segments.is_empty() {
+        return "<none>".to_owned();
+    }
+    let mut matches = Vec::new();
+    evaluate_json_path(root, &segments, &mut matches);
+    let rendered: Vec<String> = matches
+        .into_iter()
+        .filter_map(format_json_value)
+        .filter(|text| !text.is_empty())
+        .collect();
+    if rendered.is_empty() {
+        "<none>".to_owned()
+    } else {
+        rendered.join(",")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1007,6 +1695,7 @@ mod tests {
                 image: Arc::from("example/api:v1"),
                 kind: Arc::from("container"),
                 restarts: 2,
+                ..ContainerData::default()
             },
         );
         let data = row.container_data().expect("container data");

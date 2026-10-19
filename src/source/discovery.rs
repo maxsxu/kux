@@ -59,10 +59,21 @@ async fn discover_legacy(client: &Client) -> Result<Vec<ResourceDescriptor>, kub
 
 fn descriptors_from_legacy_list(list: APIResourceList) -> Vec<ResourceDescriptor> {
     let group_version = list.group_version;
+    let scalable = list
+        .resources
+        .iter()
+        .filter_map(|resource| resource.name.strip_suffix("/scale").map(str::to_owned))
+        .collect::<std::collections::HashSet<_>>();
     list.resources
         .into_iter()
         .filter(|resource| !resource.name.contains('/'))
         .filter_map(|resource| descriptor_from_legacy_resource(&group_version, resource))
+        .map(|mut resource| {
+            resource.operations = resource
+                .operations
+                .with_scale(scalable.contains(resource.plural.as_ref()));
+            resource
+        })
         .collect()
 }
 
@@ -151,6 +162,12 @@ fn descriptor_from_aggregated_resource(
         resource.verbs.iter().any(|verb| verb == verbs::WATCH),
         resource.verbs.iter().any(|verb| verb == verbs::GET),
         resource.verbs.iter().any(|verb| verb == verbs::DELETE),
+    )
+    .with_scale(
+        resource
+            .subresources
+            .iter()
+            .any(|subresource| subresource.subresource.as_deref() == Some("scale")),
     );
     Some(
         ResourceDescriptor::new(
@@ -195,7 +212,10 @@ fn descriptor(resource: ApiResource, capabilities: &ApiCapabilities) -> Option<R
             capabilities.supports_operation(verbs::WATCH),
             capabilities.supports_operation(verbs::GET),
             capabilities.supports_operation(verbs::DELETE),
-        ),
+        )
+        .with_scale(capabilities.subresources.iter().any(|(subresource, _)| {
+            subresource.plural.ends_with("/scale") || subresource.plural == "scale"
+        })),
     ))
 }
 
@@ -286,6 +306,33 @@ mod tests {
                 .iter()
                 .any(|alias| alias == "cebc")
         );
+    }
+
+    #[test]
+    fn aggregated_discovery_preserves_scale_subresource_for_custom_resources() {
+        let resource: APIResourceDiscovery = serde_json::from_value(serde_json::json!({
+            "resource": "widgets", "responseKind": {"group": "example.io", "version": "v1", "kind": "Widget"},
+            "scope": "Namespaced", "verbs": ["get", "list", "watch"],
+            "subresources": [{"subresource": "scale", "verbs": ["get", "patch", "update"]}]
+        })).unwrap();
+        let descriptor = descriptor_from_aggregated_resource("example.io", "v1", resource).unwrap();
+        assert!(descriptor.is_scalable());
+    }
+
+    #[test]
+    fn legacy_discovery_pairs_scale_with_parent_without_listing_subresources() {
+        let list: APIResourceList = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "APIResourceList", "groupVersion": "example.io/v1",
+            "resources": [
+                {"name": "widgets", "singularName": "widget", "namespaced": false, "kind": "Widget", "verbs": ["list", "get"]},
+                {"name": "widgets/scale", "singularName": "", "namespaced": false, "kind": "Scale", "verbs": ["get", "patch"]},
+                {"name": "others", "singularName": "other", "namespaced": false, "kind": "Other", "verbs": ["list", "get"]}
+            ]
+        })).unwrap();
+        let descriptors = descriptors_from_legacy_list(list);
+        assert_eq!(descriptors.len(), 2);
+        assert!(descriptors[0].is_scalable());
+        assert!(!descriptors[1].is_scalable());
     }
 
     #[test]

@@ -24,6 +24,8 @@ pub type KuxTerminal = Terminal<CrosstermBackend<Stdout>>;
 
 pub struct TerminalGuard {
     terminal: KuxTerminal,
+    #[cfg(unix)]
+    foreground_interrupt: Option<tokio::signal::unix::Signal>,
 }
 
 impl TerminalGuard {
@@ -41,7 +43,11 @@ impl TerminalGuard {
             cursor::Hide
         )?;
         let terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-        Ok(Self { terminal })
+        Ok(Self {
+            terminal,
+            #[cfg(unix)]
+            foreground_interrupt: None,
+        })
     }
 
     pub const fn terminal_mut(&mut self) -> &mut KuxTerminal {
@@ -52,8 +58,14 @@ impl TerminalGuard {
     ///
     /// # Errors
     ///
-    /// Returns an error when raw mode or terminal commands cannot be updated.
+    /// Returns an error when interrupt handling, raw mode, or terminal commands cannot be updated.
     pub fn suspend(&mut self) -> Result<()> {
+        // Register before restoring canonical terminal input: Ctrl-C is delivered
+        // to both Kux and its child in their shared foreground process group.
+        #[cfg(unix)]
+        if self.foreground_interrupt.is_none() {
+            self.foreground_interrupt = Some(register_foreground_interrupt()?);
+        }
         disable_raw_mode()?;
         execute!(
             self.terminal.backend_mut(),
@@ -98,6 +110,10 @@ impl TerminalGuard {
             cursor::Hide
         )?;
         force_full_redraw(&mut self.terminal)?;
+        #[cfg(unix)]
+        {
+            self.foreground_interrupt = None;
+        }
         Ok(())
     }
 
@@ -117,6 +133,12 @@ impl TerminalGuard {
         )?;
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn register_foreground_interrupt() -> io::Result<tokio::signal::unix::Signal> {
+    tokio::runtime::Handle::try_current().map_err(io::Error::other)?;
+    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
 }
 
 fn force_full_redraw<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
@@ -200,5 +222,42 @@ mod tests {
             .expect("redraw");
 
         assert_eq!(terminal.backend().buffer(), &Buffer::with_lines(["abc"]));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn foreground_interrupt_reaches_child_without_terminating_kux() {
+        use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+
+        const CHILD_MARKER: &str = "KUX_TEST_FOREGROUND_INTERRUPT_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let _interrupt = super::register_foreground_interrupt().expect("register SIGINT");
+            let status = tokio::process::Command::new("/bin/sh")
+                .args(["-c", "kill -INT 0; exit 17"])
+                .status()
+                .await
+                .expect("start foreground child");
+            assert_eq!(status.signal(), Some(libc::SIGINT));
+            return;
+        }
+
+        // Isolate signal registration and group delivery from the test runner.
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "terminal::tests::foreground_interrupt_reaches_child_without_terminating_kux",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .process_group(0)
+            .output()
+            .expect("run isolated SIGINT test");
+        assert!(
+            output.status.success(),
+            "isolated interrupt test failed: {:?}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

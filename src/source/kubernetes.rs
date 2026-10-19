@@ -18,12 +18,11 @@ use k8s_openapi::api::{
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, Time};
 use kube::{
-    Api, Client, Config, Resource, ResourceExt,
+    Api, Client, Resource, ResourceExt,
     api::{
         DeleteParams, EvictParams, ListParams, LogParams, Patch, PatchParams, Preconditions,
         WatchParams,
     },
-    config::KubeConfigOptions,
     core::{ApiResource, DynamicObject, GroupVersionKind, Request, WatchEvent},
     runtime::{WatchStreamExt, watcher},
 };
@@ -39,17 +38,27 @@ use crate::{
         ActionIntent, ContainerTarget, ContentKind, NodeDrainFlags, NodeDrainOptions,
         ResourceTarget,
     },
+    connection::ConnectionOptions,
     model::{
         ChildResourceData, ContainerData, NamespaceInfo, NodeData, OwnerReferenceData, PodData,
-        PolicyData, PortForwardPort, ResourceData, ResourceDescriptor, ResourceKind,
-        ResourceOperations, ResourceRow, ResourceSnapshot, SourceState, TableCell, TableColumn,
+        PolicyData, PortForwardPort, ResourceData, ResourceDescriptor, ResourceKind, ResourceRow,
+        ResourceSnapshot, SourceState, TableCell, TableColumn,
     },
 };
 
 use super::{
     ActionRequest, ActionResult, KubernetesSettings, WatchRequest, YamlContent,
-    discovery::discover_resources, logs::LogTask,
+    discovery::discover_resources, logs::LogTask, refresh::RefreshSchedule,
 };
+
+#[path = "workload_actions.rs"]
+pub(super) mod workload_actions;
+
+#[path = "resource_views.rs"]
+pub(crate) mod resource_views;
+
+#[path = "xray.rs"]
+pub(crate) mod xray;
 
 struct PodWatchCache {
     context: String,
@@ -60,6 +69,7 @@ struct PodWatchCache {
 impl PodWatchCache {
     fn spawn(client: Client, settings: KubernetesSettings, context: String) -> Self {
         let request = WatchRequest {
+            instance: None,
             generation: 0,
             context: context.clone(),
             kind: ResourceKind::Pods.into(),
@@ -94,6 +104,7 @@ impl PodWatchCache {
 
 fn is_all_namespace_pod_request(request: &WatchRequest, context: &str) -> bool {
     request.context == context
+        && request.instance.is_none()
         && request.kind.known_kind() == Some(ResourceKind::Pods)
         && request.namespace.is_none()
         && request.field_selector.is_none()
@@ -135,7 +146,7 @@ pub async fn run_manager(
                     task.abort();
                 }
                 if request.context != active_context {
-                    match client_for_context(&request.context).await {
+                    match client_for_context_with(&settings.connection, &request.context).await {
                         Ok(next_client) => {
                             client = next_client;
                             active_context.clone_from(&request.context);
@@ -186,9 +197,16 @@ pub async fn run_manager(
                 }
             }
             Some(action) = actions.recv() => {
+                sync_renamed_active_context(
+                    &action.intent,
+                    &mut active_context,
+                    &mut active_request,
+                    &mut pod_cache,
+                );
                 dispatch_action(
                     client.clone(),
-                    active_context.clone(),
+                    active_request.as_ref(),
+                    settings.connection.clone(),
                     action,
                     action_results.clone(),
                     &mut running_read_action,
@@ -207,14 +225,46 @@ pub async fn run_manager(
     }
 }
 
+fn sync_renamed_active_context(
+    intent: &ActionIntent,
+    active_context: &mut String,
+    active_request: &mut Option<WatchRequest>,
+    pod_cache: &mut PodWatchCache,
+) {
+    if let ActionIntent::RenameContext { old_name, new_name } = intent
+        && active_context == old_name
+    {
+        active_context.clone_from(new_name);
+        if let Some(req) = active_request.as_mut() {
+            req.context.clone_from(new_name);
+        }
+        pod_cache.context.clone_from(new_name);
+    }
+}
+
 fn dispatch_action(
     client: Client,
-    context: String,
+    active_request: Option<&WatchRequest>,
+    connection: ConnectionOptions,
     action: ActionRequest,
     results: mpsc::Sender<ActionResult>,
     running_read: &mut Option<tokio::task::JoinHandle<()>>,
     running_logs: &mut Option<LogTask>,
 ) {
+    let Some(request) = active_request.filter(|request| request.generation == action.generation)
+    else {
+        let message =
+            "Action canceled because the active view changed; retry in the current view".to_owned();
+        if let Err(mpsc::error::TrySendError::Full(result)) =
+            results.try_send(action.rejected(message))
+        {
+            tokio::spawn(async move {
+                let _ = results.send(result).await;
+            });
+        }
+        return;
+    };
+    let context = request.context.clone();
     match &action.intent {
         ActionIntent::StartLogs { request } => {
             if let Some(task) = running_read.take() {
@@ -222,18 +272,24 @@ fn dispatch_action(
             }
             *running_logs = Some(LogTask::spawn(
                 client,
+                connection,
                 action.generation,
                 request.clone(),
                 results,
             ));
         }
         ActionIntent::StopLogs { id } => LogTask::stop_if_matching(running_logs, *id),
+        ActionIntent::StopContentRefresh => {
+            if let Some(task) = running_read.take() {
+                task.abort();
+            }
+        }
         _ => {
             let cancelable = action.intent.cancelable_read();
             if cancelable {
                 running_logs.take();
             }
-            let task = spawn_action_task(client, context, action, results, cancelable);
+            let task = spawn_action_task(client, context, connection, action, results, cancelable);
             if cancelable && let Some(previous) = running_read.replace(task) {
                 previous.abort();
             }
@@ -244,12 +300,20 @@ fn dispatch_action(
 fn spawn_action_task(
     client: Client,
     context: String,
+    connection: ConnectionOptions,
     action: ActionRequest,
     action_results: mpsc::Sender<ActionResult>,
     scoped: bool,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let result = handle_action(client, &context, action.intent).await;
+        let scoped = scoped
+            || matches!(
+                &action.intent,
+                ActionIntent::SetImages { .. }
+                    | ActionIntent::SanitizePods { .. }
+                    | ActionIntent::Rollback { .. }
+            );
+        let result = handle_action(client, &context, &connection, action.intent).await;
         let result = if scoped {
             ActionResult::Scoped {
                 generation: action.generation,
@@ -281,7 +345,7 @@ fn refresh_cluster_metadata(
                 .send(ActionResult::ServerVersion(version.git_version))
                 .await;
         }
-        let Ok(namespaces) = Api::<Namespace>::all(client)
+        let Ok(namespaces) = Api::<Namespace>::all(client.clone())
             .list(&ListParams::default())
             .await
         else {
@@ -297,6 +361,39 @@ fn refresh_cluster_metadata(
                 namespaces,
             })
             .await;
+        if let (Ok(nodes), Ok(node_metrics)) = (
+            Api::<Node>::all(client.clone())
+                .list(&ListParams::default())
+                .await,
+            fetch_node_metrics(client).await,
+        ) {
+            let mut alloc_cpu = 0_u64;
+            let mut alloc_mem = 0_u64;
+            for node in &nodes.items {
+                let row = node_row(node);
+                if let Some(nd) = row.node_data() {
+                    alloc_cpu = alloc_cpu.saturating_add(nd.cpu_allocatable_millis);
+                    alloc_mem = alloc_mem.saturating_add(nd.memory_allocatable_bytes);
+                }
+            }
+            let mut curr_cpu = 0_u64;
+            let mut curr_mem = 0_u64;
+            for usage in node_metrics.values() {
+                curr_cpu = curr_cpu.saturating_add(usage.cpu_millis.unwrap_or(0));
+                curr_mem = curr_mem.saturating_add(usage.memory_bytes.unwrap_or(0));
+            }
+            let cpu = curr_cpu
+                .saturating_mul(100)
+                .checked_div(alloc_cpu)
+                .map_or_else(|| "n/a".to_owned(), |pct| format!("{pct}%"));
+            let mem = curr_mem
+                .saturating_mul(100)
+                .checked_div(alloc_mem)
+                .map_or_else(|| "n/a".to_owned(), |pct| format!("{pct}%"));
+            let _ = action_results
+                .send(ActionResult::ClusterMetrics { cpu, mem })
+                .await;
+        }
     });
 }
 
@@ -316,19 +413,16 @@ fn namespace_info(namespace: &Namespace) -> NamespaceInfo {
     )
 }
 
-async fn client_for_context(context: &str) -> Result<Client, String> {
-    let config = Config::from_kubeconfig(&KubeConfigOptions {
-        context: Some(context.to_owned()),
-        ..KubeConfigOptions::default()
-    })
-    .await
-    .map_err(|error| format!("Unable to load context {context:?}: {error}"))?;
-    let client = Client::try_from(config)
-        .map_err(|error| format!("Unable to create client for context {context:?}: {error}"))?;
-    client
-        .apiserver_version()
-        .await
-        .map_err(|error| format!("Unable to authenticate context {context:?}: {error}"))?;
+async fn client_for_context_with(
+    connection: &ConnectionOptions,
+    context: &str,
+) -> Result<Client, String> {
+    let client = connection.client(Some(context)).await?;
+    client.apiserver_version().await.map_err(|error| {
+        connection.redact(&format!(
+            "Unable to authenticate context {context:?}: {error}"
+        ))
+    })?;
     Ok(client)
 }
 
@@ -342,6 +436,50 @@ async fn run_watch(
         request.generation,
         request.kind.clone(),
     ));
+    if request.instance.is_some() {
+        resource_views::run_instance(client, settings, request, snapshots).await;
+        return;
+    }
+    if request.kind.is_workloads() {
+        resource_views::run_workloads(client, settings, request, snapshots).await;
+        return;
+    }
+    if let Some(kind) = request.kind.subject_kind() {
+        resource_views::run_subjects(client, settings, request, snapshots, kind).await;
+        return;
+    }
+    if request.kind.is_helm() {
+        resource_views::run_helm(client, settings, request, snapshots).await;
+        return;
+    }
+    if request.kind.is_helm_history() {
+        resource_views::run_helm_history(client, settings, request, snapshots).await;
+        return;
+    }
+    if request.kind.is_dir() {
+        resource_views::run_dir(client, settings, request, snapshots).await;
+        return;
+    }
+    if request.kind.is_benchmarks() {
+        resource_views::run_benchmarks(client, settings, request, snapshots).await;
+        return;
+    }
+    if request.kind.is_pulses() {
+        resource_views::run_pulses(client, settings, request, snapshots).await;
+        return;
+    }
+    if request.kind.is_xray() {
+        resource_views::run_xray(client, settings, request, snapshots).await;
+        return;
+    }
+    if request.kind.is_scans() {
+        resource_views::run_scans(client, settings, request, snapshots).await;
+        return;
+    }
+    if request.kind.is_skins() {
+        resource_views::run_skins(client, settings, request, snapshots).await;
+        return;
+    }
     match request.kind.known_kind() {
         Some(ResourceKind::Pods) => {
             let api = namespaced_api::<Pod>(client.clone(), request.namespace.as_deref());
@@ -425,41 +563,86 @@ fn dynamic_api(
     }
 }
 
-async fn handle_action(client: Client, context: &str, action: ActionIntent) -> ActionResult {
-    let result = match action {
+async fn handle_action(
+    client: Client,
+    context: &str,
+    connection: &ConnectionOptions,
+    action: ActionIntent,
+) -> ActionResult {
+    execute_action_intent(client, context, connection, action)
+        .await
+        .unwrap_or_else(|error| ActionResult::Error(connection.redact(&error)))
+}
+
+#[allow(clippy::too_many_lines)]
+async fn execute_action_intent(
+    client: Client,
+    context: &str,
+    connection: &ConnectionOptions,
+    action: ActionIntent,
+) -> Result<ActionResult, String> {
+    match action {
+        ActionIntent::LoadBatchNavigation { id, target } => {
+            Ok(batch_navigation_result(client, connection, id, target).await)
+        }
+        ActionIntent::LoadReferences { id, target } => {
+            Ok(references_result(client, connection, id, target).await)
+        }
+        ActionIntent::LoadDeploymentSelector {
+            id,
+            target,
+            replica_sets,
+        } => Ok(deployment_selector_result(client, connection, id, target, replica_sets).await),
+        ActionIntent::LoadRollback { id, target } => {
+            Ok(load_rollback_result(client, connection, id, target).await)
+        }
+        ActionIntent::Rollback { snapshot } => {
+            Ok(rollback_result(client, connection, &snapshot).await)
+        }
+        ActionIntent::LoadTransferPod { id, target } => {
+            Ok(transfer_pod_result(client, connection, id, target).await)
+        }
+        ActionIntent::SanitizePods { namespace } => {
+            Ok(sanitize_result(client, connection, namespace).await)
+        }
+        ActionIntent::LoadImages { id, target } => {
+            let result = super::image_actions::load_images(client, &target)
+                .await
+                .map_err(|error| connection.redact(&error));
+            Ok(ActionResult::Images { id, target, result })
+        }
+        ActionIntent::SetImages { snapshot, images } => {
+            Ok(update_images_result(client, connection, snapshot, &images).await)
+        }
         ActionIntent::Delete { targets, immediate } => {
-            delete_resources(client, targets, immediate).await
+            delete_resources(client, connection, context, targets, immediate).await
         }
-        ActionIntent::DeleteContext { name } => delete_context(context, &name).await,
-        ActionIntent::Content { target, content } => {
-            fetch_content(client, context, &target, content).await
+        ActionIntent::DeleteContext { name } => delete_context(connection, context, &name).await,
+        ActionIntent::RenameContext { old_name, new_name } => {
+            rename_context(connection, context, &old_name, &new_name).await
         }
+        ActionIntent::Content {
+            id,
+            target,
+            content,
+        } => Ok(open_content(client, context, connection, id, target, content).await),
         ActionIntent::RefreshYaml {
             id,
             target,
             include_managed_fields,
-        } => {
-            let result = tokio::time::timeout(Duration::from_secs(10), async {
-                let object = dynamic_target_api(client, &target)?
-                    .get(&target.name)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let target = target.clone();
-                tokio::task::spawn_blocking(move || {
-                    yaml_content_with_managed_fields(object, &target, include_managed_fields)
-                })
-                .await
-                .map_err(|error| format!("Unable to format YAML: {error}"))?
-            })
-            .await
-            .unwrap_or_else(|_| Err("request timed out".to_owned()));
-            Ok(ActionResult::RefreshedYaml { id, target, result })
-        }
+        } => Ok(refresh_yaml(client, connection, id, target, include_managed_fields).await),
         ActionIntent::ManagedYaml {
+            id,
             target,
             body,
             decoded_body,
-        } => fetch_managed_yaml(client, target, body, decoded_body).await,
+        } => Ok(managed_yaml_result(client, connection, id, target, body, decoded_body).await),
+        ActionIntent::RefreshDescribe { id, target } => {
+            Ok(refresh_describe(connection, context, id, target).await)
+        }
+        ActionIntent::StopContentRefresh => {
+            Err("Content refresh cancellation is handled by the source manager".to_owned())
+        }
         ActionIntent::Containers { target } => load_containers(client, target).await,
         ActionIntent::ContainerLogs { target, previous } => {
             fetch_container_logs(client, target, previous).await
@@ -475,13 +658,230 @@ async fn handle_action(client: Client, context: &str, action: ActionIntent) -> A
         }
         ActionIntent::ResolveOwner { target } => resolve_owner(client, target).await,
         ActionIntent::Restart { targets } => restart_workloads(client, targets).await,
+        ActionIntent::Scale { targets, replicas } => {
+            workload_actions::scale_workloads(client, targets, replicas).await
+        }
+        ActionIntent::TriggerCronJob { targets } => {
+            workload_actions::trigger_cronjobs(client, targets).await
+        }
+        ActionIntent::ToggleCronJobSuspend { target } => {
+            workload_actions::toggle_cronjob_suspend(client, target).await
+        }
+        ActionIntent::SetSuspended { targets, suspended } => {
+            workload_actions::set_suspended(client, targets, suspended).await
+        }
         ActionIntent::SetNodeUnschedulable {
             name,
             unschedulable,
         } => set_node_unschedulable(client, &name, unschedulable).await,
         ActionIntent::DrainNode { name, options } => drain_node(client, &name, options).await,
-    };
-    result.unwrap_or_else(ActionResult::Error)
+        ActionIntent::HelmRollback {
+            namespace,
+            release,
+            revision,
+        } => helm_rollback(connection, context, &namespace, &release, &revision).await,
+        ActionIntent::DirApply { path } => {
+            dir_kubectl_action(connection, context, "apply", &path).await
+        }
+        ActionIntent::DirDelete { path } => {
+            dir_kubectl_action(connection, context, "delete", &path).await
+        }
+    }
+}
+
+async fn batch_navigation_result(
+    client: Client,
+    connection: &ConnectionOptions,
+    id: u64,
+    target: ResourceTarget,
+) -> ActionResult {
+    let result = match connection.api_call_timeout() {
+        Ok(timeout) => super::batch_navigation::load_navigation(client, &target, timeout).await,
+        Err(error) => Err(error),
+    }
+    .map_err(|error| connection.redact(&error));
+    ActionResult::BatchNavigation { id, target, result }
+}
+
+async fn references_result(
+    client: Client,
+    connection: &ConnectionOptions,
+    id: u64,
+    target: ResourceTarget,
+) -> ActionResult {
+    let result = match connection.api_call_timeout() {
+        Ok(timeout) => super::references::scan_references(client, &target, timeout).await,
+        Err(error) => Err(error),
+    }
+    .map(|mut report| {
+        report.errors = report
+            .errors
+            .into_iter()
+            .map(|error| connection.redact(&error).chars().take(1_024).collect())
+            .collect();
+        report
+    })
+    .map_err(|error| connection.redact(&error));
+    ActionResult::References { id, target, result }
+}
+
+async fn transfer_pod_result(
+    client: Client,
+    connection: &ConnectionOptions,
+    id: u64,
+    target: ResourceTarget,
+) -> ActionResult {
+    let result = crate::transfer::load_pod(client, &target)
+        .await
+        .map_err(|error| connection.redact(&error));
+    ActionResult::TransferPod { id, target, result }
+}
+
+async fn managed_yaml_result(
+    client: Client,
+    connection: &ConnectionOptions,
+    id: u64,
+    target: ResourceTarget,
+    body: String,
+    decoded_body: Option<String>,
+) -> ActionResult {
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        fetch_managed_yaml(client, &target, body, decoded_body),
+    )
+    .await
+    .unwrap_or_else(|_| Err("request timed out".to_owned()))
+    .map_err(|error| connection.redact(&error));
+    ActionResult::ManagedYaml { id, target, result }
+}
+
+async fn load_rollback_result(
+    client: Client,
+    connection: &ConnectionOptions,
+    id: u64,
+    target: ResourceTarget,
+) -> ActionResult {
+    let result = super::rollback::load_snapshot(client, &target)
+        .await
+        .map_err(|error| connection.redact(&error));
+    ActionResult::RollbackLoaded { id, target, result }
+}
+
+async fn deployment_selector_result(
+    client: Client,
+    connection: &ConnectionOptions,
+    id: u64,
+    target: ResourceTarget,
+    replica_sets: bool,
+) -> ActionResult {
+    let result = super::deployment_navigation::load_selector(client, &target)
+        .await
+        .map_err(|error| connection.redact(&error));
+    ActionResult::DeploymentSelector {
+        id,
+        target,
+        replica_sets,
+        result,
+    }
+}
+
+async fn rollback_result(
+    client: Client,
+    connection: &ConnectionOptions,
+    snapshot: &super::RollbackSnapshot,
+) -> ActionResult {
+    let result = match connection.api_call_timeout() {
+        Ok(timeout) => super::rollback::rollback(client, snapshot, timeout).await,
+        Err(error) => Err(error),
+    }
+    .map_err(|error| connection.redact(&error));
+    ActionResult::RolledBack { result }
+}
+
+async fn update_images_result(
+    client: Client,
+    connection: &ConnectionOptions,
+    snapshot: super::ImageSnapshot,
+    images: &[super::ContainerImage],
+) -> ActionResult {
+    let result = super::image_actions::update_images(client, &snapshot, images)
+        .await
+        .map(|changed| {
+            format!(
+                "Updated {changed} container image(s) on {} {}",
+                snapshot.target.kind.kind,
+                resource_identity(&snapshot.target),
+            )
+        })
+        .map_err(|error| connection.redact(&error));
+    ActionResult::ImagesUpdated {
+        target: snapshot.target,
+        result,
+    }
+}
+
+async fn sanitize_result(
+    client: Client,
+    connection: &ConnectionOptions,
+    namespace: Option<String>,
+) -> ActionResult {
+    let result = match connection.api_call_timeout() {
+        Ok(timeout) => super::pod_actions::sanitize_pods(client, namespace.clone(), timeout).await,
+        Err(error) => Err(error),
+    }
+    .map(|mut report| {
+        report.failure = report.failure.map(|error| connection.redact(&error));
+        report
+    })
+    .map_err(|error| connection.redact(&error));
+    ActionResult::Sanitized { namespace, result }
+}
+
+async fn open_content(
+    client: Client,
+    context: &str,
+    connection: &ConnectionOptions,
+    id: u64,
+    target: ResourceTarget,
+    kind: ContentKind,
+) -> ActionResult {
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        fetch_content(client, context, connection, &target, kind),
+    )
+    .await
+    .unwrap_or_else(|_| Err("request timed out".to_owned()))
+    .unwrap_or_else(|error| ActionResult::Error(connection.redact(&error)));
+    ActionResult::OpenedContent {
+        id,
+        target,
+        result: Box::new(result),
+    }
+}
+
+async fn refresh_yaml(
+    client: Client,
+    connection: &ConnectionOptions,
+    id: u64,
+    target: ResourceTarget,
+    include_managed_fields: bool,
+) -> ActionResult {
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        let object = dynamic_target_api(client, &target)?
+            .get(&target.name)
+            .await
+            .map_err(|error| error.to_string())?;
+        let target = target.clone();
+        tokio::task::spawn_blocking(move || {
+            yaml_content_with_managed_fields(object, &target, include_managed_fields)
+        })
+        .await
+        .map_err(|error| format!("Unable to format YAML: {error}"))?
+    })
+    .await
+    .unwrap_or_else(|_| Err("request timed out".to_owned()))
+    .map_err(|error| connection.redact(&error));
+    ActionResult::RefreshedYaml { id, target, result }
 }
 
 async fn resolve_owner(client: Client, target: ResourceTarget) -> Result<ActionResult, String> {
@@ -586,6 +986,8 @@ async fn resource_has_owner(
 
 async fn delete_resources(
     client: Client,
+    connection: &ConnectionOptions,
+    context: &str,
     targets: Vec<ResourceTarget>,
     immediate: bool,
 ) -> Result<ActionResult, String> {
@@ -597,9 +999,14 @@ async fn delete_resources(
     let first_identity = resource_identity(first);
     let tasks = targets.into_iter().map(|target| {
         let client = client.clone();
+        let connection = connection.clone();
+        let context = context.to_owned();
         async move {
             let identity = resource_identity(&target);
-            (identity, delete_resource(client, &target, immediate).await)
+            (
+                identity,
+                delete_resource(client, &connection, &context, &target, immediate).await,
+            )
         }
     });
     let results = futures::stream::iter(tasks)
@@ -1057,9 +1464,45 @@ fn resource_identity(target: &ResourceTarget) -> String {
 
 async fn delete_resource(
     client: Client,
+    connection: &ConnectionOptions,
+    context: &str,
     target: &ResourceTarget,
     immediate: bool,
 ) -> Result<(), String> {
+    if target.kind.is_helm() {
+        let ns = target.namespace.as_deref().unwrap_or("default");
+        let mut args = connection.helm_args(Some(context));
+        args.extend(
+            ["uninstall", &target.name, "-n", ns]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        );
+        let output = Command::new("helm")
+            .args(args)
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|error| format!("Unable to run helm uninstall: {error}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            return Err(if stderr.is_empty() {
+                format!("helm uninstall failed with {}", output.status)
+            } else {
+                connection.redact(&stderr)
+            });
+        }
+        return Ok(());
+    }
+    if target.kind.is_benchmarks() {
+        let path = target.name.clone();
+        tokio::task::spawn_blocking(move || {
+            std::fs::remove_file(&path)
+                .map_err(|error| format!("Unable to delete benchmark report {path}: {error}"))
+        })
+        .await
+        .map_err(|error| format!("Benchmark delete task failed: {error}"))??;
+        return Ok(());
+    }
     ensure_deletable(target)?;
     let mut params = DeleteParams::background();
     if immediate {
@@ -1082,9 +1525,68 @@ fn context_delete_args(name: &str) -> [&str; 3] {
     ["config", "delete-context", name]
 }
 
-async fn delete_context(active_context: &str, name: &str) -> Result<ActionResult, String> {
+fn context_delete_args_with(connection: &ConnectionOptions, name: &str) -> Vec<std::ffi::OsString> {
+    let mut args = connection.kubectl_args(None);
+    args.extend(context_delete_args(name).map(std::ffi::OsString::from));
+    args
+}
+
+fn context_rename_args<'a>(old_name: &'a str, new_name: &'a str) -> [&'a str; 4] {
+    ["config", "rename-context", old_name, new_name]
+}
+
+fn context_rename_args_with(
+    connection: &ConnectionOptions,
+    old_name: &str,
+    new_name: &str,
+) -> Vec<std::ffi::OsString> {
+    let mut args = connection.kubectl_args(None);
+    args.extend(context_rename_args(old_name, new_name).map(std::ffi::OsString::from));
+    args
+}
+
+async fn rename_context(
+    connection: &ConnectionOptions,
+    active_context: &str,
+    old_name: &str,
+    new_name: &str,
+) -> Result<ActionResult, String> {
     let output = Command::new("kubectl")
-        .args(context_delete_args(name))
+        .args(context_rename_args_with(connection, old_name, new_name))
+        .output()
+        .await
+        .map_err(|error| format!("Unable to run kubectl config rename-context: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if stderr.is_empty() {
+            format!(
+                "kubectl config rename-context failed with {}",
+                output.status
+            )
+        } else {
+            connection.redact(&stderr)
+        });
+    }
+    let next_active = if active_context == old_name {
+        new_name
+    } else {
+        active_context
+    };
+    let catalog = crate::kubeconfig::read_contexts_with(connection, Some(next_active))?;
+    Ok(ActionResult::ContextOptions {
+        context: next_active.to_owned(),
+        contexts: catalog.contexts,
+        notice: format!("Renamed context {old_name} to {new_name}"),
+    })
+}
+
+async fn delete_context(
+    connection: &ConnectionOptions,
+    active_context: &str,
+    name: &str,
+) -> Result<ActionResult, String> {
+    let output = Command::new("kubectl")
+        .args(context_delete_args_with(connection, name))
         .output()
         .await
         .map_err(|error| format!("Unable to run kubectl config delete-context: {error}"))?;
@@ -1096,10 +1598,10 @@ async fn delete_context(active_context: &str, name: &str) -> Result<ActionResult
                 output.status
             )
         } else {
-            stderr
+            connection.redact(&stderr)
         });
     }
-    let catalog = crate::kubeconfig::read_contexts(Some(active_context))?;
+    let catalog = crate::kubeconfig::read_contexts_with(connection, Some(active_context))?;
     Ok(ActionResult::ContextOptions {
         context: active_context.to_owned(),
         contexts: catalog.contexts,
@@ -1124,14 +1626,24 @@ where
 async fn fetch_content(
     client: Client,
     context: &str,
+    connection: &ConnectionOptions,
     target: &ResourceTarget,
     content_kind: ContentKind,
 ) -> Result<ActionResult, String> {
+    if target.kind.is_helm() || target.kind.is_helm_history() {
+        return fetch_helm_content(connection, context, target, content_kind).await;
+    }
+    if target.kind.is_dir() {
+        return fetch_dir_content(target, content_kind).await;
+    }
+    if target.kind.is_benchmarks() {
+        return fetch_benchmark_content(target, content_kind).await;
+    }
     if content_kind == ContentKind::SecretData {
         return fetch_secret_data(client, target).await;
     }
     if content_kind == ContentKind::Describe {
-        return describe_resource(context, target).await;
+        return describe_resource(connection, context, target).await;
     }
     if matches!(content_kind, ContentKind::Logs | ContentKind::PreviousLogs) {
         if target.kind.known_kind() != Some(ResourceKind::Pods) {
@@ -1179,24 +1691,19 @@ async fn fetch_content(
 
 async fn fetch_managed_yaml(
     client: Client,
-    target: ResourceTarget,
+    target: &ResourceTarget,
     body: String,
     decoded_body: Option<String>,
-) -> Result<ActionResult, String> {
-    let object = dynamic_target_api(client, &target)?
+) -> Result<(String, Option<String>), String> {
+    let object = dynamic_target_api(client, target)?
         .get(&target.name)
         .await
         .map_err(|error| error.to_string())?;
-    let (body, decoded_body) = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         managed_yaml_content_from_object(&object, &body, decoded_body.as_deref())
     })
     .await
-    .map_err(|error| format!("Unable to format managed-fields YAML: {error}"))??;
-    Ok(ActionResult::ManagedYaml {
-        target,
-        body,
-        decoded_body,
-    })
+    .map_err(|error| format!("Unable to format managed-fields YAML: {error}"))?
 }
 
 fn managed_yaml_content_from_object(
@@ -1282,9 +1789,34 @@ fn secret_data_content(
     })
 }
 
-async fn describe_resource(context: &str, target: &ResourceTarget) -> Result<ActionResult, String> {
+async fn refresh_describe(
+    connection: &ConnectionOptions,
+    context: &str,
+    id: u64,
+    target: ResourceTarget,
+) -> ActionResult {
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        describe_resource(connection, context, &target),
+    )
+    .await
+    .unwrap_or_else(|_| Err("request timed out".to_owned()))
+    .and_then(|result| match result {
+        ActionResult::Content { body, .. } => Ok(body),
+        _ => Err("Describe returned no content".to_owned()),
+    })
+    .map_err(|error| connection.redact(&error));
+    ActionResult::RefreshedDescribe { id, target, result }
+}
+
+async fn describe_resource(
+    connection: &ConnectionOptions,
+    context: &str,
+    target: &ResourceTarget,
+) -> Result<ActionResult, String> {
     let output = Command::new("kubectl")
-        .args(describe_args(context, target))
+        .args(describe_args_with(connection, context, target))
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|error| format!("Unable to run kubectl describe: {error}"))?;
@@ -1293,7 +1825,7 @@ async fn describe_resource(context: &str, target: &ResourceTarget) -> Result<Act
         return Err(if stderr.is_empty() {
             format!("kubectl describe failed with {}", output.status)
         } else {
-            stderr
+            connection.redact(&stderr)
         });
     }
     Ok(ActionResult::Content {
@@ -1320,10 +1852,295 @@ fn describe_args(context: &str, target: &ResourceTarget) -> Vec<String> {
     args
 }
 
+fn describe_args_with(
+    connection: &ConnectionOptions,
+    context: &str,
+    target: &ResourceTarget,
+) -> Vec<std::ffi::OsString> {
+    let mut args = connection.kubectl_args(None);
+    args.extend(
+        describe_args(context, target)
+            .into_iter()
+            .map(std::ffi::OsString::from),
+    );
+    args
+}
+
+async fn run_helm_stdout(
+    connection: &ConnectionOptions,
+    context: &str,
+    sub_args: &[&str],
+) -> Result<String, String> {
+    let mut args = connection.helm_args(Some(context));
+    args.extend(sub_args.iter().map(std::ffi::OsString::from));
+    let output = Command::new("helm")
+        .args(args)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|error| format!("Unable to run helm: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if stderr.is_empty() {
+            format!("helm failed with {}", output.status)
+        } else {
+            connection.redact(&stderr)
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn split_helm_target(target: &ResourceTarget) -> (&str, &str, Option<&str>) {
+    let namespace = target.namespace.as_deref().unwrap_or("default");
+    if target.kind.is_helm_history()
+        && let Some((release, rev)) = target.name.split_once(':')
+    {
+        (namespace, release, Some(rev))
+    } else {
+        (namespace, &target.name, None)
+    }
+}
+
+async fn fetch_helm_content(
+    connection: &ConnectionOptions,
+    context: &str,
+    target: &ResourceTarget,
+    content_kind: ContentKind,
+) -> Result<ActionResult, String> {
+    let (namespace, release, revision) = split_helm_target(target);
+    let rev_suffix = revision.map_or_else(String::new, |rev| format!(":{rev}"));
+    match content_kind {
+        ContentKind::Yaml => {
+            let mut args = vec!["get", "manifest", release, "-n", namespace];
+            if let Some(rev) = revision {
+                args.extend(["--revision", rev]);
+            }
+            let body = run_helm_stdout(connection, context, &args).await?;
+            Ok(ActionResult::Content {
+                title: format!("YAML({namespace}/{release}{rev_suffix})"),
+                body,
+                managed_fields: None,
+                decoded_body: None,
+                decoded_managed_fields: None,
+                content: ContentKind::Yaml,
+            })
+        }
+        ContentKind::Describe => {
+            let mut args = vec!["get", "notes", release, "-n", namespace];
+            if let Some(rev) = revision {
+                args.extend(["--revision", rev]);
+            }
+            let body = run_helm_stdout(connection, context, &args).await?;
+            Ok(ActionResult::Content {
+                title: format!("Describe({namespace}/{release}{rev_suffix})"),
+                body,
+                managed_fields: None,
+                decoded_body: None,
+                decoded_managed_fields: None,
+                content: ContentKind::Describe,
+            })
+        }
+        ContentKind::HelmValues => {
+            let mut user_args = vec!["get", "values", release, "-n", namespace, "-o", "yaml"];
+            let mut all_args = vec![
+                "get", "values", release, "-n", namespace, "--all", "-o", "yaml",
+            ];
+            if let Some(rev) = revision {
+                user_args.extend(["--revision", rev]);
+                all_args.extend(["--revision", rev]);
+            }
+            let (user_values, all_values) = tokio::try_join!(
+                run_helm_stdout(connection, context, &user_args),
+                run_helm_stdout(connection, context, &all_args),
+            )?;
+            Ok(ActionResult::Content {
+                title: format!("Values({namespace}/{release}{rev_suffix})"),
+                body: user_values,
+                managed_fields: None,
+                decoded_body: Some(all_values),
+                decoded_managed_fields: None,
+                content: ContentKind::HelmValues,
+            })
+        }
+        _ => Err("Unsupported content view for Helm release".to_owned()),
+    }
+}
+
+async fn fetch_dir_content(
+    target: &ResourceTarget,
+    content_kind: ContentKind,
+) -> Result<ActionResult, String> {
+    if content_kind != ContentKind::Yaml {
+        return Err("Only YAML view (`y`) is supported for local directory entries".to_owned());
+    }
+    let path = target.name.clone();
+    if std::path::Path::new(&path).extension().is_none() {
+        return Err("Select a manifest file to view YAML".to_owned());
+    }
+    let read_path = path.clone();
+    let body = tokio::task::spawn_blocking(move || {
+        std::fs::read_to_string(&read_path)
+            .map_err(|error| format!("Unable to read {read_path}: {error}"))
+    })
+    .await
+    .map_err(|error| format!("File reader task failed: {error}"))??;
+    Ok(ActionResult::Content {
+        title: format!("YAML({path})"),
+        body,
+        managed_fields: None,
+        decoded_body: None,
+        decoded_managed_fields: None,
+        content: ContentKind::Yaml,
+    })
+}
+
+async fn fetch_benchmark_content(
+    target: &ResourceTarget,
+    content_kind: ContentKind,
+) -> Result<ActionResult, String> {
+    if content_kind != ContentKind::Yaml {
+        return Err("Only report view (`Enter` / `y`) is supported for benchmarks".to_owned());
+    }
+    let path = target.name.clone();
+    let read_path = path.clone();
+    let body = tokio::task::spawn_blocking(move || {
+        std::fs::read_to_string(&read_path)
+            .map_err(|error| format!("Unable to load bench file {read_path}: {error}"))
+    })
+    .await
+    .map_err(|error| format!("Benchmark reader task failed: {error}"))??;
+    let file_name = std::path::Path::new(&path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&path);
+    let tokens: Vec<_> = file_name.split('_').collect();
+    let subject = if tokens.len() >= 2 {
+        format!("{}/{}", tokens[0], tokens[1])
+    } else {
+        file_name.to_owned()
+    };
+    Ok(ActionResult::Content {
+        title: format!("Results({subject})"),
+        body,
+        managed_fields: None,
+        decoded_body: None,
+        decoded_managed_fields: None,
+        content: ContentKind::Yaml,
+    })
+}
+
+async fn helm_rollback(
+    connection: &ConnectionOptions,
+    context: &str,
+    namespace: &str,
+    release: &str,
+    revision: &str,
+) -> Result<ActionResult, String> {
+    let args = ["rollback", release, revision, "-n", namespace];
+    run_helm_stdout(connection, context, &args).await?;
+    Ok(ActionResult::Notice(format!(
+        "Rolled back Helm release {namespace}/{release} to revision {revision}"
+    )))
+}
+
+pub(crate) fn is_kustomized_dir(path: &std::path::Path) -> bool {
+    if !path.is_dir() {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        matches!(
+            entry.file_name().to_str(),
+            Some("Kustomization" | "kustomization.yaml" | "kustomization.yml")
+        )
+    })
+}
+
+pub(crate) fn contains_sub_dir(path: &std::path::Path) -> bool {
+    if !path.is_dir() {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|entry| entry.file_type().is_ok_and(|ft| ft.is_dir()))
+}
+
+pub(crate) fn dir_kubectl_flags(path: &str) -> Vec<&'static str> {
+    let p = std::path::Path::new(path);
+    if is_kustomized_dir(p) {
+        vec!["-k"]
+    } else if contains_sub_dir(p) {
+        vec!["-f", "-R"]
+    } else {
+        vec!["-f"]
+    }
+}
+
+fn format_dir_command_results(output: &str) -> String {
+    output
+        .trim()
+        .lines()
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn dir_kubectl_action(
+    connection: &ConnectionOptions,
+    context: &str,
+    verb: &str,
+    path: &str,
+) -> Result<ActionResult, String> {
+    let mut args = connection.kubectl_args(Some(context));
+    args.push(std::ffi::OsString::from(verb));
+    for flag in dir_kubectl_flags(path) {
+        args.push(std::ffi::OsString::from(flag));
+    }
+    args.push(std::ffi::OsString::from(path));
+    let output = Command::new("kubectl")
+        .args(args)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|error| format!("Unable to run kubectl {verb}: {error}"))?;
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = if output.status.success() {
+        format!("message:\n{}", format_dir_command_results(&combined))
+    } else {
+        format!(
+            "status:\n  {}\nmessage:\n{}",
+            output.status,
+            format_dir_command_results(&combined)
+        )
+    };
+    let label = if verb == "apply" {
+        "Applied Manifest"
+    } else {
+        "Deleted Manifest"
+    };
+    Ok(ActionResult::Content {
+        title: format!("{label}({path})"),
+        body: connection.redact(&body),
+        managed_fields: None,
+        decoded_body: None,
+        decoded_managed_fields: None,
+        content: ContentKind::Yaml,
+    })
+}
+
 #[derive(Debug, Clone, Copy)]
-struct ResourceUsage {
-    cpu_millis: Option<u64>,
-    memory_bytes: Option<u64>,
+pub(super) struct ResourceUsage {
+    pub cpu_millis: Option<u64>,
+    pub memory_bytes: Option<u64>,
 }
 
 enum EnrichmentUpdate {
@@ -1364,9 +2181,13 @@ impl EnrichmentState {
                 data.pods = self.node_pods.get(row.name.as_ref()).copied().unwrap_or(0);
             }
             ResourceData::Generic
+            | ResourceData::Workload { .. }
+            | ResourceData::Reference { .. }
             | ResourceData::ChildResource(_)
             | ResourceData::Container(_)
-            | ResourceData::Policy(_) => {}
+            | ResourceData::Policy(_)
+            | ResourceData::Pulse(_)
+            | ResourceData::XRay(_) => {}
         }
     }
 
@@ -1394,6 +2215,21 @@ struct FastInitialList {
 
 const FAST_INITIAL_LIST_HEAD_START: Duration = Duration::from_secs(5);
 const OWNER_UID_FIELD_SELECTOR_PREFIX: &str = "kux.ownerUID=";
+const OWNER_NAME_FIELD_SELECTOR_PREFIX: &str = "kux.ownerName=";
+const MATCH_NONE_FIELD_SELECTOR: &str = "kux.matchNone=true";
+
+fn owner_name_filter(request: &WatchRequest) -> Option<&str> {
+    request
+        .field_selector
+        .as_deref()
+        .and_then(|selector| selector.strip_prefix(OWNER_NAME_FIELD_SELECTOR_PREFIX))
+}
+
+fn has_local_field_filter(request: &WatchRequest) -> bool {
+    owner_uid_filter(request).is_some()
+        || owner_name_filter(request).is_some()
+        || request.field_selector.as_deref() == Some(MATCH_NONE_FIELD_SELECTOR)
+}
 
 fn owner_uid_filter(request: &WatchRequest) -> Option<&str> {
     request
@@ -1406,7 +2242,7 @@ fn server_field_selector(request: &WatchRequest) -> Option<&str> {
     request
         .field_selector
         .as_deref()
-        .filter(|_| owner_uid_filter(request).is_none())
+        .filter(|_| !has_local_field_filter(request))
 }
 
 fn spawn_fast_initial_list(
@@ -1419,7 +2255,7 @@ fn spawn_fast_initial_list(
     let label_selector = request.label_selector.clone();
     let metadata_free_head = request.namespace.is_none()
         && request.kind.known_kind() == Some(ResourceKind::Pods)
-        && owner_uid_filter(request).is_none();
+        && !has_local_field_filter(request);
     let task = tokio::spawn(async move {
         if metadata_free_head {
             if let Ok(page) = list_table_head(
@@ -1599,22 +2435,22 @@ fn hydrate_fast_initial_row(
                 ..NodeData::default()
             })
         }
-        Some(ResourceKind::Deployments) => {
-            if let Some(selector) = table_selector(columns, &row) {
-                with_child_resource(row, replica_set_descriptor(), selector)
-            } else {
-                row
-            }
-        }
-        Some(ResourceKind::StatefulSets | ResourceKind::DaemonSets | ResourceKind::Services) => {
-            if let Some(selector) = table_selector(columns, &row) {
+        Some(
+            ResourceKind::Deployments
+            | ResourceKind::StatefulSets
+            | ResourceKind::DaemonSets
+            | ResourceKind::Services,
+        ) => {
+            row = remap_fast_table_cells(kind, columns, row);
+            if let Some(selector) = table_selector(&typed_table_columns(kind), &row) {
                 with_child_resource(row, ResourceKind::Pods.into(), selector)
             } else {
                 row
             }
         }
         None if kind.is_apps_v1_replica_set() => {
-            if let Some(selector) = table_selector(columns, &row) {
+            row = remap_fast_table_cells(kind, columns, row);
+            if let Some(selector) = table_selector(&typed_table_columns(kind), &row) {
                 with_child_resource(row, ResourceKind::Pods.into(), selector)
             } else {
                 row
@@ -1622,6 +2458,37 @@ fn hydrate_fast_initial_row(
         }
         _ => row,
     }
+}
+
+fn remap_fast_table_cells(
+    kind: &ResourceDescriptor,
+    server_columns: &[TableColumn],
+    mut row: ResourceRow,
+) -> ResourceRow {
+    let target_cols = typed_table_columns(kind);
+    if target_cols.is_empty() || server_columns.is_empty() {
+        return row;
+    }
+    let cells = target_cols
+        .iter()
+        .map(|target| {
+            if target.name.eq_ignore_ascii_case("age") {
+                return age_cell(row.created_unix);
+            }
+            let text = table_cell_text(server_columns, &row, target.name.as_ref())
+                .map(|s| {
+                    if s == "<none>" {
+                        String::new()
+                    } else {
+                        s.to_owned()
+                    }
+                })
+                .unwrap_or_default();
+            plain_cell(text)
+        })
+        .collect();
+    row.table_cells = cells;
+    row
 }
 
 fn parse_table_age(value: &str) -> Option<u64> {
@@ -1669,11 +2536,13 @@ fn spawn_enrichment_tasks(
         Some(ResourceKind::Pods) => vec![AbortOnDrop(tokio::spawn(pod_metrics_loop(
             client,
             request.namespace.clone(),
+            settings.refresh_interval.clone(),
             updates,
         )))],
         Some(ResourceKind::Nodes) => vec![
             AbortOnDrop(tokio::spawn(node_metrics_loop(
                 client.clone(),
+                settings.refresh_interval.clone(),
                 updates.clone(),
             ))),
             AbortOnDrop(tokio::spawn(node_pod_count_loop(
@@ -1689,10 +2558,10 @@ fn spawn_enrichment_tasks(
 async fn pod_metrics_loop(
     client: Client,
     namespace: Option<String>,
+    refresh: watch::Receiver<Duration>,
     updates: mpsc::Sender<EnrichmentUpdate>,
 ) {
-    let mut ticker = tokio::time::interval(Duration::from_secs(5));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut ticker = RefreshSchedule::new(refresh);
     loop {
         ticker.tick().await;
         if let Ok(usage) = fetch_pod_metrics(client.clone(), namespace.as_deref()).await {
@@ -1701,9 +2570,12 @@ async fn pod_metrics_loop(
     }
 }
 
-async fn node_metrics_loop(client: Client, updates: mpsc::Sender<EnrichmentUpdate>) {
-    let mut ticker = tokio::time::interval(Duration::from_secs(5));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+async fn node_metrics_loop(
+    client: Client,
+    refresh: watch::Receiver<Duration>,
+    updates: mpsc::Sender<EnrichmentUpdate>,
+) {
+    let mut ticker = RefreshSchedule::new(refresh);
     loop {
         ticker.tick().await;
         if let Ok(usage) = fetch_node_metrics(client.clone()).await {
@@ -1712,7 +2584,7 @@ async fn node_metrics_loop(client: Client, updates: mpsc::Sender<EnrichmentUpdat
     }
 }
 
-async fn fetch_pod_metrics(
+pub(super) async fn fetch_pod_metrics(
     client: Client,
     namespace: Option<&str>,
 ) -> Result<FxHashMap<Arc<str>, ResourceUsage>, kube::Error> {
@@ -1764,7 +2636,7 @@ async fn fetch_pod_metrics(
     Ok(usage)
 }
 
-async fn fetch_node_metrics(
+pub(super) async fn fetch_node_metrics(
     client: Client,
 ) -> Result<FxHashMap<Arc<str>, ResourceUsage>, kube::Error> {
     let resource = metrics_resource("NodeMetrics", "nodes");
@@ -1959,6 +2831,13 @@ async fn load_authorization_policy(
                 resolve_policy_references(client, references).await?,
             )
         }
+        "User" | "Group" if target.kind.is_subject() => {
+            let references = subject_references(client.clone(), kind, &target.name).await?;
+            (
+                format!("policy({kind}:{})", target.name),
+                resolve_policy_references(client, references).await?,
+            )
+        }
         "Role" => {
             let namespace = namespace.ok_or_else(|| "Role requires a namespace".to_owned())?;
             let role = Api::<Role>::namespaced(client, namespace)
@@ -2063,6 +2942,41 @@ async fn service_account_references(
     Ok(references)
 }
 
+async fn subject_references(
+    client: Client,
+    subject_kind: &str,
+    name: &str,
+) -> Result<BTreeSet<PolicyReference>, String> {
+    let (mut references, cluster_references) = tokio::try_join!(
+        collect_policy_references(Api::<RoleBinding>::all(client.clone()), |binding| {
+            let matches = binding.subjects.as_deref().is_some_and(|subjects| {
+                subjects
+                    .iter()
+                    .any(|subject| subject_matches(subject, subject_kind, name))
+            });
+            matches
+                .then(|| reference_from_role_binding(binding, false))
+                .transpose()
+        }),
+        collect_policy_references(Api::<ClusterRoleBinding>::all(client), |binding| {
+            let matches = binding.subjects.as_deref().is_some_and(|subjects| {
+                subjects
+                    .iter()
+                    .any(|subject| subject_matches(subject, subject_kind, name))
+            });
+            matches
+                .then(|| reference_from_cluster_role_binding(binding, false))
+                .transpose()
+        })
+    )?;
+    references.extend(cluster_references);
+    Ok(references)
+}
+
+fn subject_matches(subject: &Subject, kind: &str, name: &str) -> bool {
+    subject.kind == kind && subject.name == name
+}
+
 async fn collect_policy_references<K, F>(
     api: Api<K>,
     mut project: F,
@@ -2097,9 +3011,19 @@ fn service_account_subject_matches(
     name: &str,
     binding_namespace: Option<&str>,
 ) -> bool {
-    subject.kind == "ServiceAccount"
-        && subject.name == name
-        && subject.namespace.as_deref().or(binding_namespace) == Some(namespace)
+    if subject.kind == "ServiceAccount" {
+        subject.name == name
+            && subject.namespace.as_deref().or(binding_namespace) == Some(namespace)
+    } else if subject.kind == "Group" {
+        let group = subject.name.as_str();
+        group == "system:authenticated"
+            || group == "system:serviceaccounts"
+            || group
+                .strip_prefix("system:serviceaccounts:")
+                .is_some_and(|ns| ns == namespace)
+    } else {
+        false
+    }
 }
 
 fn reference_from_role_binding(
@@ -2330,12 +3254,64 @@ async fn load_containers(client: Client, target: ResourceTarget) -> Result<Actio
     if target.kind.known_kind() != Some(ResourceKind::Pods) {
         return Err("Container navigation is supported for pods only".to_owned());
     }
-    let pod = namespaced_target_api::<Pod>(client, &target)?
+    let pod = namespaced_target_api::<Pod>(client.clone(), &target)?
         .get(&target.name)
         .await
         .map_err(|error| error.to_string())?;
-    let rows = container_rows(&pod).into_iter().map(Arc::new).collect();
+    let usage = if let Some(ns) = target.namespace.as_deref() {
+        fetch_pod_container_metrics(client, ns, &target.name)
+            .await
+            .ok()
+    } else {
+        None
+    };
+    let rows = load_containers_rows(&pod, usage.as_ref())
+        .into_iter()
+        .map(Arc::new)
+        .collect();
     Ok(ActionResult::Containers { target, rows })
+}
+
+async fn fetch_pod_container_metrics(
+    client: Client,
+    namespace: &str,
+    pod_name: &str,
+) -> Result<FxHashMap<String, ResourceUsage>, kube::Error> {
+    let resource = metrics_resource("PodMetrics", "pods");
+    let api = Api::<DynamicObject>::namespaced_with(client, namespace, &resource);
+    let metric = api.get(pod_name).await?;
+    let Some(containers) = metric
+        .data
+        .get("containers")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Ok(FxHashMap::default());
+    };
+    let mut map = FxHashMap::default();
+    for container in containers {
+        let Some(name) = container.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(usage) = container.get("usage") else {
+            continue;
+        };
+        let cpu_millis = usage
+            .get("cpu")
+            .and_then(serde_json::Value::as_str)
+            .and_then(parse_cpu_millis);
+        let memory_bytes = usage
+            .get("memory")
+            .and_then(serde_json::Value::as_str)
+            .and_then(parse_memory_bytes);
+        map.insert(
+            name.to_owned(),
+            ResourceUsage {
+                cpu_millis,
+                memory_bytes,
+            },
+        );
+    }
+    Ok(map)
 }
 
 async fn fetch_container_logs(
@@ -2377,7 +3353,10 @@ fn pod_log_params(container: Option<String>, previous: bool) -> LogParams {
     }
 }
 
-fn container_rows(pod: &Pod) -> Vec<ResourceRow> {
+fn load_containers_rows(
+    pod: &Pod,
+    usage: Option<&FxHashMap<String, ResourceUsage>>,
+) -> Vec<ResourceRow> {
     let Some(spec) = &pod.spec else {
         return Vec::new();
     };
@@ -2389,51 +3368,140 @@ fn container_rows(pod: &Pod) -> Vec<ResourceRow> {
         .as_ref()
         .map_or(0, |time| time.0.as_second());
     let mut rows = Vec::new();
-    for container in &spec.containers {
+    for (idx, container) in spec
+        .init_containers
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+    {
         rows.push(container_row(
             &namespace,
-            &container.name,
-            container.image.as_deref().unwrap_or("-"),
-            "container",
-            status.and_then(|status| status.container_statuses.as_deref()),
-            created_unix,
-        ));
-    }
-    for container in spec.init_containers.as_deref().unwrap_or_default() {
-        rows.push(container_row(
-            &namespace,
-            &container.name,
-            container.image.as_deref().unwrap_or("-"),
+            container,
+            (idx + 1).to_string(),
+            "✓",
             "init",
             status.and_then(|status| status.init_container_statuses.as_deref()),
             created_unix,
+            usage.and_then(|map| map.get(&container.name)).copied(),
         ));
     }
-    for container in spec.ephemeral_containers.as_deref().unwrap_or_default() {
+    for (idx, container) in spec.containers.iter().enumerate() {
         rows.push(container_row(
             &namespace,
-            &container.name,
-            container.image.as_deref().unwrap_or("-"),
+            container,
+            (idx + 1).to_string(),
+            "×",
+            "container",
+            status.and_then(|status| status.container_statuses.as_deref()),
+            created_unix,
+            usage.and_then(|map| map.get(&container.name)).copied(),
+        ));
+    }
+    for (idx, container) in spec
+        .ephemeral_containers
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+    {
+        let ephemeral_as_container = k8s_openapi::api::core::v1::Container {
+            name: container.name.clone(),
+            image: container.image.clone(),
+            liveness_probe: container.liveness_probe.clone(),
+            readiness_probe: container.readiness_probe.clone(),
+            ports: container.ports.clone(),
+            resources: container.resources.clone(),
+            ..k8s_openapi::api::core::v1::Container::default()
+        };
+        rows.push(container_row(
+            &namespace,
+            &ephemeral_as_container,
+            (idx + 1).to_string(),
+            "×",
             "ephemeral",
             status.and_then(|status| status.ephemeral_container_statuses.as_deref()),
             created_unix,
+            usage.and_then(|map| map.get(&container.name)).copied(),
         ));
     }
-    rows.sort_unstable_by(|left, right| left.name.cmp(&right.name));
     rows
 }
 
+#[cfg(test)]
+fn container_rows(pod: &Pod) -> Vec<ResourceRow> {
+    load_containers_rows(pod, None)
+}
+
+fn container_forward_ports(
+    container: &k8s_openapi::api::core::v1::Container,
+) -> Vec<PortForwardPort> {
+    container
+        .ports
+        .iter()
+        .flatten()
+        .filter_map(|port| {
+            let is_tcp = port.protocol.as_deref().unwrap_or("TCP") == "TCP";
+            let port_number = u16::try_from(port.container_port).ok()?;
+            (is_tcp && port_number > 0).then(|| PortForwardPort {
+                container: Some(Arc::from(container.name.as_str())),
+                name: Arc::from(port.name.as_deref().unwrap_or("")),
+                port: port_number,
+            })
+        })
+        .collect()
+}
+
+fn container_ports_display(container: &k8s_openapi::api::core::v1::Container) -> String {
+    container
+        .ports
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|p| {
+            let mut s = String::new();
+            if let Some(name) = p.name.as_deref().filter(|n| !n.is_empty()) {
+                let _ = write!(s, "{name}:");
+            }
+            let _ = write!(s, "{}", p.container_port);
+            if let Some(proto) = p.protocol.as_deref().filter(|pr| *pr != "TCP") {
+                let _ = write!(s, "/{proto}");
+            }
+            s
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[allow(clippy::too_many_arguments)]
 fn container_row(
     namespace: &str,
-    name: &str,
-    image: &str,
+    container: &k8s_openapi::api::core::v1::Container,
+    index: String,
+    init: &str,
     kind: &str,
     statuses: Option<&[ContainerStatus]>,
     created_unix: i64,
+    usage: Option<ResourceUsage>,
 ) -> ResourceRow {
-    let status = statuses.and_then(|statuses| statuses.iter().find(|status| status.name == name));
+    let name = &container.name;
+    let image = container.image.as_deref().unwrap_or("-");
+    let status = statuses.and_then(|statuses| statuses.iter().find(|status| status.name == *name));
     let ready = status.is_some_and(|status| status.ready);
     let restarts = status.map_or(0, |status| status.restart_count.max(0));
+    let liveness = if container.liveness_probe.is_some() {
+        "on"
+    } else {
+        "off"
+    };
+    let readiness = if container.readiness_probe.is_some() {
+        "on"
+    } else {
+        "off"
+    };
+    let probes = format!("{liveness}:{readiness}");
+    let ports_str = container_ports_display(container);
+    let (cpu_req, cpu_lim, mem_req, mem_lim) = container_resource_totals(container);
     ResourceRow::new(
         namespace,
         name,
@@ -2446,7 +3514,51 @@ fn container_row(
         image: Arc::from(image),
         kind: Arc::from(kind),
         restarts: u32::try_from(restarts).unwrap_or(0),
+        index: Arc::from(index),
+        init: Arc::from(init),
+        probes: Arc::from(probes),
+        ports: Arc::from(ports_str),
+        cpu_millis: usage.and_then(|u| u.cpu_millis),
+        cpu_request_millis: cpu_req,
+        cpu_limit_millis: cpu_lim,
+        memory_bytes: usage.and_then(|u| u.memory_bytes),
+        memory_request_bytes: mem_req,
+        memory_limit_bytes: mem_lim,
     })
+    .with_port_forward_ports(container_forward_ports(container))
+}
+
+fn container_resource_totals(
+    container: &k8s_openapi::api::core::v1::Container,
+) -> (u64, u64, u64, u64) {
+    let Some(resources) = &container.resources else {
+        return (0, 0, 0, 0);
+    };
+    let cpu_req = resources
+        .requests
+        .as_ref()
+        .and_then(|v| v.get("cpu"))
+        .and_then(|q| parse_cpu_millis(&q.0))
+        .unwrap_or(0);
+    let cpu_lim = resources
+        .limits
+        .as_ref()
+        .and_then(|v| v.get("cpu"))
+        .and_then(|q| parse_cpu_millis(&q.0))
+        .unwrap_or(0);
+    let mem_req = resources
+        .requests
+        .as_ref()
+        .and_then(|v| v.get("memory"))
+        .and_then(|q| parse_memory_bytes(&q.0))
+        .unwrap_or(0);
+    let mem_lim = resources
+        .limits
+        .as_ref()
+        .and_then(|v| v.get("memory"))
+        .and_then(|q| parse_memory_bytes(&q.0))
+        .unwrap_or(0);
+    (cpu_req, cpu_lim, mem_req, mem_lim)
 }
 
 fn container_status(status: &ContainerStatus) -> String {
@@ -2599,6 +3711,7 @@ fn decoded_secret_value(bytes: &[u8]) -> String {
 
 #[derive(Default)]
 struct TypedWatchState {
+    table_columns: Arc<[TableColumn]>,
     rows: FxHashMap<Arc<str>, Arc<ResourceRow>>,
     initializing: Option<FxHashMap<Arc<str>, Arc<ResourceRow>>>,
     initial_load_complete: bool,
@@ -2611,6 +3724,13 @@ struct TypedWatchState {
 }
 
 impl TypedWatchState {
+    fn new(table_columns: Arc<[TableColumn]>) -> Self {
+        Self {
+            table_columns,
+            ..Self::default()
+        }
+    }
+
     fn apply_fast_initial(
         &mut self,
         mut update: FastInitialList,
@@ -2635,7 +3755,14 @@ impl TypedWatchState {
         let state = SourceState::Loading {
             loaded: update.rows.len(),
         };
-        publish(snapshots, request, &update.rows, state, self.revision);
+        publish_table(
+            snapshots,
+            request,
+            &update.rows,
+            Arc::clone(&self.table_columns),
+            state,
+            self.revision,
+        );
         self.fast_initial_rows = Some(update.rows);
     }
 
@@ -2664,6 +3791,7 @@ impl TypedWatchState {
                     &mut self.initial_progress,
                     snapshots,
                     request,
+                    &self.table_columns,
                     &mut self.revision,
                 );
                 self.dirty = true;
@@ -2675,10 +3803,11 @@ impl TypedWatchState {
                 self.initial_load_complete = true;
                 self.fast_initial_rows = None;
                 self.revision = self.revision.wrapping_add(1);
-                publish(
+                publish_table(
                     snapshots,
                     request,
                     &self.rows,
+                    Arc::clone(&self.table_columns),
                     SourceState::Ready,
                     self.revision,
                 );
@@ -2716,20 +3845,22 @@ impl TypedWatchState {
         if let Some(initializing) = &self.initializing {
             let mut visible = self.fast_initial_rows.clone().unwrap_or_default();
             overlay_typed_rows(&mut visible, initializing);
-            publish(
+            publish_table(
                 snapshots,
                 request,
                 &visible,
+                Arc::clone(&self.table_columns),
                 SourceState::Loading {
                     loaded: initializing.len(),
                 },
                 self.revision,
             );
         } else {
-            publish(
+            publish_table(
                 snapshots,
                 request,
                 &self.rows,
+                Arc::clone(&self.table_columns),
                 SourceState::Ready,
                 self.revision,
             );
@@ -2752,10 +3883,11 @@ impl TypedWatchState {
                 .or(self.initializing.as_ref())
                 .unwrap_or(&self.rows)
         };
-        publish(
+        publish_table(
             snapshots,
             request,
             visible,
+            Arc::clone(&self.table_columns),
             SourceState::Error(error),
             self.revision,
         );
@@ -2775,7 +3907,7 @@ async fn watch_api<K, F>(
 {
     let (mut fast_initial_updates, _fast_initial_task) =
         spawn_fast_initial_list(client.clone(), &request);
-    let mut state = TypedWatchState::default();
+    let mut state = TypedWatchState::new(typed_table_columns(&request.kind));
     let mut fast_initial_finished = false;
     if let Ok(update) =
         tokio::time::timeout(FAST_INITIAL_LIST_HEAD_START, fast_initial_updates.recv()).await
@@ -2873,6 +4005,7 @@ fn resource_watcher_config(
     config
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_initial_row(
     initializing: &mut Option<FxHashMap<Arc<str>, Arc<ResourceRow>>>,
     row: Arc<ResourceRow>,
@@ -2880,6 +4013,7 @@ fn apply_initial_row(
     progress: &mut InitialListProgress,
     snapshots: &watch::Sender<ResourceSnapshot>,
     request: &WatchRequest,
+    table_columns: &Arc<[TableColumn]>,
     revision: &mut u64,
 ) {
     let initial = initializing.get_or_insert_with(FxHashMap::default);
@@ -2888,10 +4022,11 @@ fn apply_initial_row(
         return;
     }
     *revision = revision.wrapping_add(1);
-    publish(
+    publish_table(
         snapshots,
         request,
         initial,
+        Arc::clone(table_columns),
         SourceState::Loading {
             loaded: initial.len(),
         },
@@ -3189,9 +4324,7 @@ async fn poll_table_api(
 ) {
     let mut revision = 0_u64;
     let mut initial_load_complete = false;
-    let poll_interval = settings.publish_interval.max(Duration::from_secs(5));
-    let mut ticker = tokio::time::interval(poll_interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut ticker = RefreshSchedule::new(settings.refresh_interval);
     loop {
         ticker.tick().await;
         let mut initial_progress = InitialListProgress::default();
@@ -3451,6 +4584,7 @@ fn decode_server_table(table: ServerTable, previous_columns: &[TableColumn]) -> 
 }
 
 fn server_table_row(row: ServerTableRow, columns: &[TableColumn]) -> ResourceRow {
+    let raw_value = row.object.clone();
     let object = row
         .object
         .and_then(|object| serde_json::from_value::<DynamicObject>(object).ok());
@@ -3480,11 +4614,20 @@ fn server_table_row(row: ServerTableRow, columns: &[TableColumn]) -> ResourceRow
         .unwrap_or_else(|| "<unknown>".to_owned());
     let status = column_text("status")
         .or_else(|| column_text("available"))
+        .or_else(|| column_text("type"))
+        .or_else(|| column_text("phase"))
         .unwrap_or_else(|| "-".to_owned());
     let ready = column_text("ready")
         .or_else(|| column_text("service"))
+        .or_else(|| column_text("completions"))
+        .or_else(|| column_text("reason"))
         .unwrap_or_else(|| "-".to_owned());
-    let details = column_text("details").unwrap_or_else(|| "-".to_owned());
+    let details = column_text("details")
+        .or_else(|| column_text("message"))
+        .or_else(|| column_text("claim"))
+        .or_else(|| column_text("volume"))
+        .or_else(|| column_text("data"))
+        .unwrap_or_else(|| "-".to_owned());
     let created_unix = object
         .as_ref()
         .and_then(|object| object.meta().creation_timestamp.as_ref())
@@ -3508,10 +4651,17 @@ fn server_table_row(row: ServerTableRow, columns: &[TableColumn]) -> ResourceRow
     let row = ResourceRow::new(namespace, name, status, ready, details, created_unix)
         .with_labels(labels)
         .with_table_cells(cells);
-    match owner {
+    let mut row = match owner {
         Some(owner) => row.with_owner_reference_data(owner),
         None => row,
+    };
+    if let Some(object) = object.as_ref() {
+        row.owner_names = owner_reference_names(object.meta());
     }
+    if let Some(raw_value) = raw_value {
+        row = row.with_raw_object(raw_value);
+    }
+    row
 }
 
 fn table_cell(value: &serde_json::Value, column: Option<&TableColumn>) -> TableCell {
@@ -3559,6 +4709,7 @@ fn kubectl_table_string(value: &str) -> String {
     )
 }
 
+#[cfg(test)]
 fn publish(
     snapshots: &watch::Sender<ResourceSnapshot>,
     request: &WatchRequest,
@@ -3566,28 +4717,7 @@ fn publish(
     state: SourceState,
     revision: u64,
 ) {
-    if snapshots.is_closed() {
-        return;
-    }
-    let mut compact: Vec<_> = rows
-        .values()
-        .filter(|row| row_matches_owner_filter(row, request))
-        .cloned()
-        .collect();
-    compact.sort_unstable_by(|left, right| {
-        left.namespace
-            .cmp(&right.namespace)
-            .then(left.name.cmp(&right.name))
-    });
-    let _ = snapshots.send(ResourceSnapshot {
-        generation: request.generation,
-        kind: request.kind.clone(),
-        rows: Arc::new(compact),
-        table_columns: Arc::from([]),
-        state,
-        revision,
-        emitted_at: Instant::now(),
-    });
+    publish_table(snapshots, request, rows, Arc::from([]), state, revision);
 }
 
 fn publish_table(
@@ -3622,18 +4752,158 @@ fn publish_table(
     });
 }
 
-fn row_matches_owner_filter(row: &ResourceRow, request: &WatchRequest) -> bool {
-    owner_uid_filter(request).is_none_or(|uid| {
-        row.owner
-            .as_ref()
-            .is_some_and(|owner| owner.uid.as_ref() == uid)
-    })
+pub(super) fn row_matches_owner_filter(row: &ResourceRow, request: &WatchRequest) -> bool {
+    request.field_selector.as_deref() != Some(MATCH_NONE_FIELD_SELECTOR)
+        && owner_name_filter(request)
+            .is_none_or(|name| row.owner_names.iter().any(|owner| owner.as_ref() == name))
+        && owner_uid_filter(request).is_none_or(|uid| {
+            row.owner
+                .as_ref()
+                .is_some_and(|owner| owner.uid.as_ref() == uid)
+        })
+}
+
+fn make_table_col(name: &str, priority: i32) -> TableColumn {
+    TableColumn {
+        name: Arc::from(name),
+        format: if name.eq_ignore_ascii_case("age") {
+            Arc::from("date")
+        } else {
+            Arc::from("")
+        },
+        priority,
+    }
+}
+
+pub(crate) fn typed_table_columns(kind: &ResourceDescriptor) -> Arc<[TableColumn]> {
+    match kind.known_kind() {
+        Some(ResourceKind::Deployments) => Arc::from([
+            make_table_col("NAME", 0),
+            make_table_col("READY", 0),
+            make_table_col("UP-TO-DATE", 0),
+            make_table_col("AVAILABLE", 0),
+            make_table_col("CONTAINERS", 1),
+            make_table_col("IMAGES", 1),
+            make_table_col("SELECTOR", 1),
+            make_table_col("LABELS", 1),
+            make_table_col("VALID", 1),
+            make_table_col("AGE", 0),
+        ]),
+        Some(ResourceKind::StatefulSets) => Arc::from([
+            make_table_col("NAME", 0),
+            make_table_col("READY", 0),
+            make_table_col("SELECTOR", 1),
+            make_table_col("CONTAINERS", 1),
+            make_table_col("IMAGES", 1),
+            make_table_col("LABELS", 1),
+            make_table_col("VALID", 1),
+            make_table_col("AGE", 0),
+        ]),
+        Some(ResourceKind::DaemonSets) => Arc::from([
+            make_table_col("NAME", 0),
+            make_table_col("DESIRED", 0),
+            make_table_col("CURRENT", 0),
+            make_table_col("READY", 0),
+            make_table_col("UP-TO-DATE", 0),
+            make_table_col("AVAILABLE", 0),
+            make_table_col("NODE SELECTOR", 0),
+            make_table_col("CONTAINERS", 1),
+            make_table_col("IMAGES", 1),
+            make_table_col("SELECTOR", 1),
+            make_table_col("LABELS", 1),
+            make_table_col("VALID", 1),
+            make_table_col("AGE", 0),
+        ]),
+        Some(ResourceKind::Services) => Arc::from([
+            make_table_col("NAME", 0),
+            make_table_col("TYPE", 0),
+            make_table_col("CLUSTER-IP", 0),
+            make_table_col("EXTERNAL-IP", 0),
+            make_table_col("SELECTOR", 1),
+            make_table_col("PORTS", 0),
+            make_table_col("LABELS", 1),
+            make_table_col("VALID", 1),
+            make_table_col("AGE", 0),
+        ]),
+        None if kind.is_apps_v1_replica_set() => Arc::from([
+            make_table_col("NAME", 0),
+            make_table_col("DESIRED", 0),
+            make_table_col("CURRENT", 0),
+            make_table_col("READY", 0),
+            make_table_col("CONTAINERS", 1),
+            make_table_col("IMAGES", 1),
+            make_table_col("SELECTOR", 1),
+            make_table_col("LABELS", 1),
+            make_table_col("VALID", 1),
+            make_table_col("AGE", 0),
+        ]),
+        _ => Arc::from([]),
+    }
+}
+
+fn plain_cell(text: impl Into<String>) -> TableCell {
+    TableCell {
+        text: Arc::from(text.into()),
+        timestamp_unix: None,
+    }
+}
+
+fn age_cell(created_unix: i64) -> TableCell {
+    let age_secs =
+        u64::try_from(crate::model::unix_now().saturating_sub(created_unix).max(0)).unwrap_or(0);
+    TableCell {
+        text: Arc::from(crate::model::format_age(age_secs)),
+        timestamp_unix: Some(created_unix),
+    }
+}
+
+fn pod_spec_containers_and_images(
+    spec: Option<&k8s_openapi::api::core::v1::PodSpec>,
+) -> (String, String) {
+    let mut names = Vec::new();
+    let mut images = Vec::new();
+    if let Some(spec) = spec {
+        for c in spec.init_containers.as_deref().unwrap_or_default() {
+            names.push(c.name.as_str());
+            images.push(c.image.as_deref().unwrap_or(""));
+        }
+        for c in &spec.containers {
+            names.push(c.name.as_str());
+            images.push(c.image.as_deref().unwrap_or(""));
+        }
+    }
+    (names.join(","), images.join(","))
+}
+
+fn pod_readiness_gates(pod: &Pod) -> String {
+    let Some(gates) = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.readiness_gates.as_ref())
+        .filter(|g| !g.is_empty())
+    else {
+        return "<none>".to_owned();
+    };
+    let conditions = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_deref())
+        .unwrap_or_default();
+    let mut true_gates = 0_usize;
+    for gate in gates {
+        if conditions
+            .iter()
+            .any(|c| c.type_ == gate.condition_type && c.status == "True")
+        {
+            true_gates += 1;
+        }
+    }
+    format!("{true_gates}/{}", gates.len())
 }
 
 fn pod_row(pod: &Pod) -> ResourceRow {
     let namespace = pod.namespace().unwrap_or_default();
     let name = pod.name_any();
-    let deleting = pod.meta().deletion_timestamp.is_some();
     let status = pod.status.as_ref();
     let container_statuses = status.and_then(|status| status.container_statuses.as_ref());
     let total = pod.spec.as_ref().map_or(0, |spec| spec.containers.len());
@@ -3646,13 +4916,7 @@ fn pod_row(pod: &Pod) -> ResourceRow {
             .map(|container| container.restart_count)
             .sum()
     });
-    let phase = if deleting {
-        "Terminating".to_owned()
-    } else {
-        status
-            .and_then(|status| status.phase.clone())
-            .unwrap_or_else(|| "Unknown".to_owned())
-    };
+    let phase = super::pod_actions::pod_status(pod);
     let (cpu_request_millis, cpu_limit_millis, memory_request_bytes, memory_limit_bytes) =
         pod_resource_totals(pod);
     let node = pod
@@ -3660,6 +4924,17 @@ fn pod_row(pod: &Pod) -> ResourceRow {
         .as_ref()
         .and_then(|spec| spec.node_name.clone())
         .unwrap_or_else(|| "-".to_owned());
+    let qos = status
+        .and_then(|s| s.qos_class.clone())
+        .unwrap_or_else(|| "-".to_owned());
+    let ip = status
+        .and_then(|s| s.pod_ip.clone())
+        .unwrap_or_else(|| "<none>".to_owned());
+    let nominated_node = status
+        .and_then(|s| s.nominated_node_name.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "<none>".to_owned());
+    let readiness_gates = pod_readiness_gates(pod);
     let default_container = pod_default_container(pod).unwrap_or_default();
     resource_row(
         pod,
@@ -3673,6 +4948,10 @@ fn pod_row(pod: &Pod) -> ResourceRow {
         restarts: u32::try_from(restarts.max(0)).unwrap_or(0),
         node: Arc::from(node),
         default_container: Arc::from(default_container),
+        qos: Arc::from(qos),
+        ip: Arc::from(ip),
+        nominated_node: Arc::from(nominated_node),
+        readiness_gates: Arc::from(readiness_gates),
         cpu_millis: None,
         cpu_request_millis,
         cpu_limit_millis,
@@ -3734,12 +5013,28 @@ fn deployment_row(deployment: &Deployment) -> ResourceRow {
         .as_ref()
         .and_then(|status| status.ready_replicas)
         .unwrap_or(0);
+    let up_to_date = deployment
+        .status
+        .as_ref()
+        .and_then(|status| status.updated_replicas)
+        .unwrap_or(0);
     let available = deployment
         .status
         .as_ref()
         .and_then(|status| status.available_replicas)
         .unwrap_or(0);
-    let row = resource_row(
+    let selector = deployment
+        .spec
+        .as_ref()
+        .map(|spec| label_selector_string(&spec.selector))
+        .unwrap_or_default();
+    let (containers, images) = pod_spec_containers_and_images(
+        deployment
+            .spec
+            .as_ref()
+            .and_then(|s| s.template.spec.as_ref()),
+    );
+    let mut row = resource_row(
         deployment,
         deployment.namespace().unwrap_or_default(),
         deployment.name_any(),
@@ -3751,14 +5046,28 @@ fn deployment_row(deployment: &Deployment) -> ResourceRow {
         format!("{ready}/{desired}"),
         format!("{available} available"),
     );
-    match deployment.spec.as_ref() {
-        Some(spec) => with_child_resource(
-            row,
-            replica_set_descriptor(),
-            label_selector_string(&spec.selector),
-        ),
-        None => row,
-    }
+    let valid = if row.status.as_ref() == "Ready" {
+        String::new()
+    } else {
+        row.status.to_string()
+    };
+    let created_unix = row.created_unix;
+    let row_name = row.name.to_string();
+    let row_ready = row.ready.to_string();
+    let labels = row.labels.to_string();
+    row = row.with_table_cells(vec![
+        plain_cell(row_name),
+        plain_cell(row_ready),
+        plain_cell(up_to_date.to_string()),
+        plain_cell(available.to_string()),
+        plain_cell(containers),
+        plain_cell(images),
+        plain_cell(selector.clone()),
+        plain_cell(labels),
+        plain_cell(valid),
+        age_cell(created_unix),
+    ]);
+    with_child_resource(row, ResourceKind::Pods.into(), selector)
 }
 
 fn replica_set_row(replica_set: &ReplicaSet) -> ResourceRow {
@@ -3767,12 +5076,28 @@ fn replica_set_row(replica_set: &ReplicaSet) -> ResourceRow {
         .as_ref()
         .and_then(|spec| spec.replicas)
         .unwrap_or(1);
+    let current = replica_set
+        .status
+        .as_ref()
+        .map_or(0, |status| status.replicas);
     let ready = replica_set
         .status
         .as_ref()
         .and_then(|status| status.ready_replicas)
         .unwrap_or(0);
-    let row = resource_row(
+    let selector = replica_set
+        .spec
+        .as_ref()
+        .map(|spec| label_selector_string(&spec.selector))
+        .unwrap_or_default();
+    let (containers, images) = pod_spec_containers_and_images(
+        replica_set
+            .spec
+            .as_ref()
+            .and_then(|s| s.template.as_ref())
+            .and_then(|t| t.spec.as_ref()),
+    );
+    let mut row = resource_row(
         replica_set,
         replica_set.namespace().unwrap_or_default(),
         replica_set.name_any(),
@@ -3791,14 +5116,27 @@ fn replica_set_row(replica_set: &ReplicaSet) -> ResourceRow {
                 |available| format!("{available} available"),
             ),
     );
-    match replica_set.spec.as_ref() {
-        Some(spec) => with_child_resource(
-            row,
-            ResourceKind::Pods.into(),
-            label_selector_string(&spec.selector),
-        ),
-        None => row,
-    }
+    let valid = if row.status.as_ref() == "Ready" {
+        String::new()
+    } else {
+        row.status.to_string()
+    };
+    let created_unix = row.created_unix;
+    let row_name = row.name.to_string();
+    let labels = row.labels.to_string();
+    row = row.with_table_cells(vec![
+        plain_cell(row_name),
+        plain_cell(desired.to_string()),
+        plain_cell(current.to_string()),
+        plain_cell(ready.to_string()),
+        plain_cell(containers),
+        plain_cell(images),
+        plain_cell(selector.clone()),
+        plain_cell(labels),
+        plain_cell(valid),
+        age_cell(created_unix),
+    ]);
+    with_child_resource(row, ResourceKind::Pods.into(), selector)
 }
 
 fn stateful_set_row(stateful_set: &StatefulSet) -> ResourceRow {
@@ -3812,7 +5150,18 @@ fn stateful_set_row(stateful_set: &StatefulSet) -> ResourceRow {
         .as_ref()
         .and_then(|status| status.ready_replicas)
         .unwrap_or(0);
-    let row = resource_row(
+    let selector = stateful_set
+        .spec
+        .as_ref()
+        .map(|spec| label_selector_string(&spec.selector))
+        .unwrap_or_default();
+    let (containers, images) = pod_spec_containers_and_images(
+        stateful_set
+            .spec
+            .as_ref()
+            .and_then(|s| s.template.spec.as_ref()),
+    );
+    let mut row = resource_row(
         stateful_set,
         stateful_set.namespace().unwrap_or_default(),
         stateful_set.name_any(),
@@ -3828,14 +5177,26 @@ fn stateful_set_row(stateful_set: &StatefulSet) -> ResourceRow {
             .and_then(|status| status.current_revision.clone())
             .unwrap_or_else(|| "-".to_owned()),
     );
-    match stateful_set.spec.as_ref() {
-        Some(spec) => with_child_resource(
-            row,
-            ResourceKind::Pods.into(),
-            label_selector_string(&spec.selector),
-        ),
-        None => row,
-    }
+    let valid = if row.status.as_ref() == "Ready" {
+        String::new()
+    } else {
+        row.status.to_string()
+    };
+    let created_unix = row.created_unix;
+    let row_name = row.name.to_string();
+    let row_ready = row.ready.to_string();
+    let labels = row.labels.to_string();
+    row = row.with_table_cells(vec![
+        plain_cell(row_name),
+        plain_cell(row_ready),
+        plain_cell(selector.clone()),
+        plain_cell(containers),
+        plain_cell(images),
+        plain_cell(labels),
+        plain_cell(valid),
+        age_cell(created_unix),
+    ]);
+    with_child_resource(row, ResourceKind::Pods.into(), selector)
 }
 
 fn daemon_set_row(daemon_set: &DaemonSet) -> ResourceRow {
@@ -3843,11 +5204,39 @@ fn daemon_set_row(daemon_set: &DaemonSet) -> ResourceRow {
         .status
         .as_ref()
         .map_or(0, |status| status.desired_number_scheduled);
+    let current = daemon_set
+        .status
+        .as_ref()
+        .map_or(0, |status| status.current_number_scheduled);
     let ready = daemon_set
         .status
         .as_ref()
         .map_or(0, |status| status.number_ready);
-    let row = resource_row(
+    let up_to_date = daemon_set
+        .status
+        .as_ref()
+        .and_then(|status| status.updated_number_scheduled)
+        .unwrap_or(0);
+    let available = daemon_set
+        .status
+        .as_ref()
+        .and_then(|status| status.number_available)
+        .unwrap_or(0);
+    let selector = daemon_set
+        .spec
+        .as_ref()
+        .map(|spec| label_selector_string(&spec.selector))
+        .unwrap_or_default();
+    let pod_spec = daemon_set
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref());
+    let node_selector = pod_spec
+        .and_then(|s| s.node_selector.as_ref())
+        .map(label_map_selector)
+        .unwrap_or_default();
+    let (containers, images) = pod_spec_containers_and_images(pod_spec);
+    let mut row = resource_row(
         daemon_set,
         daemon_set.namespace().unwrap_or_default(),
         daemon_set.name_any(),
@@ -3857,23 +5246,98 @@ fn daemon_set_row(daemon_set: &DaemonSet) -> ResourceRow {
             desired,
         ),
         format!("{ready}/{desired}"),
-        format!(
-            "{} available",
-            daemon_set
+        format!("{available} available"),
+    );
+    let valid = if row.status.as_ref() == "Ready" {
+        String::new()
+    } else {
+        row.status.to_string()
+    };
+    let created_unix = row.created_unix;
+    let row_name = row.name.to_string();
+    let labels = row.labels.to_string();
+    row = row.with_table_cells(vec![
+        plain_cell(row_name),
+        plain_cell(desired.to_string()),
+        plain_cell(current.to_string()),
+        plain_cell(ready.to_string()),
+        plain_cell(up_to_date.to_string()),
+        plain_cell(available.to_string()),
+        plain_cell(node_selector),
+        plain_cell(containers),
+        plain_cell(images),
+        plain_cell(selector.clone()),
+        plain_cell(labels),
+        plain_cell(valid),
+        age_cell(created_unix),
+    ]);
+    with_child_resource(row, ResourceKind::Pods.into(), selector)
+}
+
+fn service_external_ip(service: &Service) -> String {
+    let Some(spec) = service.spec.as_ref() else {
+        return String::new();
+    };
+    let svc_type = spec.type_.as_deref().unwrap_or("ClusterIP");
+    let ext_ips = spec
+        .external_ips
+        .as_ref()
+        .filter(|ips| !ips.is_empty())
+        .map(|ips| ips.join(","));
+    match svc_type {
+        "ClusterIP" | "NodePort" => ext_ips.unwrap_or_default(),
+        "LoadBalancer" => {
+            let lb_ips = service
                 .status
                 .as_ref()
-                .and_then(|status| status.number_available)
-                .unwrap_or(0)
-        ),
-    );
-    match daemon_set.spec.as_ref() {
-        Some(spec) => with_child_resource(
-            row,
-            ResourceKind::Pods.into(),
-            label_selector_string(&spec.selector),
-        ),
-        None => row,
+                .and_then(|s| s.load_balancer.as_ref())
+                .and_then(|lb| lb.ingress.as_ref())
+                .map(|ingresses| {
+                    ingresses
+                        .iter()
+                        .filter_map(|ing| ing.ip.as_deref().or(ing.hostname.as_deref()))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .filter(|s| !s.is_empty());
+            match (lb_ips, ext_ips) {
+                (Some(lb), Some(ext)) => format!("{lb},{ext}"),
+                (Some(lb), None) => lb,
+                (None, Some(ext)) => ext,
+                (None, None) => "<pending>".to_owned(),
+            }
+        }
+        "ExternalName" => spec.external_name.clone().unwrap_or_default(),
+        _ => "<unknown>".to_owned(),
     }
+}
+
+fn service_ports_display(service: &Service) -> String {
+    service
+        .spec
+        .as_ref()
+        .and_then(|s| s.ports.as_ref())
+        .map(|ports| {
+            ports
+                .iter()
+                .map(|p| {
+                    let mut s = String::new();
+                    if let Some(name) = p.name.as_deref().filter(|n| !n.is_empty()) {
+                        let _ = write!(s, "{name}:");
+                    }
+                    let _ = write!(s, "{}", p.port);
+                    if let Some(np) = p.node_port.filter(|np| *np > 0) {
+                        let _ = write!(s, "►{np}");
+                    }
+                    if let Some(proto) = p.protocol.as_deref().filter(|pr| *pr != "TCP") {
+                        let _ = write!(s, "/{proto}");
+                    }
+                    s
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default()
 }
 
 fn service_row(service: &Service) -> ResourceRow {
@@ -3883,25 +5347,49 @@ fn service_row(service: &Service) -> ResourceRow {
         .unwrap_or_else(|| "ClusterIP".to_owned());
     let cluster_ip = spec
         .and_then(|spec| spec.cluster_ip.clone())
-        .unwrap_or_else(|| "-".to_owned());
-    let ports = spec
+        .filter(|ip| ip != "None")
+        .unwrap_or_default();
+    let external_ip = service_external_ip(service);
+    let selector = spec
+        .and_then(|spec| spec.selector.as_ref())
+        .map(label_map_selector)
+        .unwrap_or_default();
+    let ports_display = service_ports_display(service);
+    let ports_count = spec
         .and_then(|spec| spec.ports.as_ref())
         .map_or(0, Vec::len);
-    let row = resource_row(
+    let raw_value = serde_json::to_value(service).ok();
+    let mut row = resource_row(
         service,
         service.namespace().unwrap_or_default(),
         service.name_any(),
-        service_type,
-        format!("{ports} ports"),
-        cluster_ip,
+        service_type.clone(),
+        format!("{ports_count} ports"),
+        if cluster_ip.is_empty() {
+            "-".to_owned()
+        } else {
+            cluster_ip.clone()
+        },
     )
     .with_port_forward_ports(service_forward_ports(service));
-    match spec.and_then(|spec| spec.selector.as_ref()) {
-        Some(selector) => {
-            with_child_resource(row, ResourceKind::Pods.into(), label_map_selector(selector))
-        }
-        None => row,
+    if let Some(raw_value) = raw_value {
+        row = row.with_raw_object(raw_value);
     }
+    let created_unix = row.created_unix;
+    let row_name = row.name.to_string();
+    let labels = row.labels.to_string();
+    row = row.with_table_cells(vec![
+        plain_cell(row_name),
+        plain_cell(service_type),
+        plain_cell(cluster_ip),
+        plain_cell(external_ip),
+        plain_cell(selector.clone()),
+        plain_cell(ports_display),
+        plain_cell(labels),
+        plain_cell(String::new()),
+        age_cell(created_unix),
+    ]);
+    with_child_resource(row, ResourceKind::Pods.into(), selector)
 }
 
 fn service_forward_ports(service: &Service) -> Vec<PortForwardPort> {
@@ -3919,19 +5407,6 @@ fn service_forward_ports(service: &Service) -> Vec<PortForwardPort> {
             })
         })
         .collect()
-}
-
-fn replica_set_descriptor() -> ResourceDescriptor {
-    ResourceDescriptor::new(
-        "apps",
-        "v1",
-        "apps/v1",
-        "ReplicaSet",
-        "replicasets",
-        true,
-        ResourceOperations::all(),
-    )
-    .with_short_names(["rs"])
 }
 
 fn with_child_resource(
@@ -4101,6 +5576,48 @@ fn dynamic_ready(value: &serde_json::Value) -> Option<String> {
     Some(format!("{ready}/{desired}"))
 }
 
+fn node_roles(node: &Node) -> String {
+    let Some(labels) = node.metadata.labels.as_ref() else {
+        return "<none>".to_owned();
+    };
+    let mut roles = Vec::new();
+    for (k, v) in labels {
+        if let Some(role) = k.strip_prefix("node-role.kubernetes.io/")
+            && !role.is_empty()
+            && !roles.contains(&role)
+        {
+            roles.push(role);
+        } else if (k == "kubernetes.io/role" || k == "kops.k8s.io/instancegroup")
+            && !v.is_empty()
+            && !roles.contains(&v.as_str())
+        {
+            roles.push(v.as_str());
+        }
+    }
+    if roles.is_empty() {
+        "<none>".to_owned()
+    } else {
+        roles.join(",")
+    }
+}
+
+fn node_ips(node: &Node) -> (String, String) {
+    let Some(addrs) = node.status.as_ref().and_then(|s| s.addresses.as_ref()) else {
+        return ("<none>".to_owned(), "<none>".to_owned());
+    };
+    let mut i_ip = "<none>".to_owned();
+    let mut e_ip = "<none>".to_owned();
+    for a in addrs {
+        match a.type_.as_str() {
+            "InternalIP" => i_ip.clone_from(&a.address),
+            "ExternalIP" => e_ip.clone_from(&a.address),
+            _ => {}
+        }
+    }
+    (i_ip, e_ip)
+}
+
+#[allow(clippy::too_many_lines)]
 fn node_row(node: &Node) -> ResourceRow {
     let readiness = node
         .status
@@ -4116,22 +5633,23 @@ fn node_row(node: &Node) -> ResourceRow {
             "False" => "NotReady",
             _ => "Unknown",
         });
-    let role = node
-        .metadata
-        .labels
-        .as_ref()
-        .and_then(|labels| {
-            labels
-                .keys()
-                .find_map(|key| key.strip_prefix("node-role.kubernetes.io/"))
-        })
-        .filter(|role| !role.is_empty())
-        .unwrap_or("worker");
-    let version = node
+    let role = node_roles(node);
+    let node_info = node
         .status
         .as_ref()
-        .and_then(|status| status.node_info.as_ref())
-        .map_or_else(|| "-".to_owned(), |info| info.kubelet_version.clone());
+        .and_then(|status| status.node_info.as_ref());
+    let version = node_info.map_or_else(|| "-".to_owned(), |info| info.kubelet_version.clone());
+    let kernel = node_info.map_or_else(|| "-".to_owned(), |info| info.kernel_version.clone());
+    let os_image = node_info.map_or_else(|| "-".to_owned(), |info| info.os_image.clone());
+    let arch = node_info.map_or_else(
+        || "-".to_owned(),
+        |info| format!("{}/{}", info.operating_system, info.architecture),
+    );
+    let runtime = node_info.map_or_else(
+        || "-".to_owned(),
+        |info| info.container_runtime_version.clone(),
+    );
+    let (internal_ip, external_ip) = node_ips(node);
     let taint_count = node
         .spec
         .as_ref()
@@ -4185,7 +5703,7 @@ fn node_row(node: &Node) -> ResourceRow {
         "-".to_owned(),
         node.name_any(),
         status,
-        role.to_owned(),
+        role,
         version.clone(),
     )
     .with_node_data(NodeData {
@@ -4193,6 +5711,12 @@ fn node_row(node: &Node) -> ResourceRow {
         taints: Arc::from(taints),
         taint_count: u32::try_from(taint_count).unwrap_or(u32::MAX),
         version: Arc::from(version),
+        kernel: Arc::from(kernel),
+        os_image: Arc::from(os_image),
+        arch: Arc::from(arch),
+        runtime: Arc::from(runtime),
+        internal_ip: Arc::from(internal_ip),
+        external_ip: Arc::from(external_ip),
         pods: 0,
         cpu_millis: None,
         cpu_allocatable_millis,
@@ -4326,7 +5850,7 @@ fn workload_status(deleting: bool, ready: i32, desired: i32) -> String {
     .to_owned()
 }
 
-fn resource_row<K: ResourceExt>(
+fn resource_row<K: ResourceExt + serde::Serialize>(
     resource: &K,
     namespace: String,
     name: String,
@@ -4353,10 +5877,30 @@ fn resource_row<K: ResourceExt>(
         .unwrap_or_default();
     let row =
         ResourceRow::new(namespace, name, status, ready, details, created_unix).with_labels(labels);
-    match owner_reference_data(resource.meta()) {
+    let mut row = match owner_reference_data(resource.meta()) {
         Some(owner) => row.with_owner_reference_data(owner),
         None => row,
+    };
+    row.owner_names = owner_reference_names(resource.meta());
+    if let Ok(raw_value) = serde_json::to_value(resource) {
+        row = row.with_raw_object(raw_value);
     }
+    row
+}
+
+fn owner_reference_names(
+    metadata: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta,
+) -> Arc<[Arc<str>]> {
+    metadata
+        .owner_references
+        .as_ref()
+        .map(|owners| {
+            owners
+                .iter()
+                .map(|owner| Arc::from(owner.name.as_str()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn owner_reference_data(
@@ -4377,6 +5921,11 @@ fn owner_reference_data(
 
 #[cfg(test)]
 mod tests {
+    use kube::Config;
+
+    async fn client_for_context(context: &str) -> Result<Client, String> {
+        client_for_context_with(&ConnectionOptions::default(), context).await
+    }
     use k8s_openapi::{
         api::core::v1::{
             Container, ContainerPort, ContainerState, ContainerStateWaiting, ContainerStatus,
@@ -4389,6 +5938,865 @@ mod tests {
 
     fn default_drain_options() -> NodeDrainOptions {
         NodeDrainOptions::default()
+    }
+
+    async fn scale_client_fixture() -> (Client, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let config = Config::new(format!("http://{address}").parse().unwrap());
+        let client = Client::try_from(config).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0; 4096];
+            loop {
+                let size = socket.read(&mut chunk).await.unwrap();
+                assert_ne!(size, 0);
+                bytes.extend_from_slice(&chunk[..size]);
+                if let Some(end) = bytes.windows(4).position(|value| value == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..end]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if bytes.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+                assert!(bytes.len() < 65_536);
+            }
+            let body = r#"{"apiVersion":"autoscaling/v1","kind":"Scale","metadata":{"name":"worker","namespace":"team"},"spec":{"replicas":0}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8(bytes).unwrap()
+        });
+        (client, server)
+    }
+
+    fn assert_scoped_rejection(result: ActionResult, expected_generation: u64) {
+        let ActionResult::Scoped { generation, result } = result else {
+            panic!("rejection must retain the submitting generation");
+        };
+        assert_eq!(generation, expected_generation);
+        assert!(
+            matches!(*result, ActionResult::Error(message) if message.contains("active view changed"))
+        );
+    }
+
+    fn references_target() -> ResourceTarget {
+        ResourceTarget {
+            kind: ResourceDescriptor::new(
+                "",
+                "v1",
+                "v1",
+                "ConfigMap",
+                "configmaps",
+                true,
+                crate::model::ResourceOperations::all(),
+            ),
+            namespace: Some("team".to_owned()),
+            name: "settings".to_owned(),
+        }
+    }
+
+    async fn references_partial_client_fixture(
+        token: &str,
+    ) -> (Client, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::try_from(Config::new(
+            format!("http://{}", listener.local_addr().unwrap())
+                .parse()
+                .unwrap(),
+        ))
+        .unwrap();
+        let token = token.to_owned();
+        let server = tokio::spawn(async move {
+            for _ in 0..5 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0; 4096];
+                while !request.windows(4).any(|value| value == b"\r\n\r\n") {
+                    let size = socket.read(&mut chunk).await.unwrap();
+                    assert_ne!(size, 0);
+                    request.extend_from_slice(&chunk[..size]);
+                    assert!(request.len() < 65_536);
+                }
+                let request = String::from_utf8(request).unwrap();
+                let (status, body) = if request.contains("/daemonsets") {
+                    (
+                        "403 Forbidden",
+                        serde_json::json!({
+                            "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                            "reason": "Forbidden", "code": 403,
+                            "message": format!("do not expose {token} in this scan error"),
+                        }),
+                    )
+                } else {
+                    let items = if request.contains("/deployments") {
+                        vec![serde_json::json!({
+                            "apiVersion": "apps/v1", "kind": "Deployment",
+                            "metadata": {"name": "worker", "namespace": "team"},
+                            "spec": {"selector": {"matchLabels": {"app": "worker"}},
+                                "template": {"spec": {"containers": [{"name": "main",
+                                    "image": "example", "envFrom": [{"configMapRef": {"name": "settings"}}]}]}}},
+                        })]
+                    } else {
+                        Vec::new()
+                    };
+                    (
+                        "200 OK",
+                        serde_json::json!({
+                            "apiVersion": "v1", "kind": "List", "metadata": {}, "items": items,
+                        }),
+                    )
+                };
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn references_source_preserves_partial_results_and_redacts_scan_errors() {
+        for token in [
+            "fixture-token".to_owned(),
+            format!("fixture-token-{}", "x".repeat(2_048)),
+        ] {
+            let (client, server) = references_partial_client_fixture(&token).await;
+            let target = references_target();
+            let action = ActionIntent::LoadReferences {
+                id: 56,
+                target: target.clone(),
+            };
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                handle_action(
+                    client,
+                    "active-context",
+                    &ConnectionOptions {
+                        token: Some(token),
+                        ..ConnectionOptions::default()
+                    },
+                    action,
+                ),
+            )
+            .await
+            .unwrap();
+            let ActionResult::References {
+                id,
+                target: actual,
+                result: Ok(report),
+            } = result
+            else {
+                panic!("a partial reference scan must retain its typed report");
+            };
+            assert_eq!(id, 56);
+            assert_eq!(actual, target);
+            assert_eq!(report.entries.len(), 1);
+            assert_eq!(
+                report.entries[0].target.kind,
+                ResourceKind::Deployments.into()
+            );
+            assert_eq!(report.entries[0].target.namespace.as_deref(), Some("team"));
+            assert_eq!(report.entries[0].target.name, "worker");
+            assert_eq!(report.scanned, 1);
+            assert_eq!(report.errors.len(), 1);
+            assert!(report.errors[0].contains("[REDACTED]"));
+            assert!(!report.errors[0].contains("fixture-token"));
+            assert!(report.errors[0].chars().count() <= 1_024);
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn references_invalid_connection_timeout_is_scoped_and_never_reaches_api() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::try_from(Config::new(
+            format!("http://{}", listener.local_addr().unwrap())
+                .parse()
+                .unwrap(),
+        ))
+        .unwrap();
+        let target = references_target();
+        let action = ActionIntent::LoadReferences {
+            id: 57,
+            target: target.clone(),
+        };
+        assert!(action.cancelable_read());
+        let (results, mut received) = mpsc::channel(1);
+        spawn_action_task(
+            client,
+            "active-context".to_owned(),
+            ConnectionOptions {
+                request_timeout: Some("invalid".to_owned()),
+                ..ConnectionOptions::default()
+            },
+            ActionRequest {
+                generation: 9,
+                intent: action,
+            },
+            results,
+            true,
+        )
+        .await
+        .unwrap();
+        let ActionResult::Scoped { generation, result } = received.try_recv().unwrap() else {
+            panic!("reference completion must retain its generation");
+        };
+        assert_eq!(generation, 9);
+        let ActionResult::References {
+            id,
+            target: actual,
+            result: Err(message),
+        } = *result
+        else {
+            panic!("reference timeout rejection must retain its request identity");
+        };
+        assert_eq!(id, 57);
+        assert_eq!(actual, target);
+        assert!(message.contains("Request timeout"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    fn identified_read_actions(target: &ResourceTarget) -> [ActionIntent; 12] {
+        [
+            ActionIntent::Content {
+                id: 41,
+                target: target.clone(),
+                content: ContentKind::Yaml,
+            },
+            ActionIntent::ManagedYaml {
+                id: 42,
+                target: target.clone(),
+                body: "metadata: {}".to_owned(),
+                decoded_body: None,
+            },
+            ActionIntent::LoadImages {
+                id: 43,
+                target: target.clone(),
+            },
+            ActionIntent::LoadTransferPod {
+                id: 44,
+                target: target.clone(),
+            },
+            ActionIntent::RefreshYaml {
+                id: 45,
+                target: target.clone(),
+                include_managed_fields: true,
+            },
+            ActionIntent::RefreshDescribe {
+                id: 46,
+                target: target.clone(),
+            },
+            ActionIntent::StartLogs {
+                request: super::super::LogRequest {
+                    id: 47,
+                    target: super::super::LogTarget::pod(
+                        "team",
+                        target.name.clone(),
+                        Some("main".to_owned()),
+                        false,
+                    ),
+                    range: super::super::LogRange::Tail,
+                    tail_count: 100,
+                    all_containers: false,
+                },
+            },
+            ActionIntent::LoadRollback {
+                id: 48,
+                target: target.clone(),
+            },
+            ActionIntent::LoadDeploymentSelector {
+                id: 49,
+                target: target.clone(),
+                replica_sets: false,
+            },
+            ActionIntent::LoadDeploymentSelector {
+                id: 50,
+                target: target.clone(),
+                replica_sets: true,
+            },
+            ActionIntent::LoadReferences {
+                id: 51,
+                target: target.clone(),
+            },
+            ActionIntent::LoadBatchNavigation {
+                id: 52,
+                target: target.clone(),
+            },
+        ]
+    }
+
+    fn assert_identified_read_rejection(
+        result: ActionResult,
+        case: usize,
+        target: &ResourceTarget,
+    ) {
+        let (actual_case, id, actual_target, message) = match result {
+            ActionResult::OpenedContent { id, target, result } => {
+                let ActionResult::Error(message) = *result else {
+                    panic!("opening rejection must carry its terminal error");
+                };
+                (0, id, Some(target), message)
+            }
+            ActionResult::ManagedYaml {
+                id,
+                target,
+                result: Err(message),
+            } => (1, id, Some(target), message),
+            ActionResult::Images {
+                id,
+                target,
+                result: Err(message),
+            } => (2, id, Some(target), message),
+            ActionResult::TransferPod {
+                id,
+                target,
+                result: Err(message),
+            } => (3, id, Some(target), message),
+            ActionResult::RefreshedYaml {
+                id,
+                target,
+                result: Err(message),
+            } => (4, id, Some(target), message),
+            ActionResult::RefreshedDescribe {
+                id,
+                target,
+                result: Err(message),
+            } => (5, id, Some(target), message),
+            ActionResult::LogBatch {
+                id,
+                lines,
+                finished,
+                error: Some(message),
+            } => {
+                assert_eq!(lines, Vec::<super::super::LogLine>::new());
+                assert!(finished);
+                (6, id, None, message)
+            }
+            ActionResult::RollbackLoaded {
+                id,
+                target,
+                result: Err(message),
+            } => (7, id, Some(target), message),
+            ActionResult::DeploymentSelector {
+                id,
+                target,
+                replica_sets,
+                result: Err(message),
+            } => (8 + usize::from(replica_sets), id, Some(target), message),
+            ActionResult::References {
+                id,
+                target,
+                result: Err(message),
+            } => (10, id, Some(target), message),
+            ActionResult::BatchNavigation {
+                id,
+                target,
+                result: Err(message),
+            } => (11, id, Some(target), message),
+            other => panic!("read rejection must retain its result type: {other:?}"),
+        };
+        assert_eq!(actual_case, case);
+        assert_eq!(id, 41 + u64::try_from(case).unwrap());
+        assert_eq!(actual_target.as_ref(), (case != 6).then_some(target));
+        assert!(message.contains("active view changed"));
+    }
+
+    #[tokio::test]
+    async fn rejected_identified_reads_finish_with_original_ids_and_targets_without_api_calls() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::try_from(Config::new(
+            format!("http://{}", listener.local_addr().unwrap())
+                .parse()
+                .unwrap(),
+        ))
+        .unwrap();
+        let current = WatchRequest {
+            instance: None,
+            generation: 8,
+            context: "active-context".to_owned(),
+            kind: ResourceKind::Pods.into(),
+            namespace: Some("team".to_owned()),
+            field_selector: None,
+            label_selector: None,
+        };
+        let target = ResourceTarget {
+            kind: current.kind.clone(),
+            namespace: current.namespace.clone(),
+            name: "loading-pod".to_owned(),
+        };
+        let task = tokio::spawn(std::future::pending::<()>());
+        let handle = task.abort_handle();
+        let mut running_read = Some(task);
+        let mut running_logs = None;
+        let (results, mut received) = mpsc::channel(1);
+        for (scope, generation) in [(None, 8), (Some(&current), 7), (Some(&current), 9)] {
+            for (case, intent) in identified_read_actions(&target).into_iter().enumerate() {
+                dispatch_action(
+                    client.clone(),
+                    scope,
+                    ConnectionOptions::default(),
+                    ActionRequest { generation, intent },
+                    results.clone(),
+                    &mut running_read,
+                    &mut running_logs,
+                );
+                let ActionResult::Scoped {
+                    generation: actual,
+                    result,
+                } = received.try_recv().unwrap()
+                else {
+                    panic!("read rejection must retain the submitting generation");
+                };
+                assert_eq!(actual, generation);
+                assert_identified_read_rejection(*result, case, &target);
+                assert_eq!(running_read.as_ref().unwrap().id(), handle.id());
+                assert!(!handle.is_finished());
+                assert!(running_logs.is_none());
+            }
+        }
+        running_read.take().unwrap().abort();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn full_result_channel_delivers_rejection_after_capacity_frees_and_keeps_active_read() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::try_from(Config::new(
+            format!("http://{}", listener.local_addr().unwrap())
+                .parse()
+                .unwrap(),
+        ))
+        .unwrap();
+        let target = ResourceTarget {
+            kind: ResourceKind::Pods.into(),
+            namespace: Some("team".to_owned()),
+            name: "loading-pod".to_owned(),
+        };
+        let task = tokio::spawn(std::future::pending::<()>());
+        let handle = task.abort_handle();
+        let mut running_read = Some(task);
+        let mut running_logs = None;
+        let (results, mut received) = mpsc::channel(1);
+        let earlier = ActionResult::Notice("earlier result fills the channel".to_owned());
+        results.try_send(earlier.clone()).unwrap();
+        dispatch_action(
+            client,
+            None,
+            ConnectionOptions::default(),
+            ActionRequest {
+                generation: 8,
+                intent: identified_read_actions(&target).into_iter().next().unwrap(),
+            },
+            results,
+            &mut running_read,
+            &mut running_logs,
+        );
+        assert_eq!(running_read.as_ref().unwrap().id(), handle.id());
+        assert!(!handle.is_finished());
+        assert!(running_logs.is_none());
+        assert_eq!(received.try_recv().unwrap(), earlier);
+        let result = tokio::time::timeout(Duration::from_secs(5), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let ActionResult::Scoped { generation, result } = result else {
+            panic!("delayed rejection must retain its submitting generation");
+        };
+        assert_eq!(generation, 8);
+        assert_identified_read_rejection(*result, 0, &target);
+        assert_eq!(running_read.as_ref().unwrap().id(), handle.id());
+        assert!(!handle.is_finished());
+        running_read.take().unwrap().abort();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_generation_actions_never_reach_the_new_context_client() {
+        let (client, server) = scale_client_fixture().await;
+        let current = WatchRequest {
+            instance: None,
+            generation: 8,
+            context: "new-context".to_owned(),
+            kind: ResourceKind::Deployments.into(),
+            namespace: Some("team".to_owned()),
+            field_selector: None,
+            label_selector: None,
+        };
+        let action = |generation, replicas| ActionRequest {
+            generation,
+            intent: ActionIntent::Scale {
+                targets: vec![ResourceTarget {
+                    kind: ResourceKind::Deployments.into(),
+                    namespace: Some("team".to_owned()),
+                    name: "worker".to_owned(),
+                }],
+                replicas,
+            },
+        };
+        let (results, mut received) = mpsc::channel(4);
+        let (mut running_read, mut running_logs) = (None, None);
+        for (scope, generation) in [(Some(&current), 7), (Some(&current), 9), (None, 8)] {
+            dispatch_action(
+                client.clone(),
+                scope,
+                ConnectionOptions::default(),
+                action(generation, 9),
+                results.clone(),
+                &mut running_read,
+                &mut running_logs,
+            );
+            assert_scoped_rejection(received.try_recv().unwrap(), generation);
+            assert!(running_read.is_none());
+            assert!(running_logs.is_none());
+        }
+        // A current request still reaches the same fake API, proving the guard
+        // does not merely disable action execution or use a disconnected client.
+        dispatch_action(
+            client,
+            Some(&current),
+            ConnectionOptions::default(),
+            action(8, 0),
+            results,
+            &mut running_read,
+            &mut running_logs,
+        );
+        let observed = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut request_line = observed.lines().next().unwrap().split_whitespace();
+        assert_eq!(request_line.next(), Some("PATCH"));
+        assert_eq!(
+            request_line.next().unwrap().split('?').next(),
+            Some("/apis/apps/v1/namespaces/team/deployments/worker/scale")
+        );
+        let (_, body) = observed.split_once("\r\n\r\n").unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).unwrap()["spec"]["replicas"],
+            0
+        );
+        let result = tokio::time::timeout(Duration::from_secs(5), received.recv())
+            .await
+            .unwrap();
+        assert!(matches!(result, Some(ActionResult::Notice(_))));
+    }
+
+    #[tokio::test]
+    async fn stale_generation_image_updates_are_scoped_and_never_call_the_api() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::try_from(Config::new(
+            format!("http://{}", listener.local_addr().unwrap())
+                .parse()
+                .unwrap(),
+        ))
+        .unwrap();
+        let current = WatchRequest {
+            instance: None,
+            generation: 8,
+            context: "new-context".to_owned(),
+            kind: ResourceKind::Deployments.into(),
+            namespace: Some("team".to_owned()),
+            field_selector: None,
+            label_selector: None,
+        };
+        let loaded = super::super::ImageSnapshot {
+            target: ResourceTarget {
+                kind: current.kind.clone(),
+                namespace: current.namespace.clone(),
+                name: "worker".to_owned(),
+            },
+            uid: "old-context-uid".to_owned(),
+            resource_version: "100".to_owned(),
+            images: vec![super::super::ContainerImage {
+                name: "worker".to_owned(),
+                image: "worker:v1".to_owned(),
+                init: false,
+            }],
+        };
+        let mut images = loaded.images.clone();
+        images[0].image = "worker:v2".to_owned();
+        let (results, mut received) = mpsc::channel(3);
+        let (mut running_read, mut running_logs) = (None, None);
+        for (scope, generation) in [(Some(&current), 7), (Some(&current), 9), (None, 8)] {
+            dispatch_action(
+                client.clone(),
+                scope,
+                ConnectionOptions::default(),
+                ActionRequest {
+                    generation,
+                    intent: ActionIntent::SetImages {
+                        snapshot: loaded.clone(),
+                        images: images.clone(),
+                    },
+                },
+                results.clone(),
+                &mut running_read,
+                &mut running_logs,
+            );
+            let ActionResult::Scoped {
+                generation: actual,
+                result,
+            } = received.try_recv().unwrap()
+            else {
+                panic!("image rejection must retain the submitting generation");
+            };
+            assert_eq!(actual, generation);
+            assert!(matches!(
+                *result,
+                ActionResult::ImagesUpdated { target, result: Err(message) }
+                    if target == loaded.target && message.contains("active view changed")
+            ));
+            assert!(running_read.is_none());
+            assert!(running_logs.is_none());
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn no_active_watch_sanitize_rejection_preserves_typed_scope_and_sends_no_api_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::try_from(Config::new(
+            format!("http://{}", listener.local_addr().unwrap())
+                .parse()
+                .unwrap(),
+        ))
+        .unwrap();
+        let (results, mut received) = mpsc::channel(2);
+        let (mut running_read, mut running_logs) = (None, None);
+        for namespace in [None, Some("confirmed-team".to_owned())] {
+            dispatch_action(
+                client.clone(),
+                None,
+                ConnectionOptions::default(),
+                ActionRequest {
+                    generation: 8,
+                    intent: ActionIntent::SanitizePods {
+                        namespace: namespace.clone(),
+                    },
+                },
+                results.clone(),
+                &mut running_read,
+                &mut running_logs,
+            );
+            let ActionResult::Scoped { generation, result } = received.try_recv().unwrap() else {
+                panic!("sanitize rejection must retain the submitting generation");
+            };
+            assert_eq!(generation, 8);
+            assert!(matches!(
+                *result,
+                ActionResult::Sanitized { namespace: actual, result: Err(message) }
+                    if actual == namespace && message.contains("active view changed")
+            ));
+            assert!(running_read.is_none());
+            assert!(running_logs.is_none());
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    fn rollback_fixture() -> super::super::RollbackSnapshot {
+        super::super::RollbackSnapshot {
+            target: ResourceTarget {
+                kind: ResourceDescriptor::new(
+                    "apps",
+                    "v1",
+                    "apps/v1",
+                    "ReplicaSet",
+                    "replicasets",
+                    true,
+                    crate::model::ResourceOperations::all(),
+                ),
+                namespace: Some("team".to_owned()),
+                name: "worker-old".to_owned(),
+            },
+            uid: "rs-uid".to_owned(),
+            resource_version: "10".to_owned(),
+            deployment: "worker".to_owned(),
+            deployment_uid: "deployment-uid".to_owned(),
+            deployment_resource_version: "20".to_owned(),
+            revision: 1,
+            template: serde_json::json!({"spec": {"containers": [{"name": "main", "image": "old"}]}}),
+            annotations: std::collections::BTreeMap::new(),
+            already_matches: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn rollback_mutations_are_scoped_and_rejected_before_api_on_changed_views() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::try_from(Config::new(
+            format!("http://{}", listener.local_addr().unwrap())
+                .parse()
+                .unwrap(),
+        ))
+        .unwrap();
+        let snapshot = rollback_fixture();
+        let current = WatchRequest {
+            instance: None,
+            generation: 8,
+            context: "active-context".to_owned(),
+            kind: snapshot.target.kind.clone(),
+            namespace: snapshot.target.namespace.clone(),
+            field_selector: None,
+            label_selector: None,
+        };
+        let (results, mut received) = mpsc::channel(1);
+        let (mut running_read, mut running_logs) = (None, None);
+        for (scope, generation) in [(None, 8), (Some(&current), 7), (Some(&current), 9)] {
+            let intent = ActionIntent::Rollback {
+                snapshot: Box::new(snapshot.clone()),
+            };
+            assert!(!intent.cancelable_read());
+            dispatch_action(
+                client.clone(),
+                scope,
+                ConnectionOptions::default(),
+                ActionRequest { generation, intent },
+                results.clone(),
+                &mut running_read,
+                &mut running_logs,
+            );
+            let ActionResult::Scoped {
+                generation: actual,
+                result,
+            } = received.try_recv().unwrap()
+            else {
+                panic!("rollback rejection must remain scoped");
+            };
+            assert_eq!(actual, generation);
+            assert!(
+                matches!(*result, ActionResult::RolledBack { result: Err(message) }
+                if message.contains("active view changed"))
+            );
+            assert!(running_read.is_none());
+            assert!(running_logs.is_none());
+        }
+        // A noncancelable mutation completion still carries its originating generation.
+        let mut invalid = snapshot;
+        invalid.target.kind = ResourceKind::Pods.into();
+        let task = spawn_action_task(
+            client,
+            "active-context".to_owned(),
+            ConnectionOptions::default(),
+            ActionRequest {
+                generation: 8,
+                intent: ActionIntent::Rollback {
+                    snapshot: Box::new(invalid),
+                },
+            },
+            results,
+            false,
+        );
+        task.await.unwrap();
+        let ActionResult::Scoped { generation, result } = received.try_recv().unwrap() else {
+            panic!("rollback completion must remain scoped even though it is not cancelable");
+        };
+        assert_eq!(generation, 8);
+        assert!(matches!(
+            *result,
+            ActionResult::RolledBack { result: Err(_) }
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_generation_cancellation_preserves_current_read_but_matching_stop_aborts_it() {
+        let config = Config::new("http://127.0.0.1:1".parse().unwrap());
+        let client = Client::try_from(config).unwrap();
+        let current = WatchRequest {
+            instance: None,
+            generation: 8,
+            context: "new-context".to_owned(),
+            kind: ResourceKind::Pods.into(),
+            namespace: Some("team".to_owned()),
+            field_selector: None,
+            label_selector: None,
+        };
+        let task = tokio::spawn(std::future::pending::<()>());
+        let handle = task.abort_handle();
+        let mut running_read = Some(task);
+        let mut running_logs = None;
+        let (results, mut received) = mpsc::channel(3);
+        for (scope, generation) in [(Some(&current), 7), (Some(&current), 9), (None, 8)] {
+            dispatch_action(
+                client.clone(),
+                scope,
+                ConnectionOptions::default(),
+                ActionRequest {
+                    generation,
+                    intent: ActionIntent::StopContentRefresh,
+                },
+                results.clone(),
+                &mut running_read,
+                &mut running_logs,
+            );
+            assert_scoped_rejection(received.try_recv().unwrap(), generation);
+            assert_eq!(running_read.as_ref().unwrap().id(), handle.id());
+            assert!(!handle.is_finished());
+        }
+        dispatch_action(
+            client,
+            Some(&current),
+            ConnectionOptions::default(),
+            ActionRequest {
+                generation: current.generation,
+                intent: ActionIntent::StopContentRefresh,
+            },
+            results,
+            &mut running_read,
+            &mut running_logs,
+        );
+        assert!(running_read.is_none());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            received.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        );
     }
 
     #[test]
@@ -4695,7 +7103,7 @@ mod tests {
     }
 
     #[test]
-    fn deployment_row_declares_replica_sets_as_label_selected_children() {
+    fn deployment_row_declares_pods_as_label_selected_children() {
         let deployment: Deployment = serde_json::from_value(serde_json::json!({
             "apiVersion": "apps/v1",
             "kind": "Deployment",
@@ -4714,7 +7122,7 @@ mod tests {
 
         let row = deployment_row(&deployment);
         let child = row.child_resource_data().expect("Deployment child data");
-        assert!(child.kind.is_apps_v1_replica_set());
+        assert_eq!(child.kind.known_kind(), Some(ResourceKind::Pods));
         assert_eq!(child.label_selector.as_ref(), "app=api,tier=backend");
     }
 
@@ -4788,6 +7196,22 @@ mod tests {
         assert_eq!(
             context_delete_args("prod; touch /tmp/nope"),
             ["config", "delete-context", "prod; touch /tmp/nope"]
+        );
+        let connection = ConnectionOptions {
+            kubeconfig: Some("/tmp/explicit config".into()),
+            ..ConnectionOptions::default()
+        };
+        let args = context_delete_args_with(&connection, "inactive");
+        assert_eq!(
+            args,
+            [
+                "--kubeconfig",
+                "/tmp/explicit config",
+                "config",
+                "delete-context",
+                "inactive"
+            ]
+            .map(std::ffi::OsString::from)
         );
     }
 
@@ -4994,6 +7418,23 @@ mod tests {
             namespace: Some("prod".to_owned()),
             name: "api-0".to_owned(),
         };
+        let connection = ConnectionOptions {
+            kubeconfig: Some("/tmp/explicit config".into()),
+            impersonate: Some("reader".to_owned()),
+            ..ConnectionOptions::default()
+        };
+        let args = describe_args_with(&connection, "staging", &pod);
+        for (flag, value) in [
+            ("--kubeconfig", "/tmp/explicit config"),
+            ("--as", "reader"),
+            ("--context", "staging"),
+            ("--namespace", "prod"),
+        ] {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == flag && pair[1] == value)
+            );
+        }
         assert_eq!(
             describe_args("staging", &pod),
             [
@@ -5164,6 +7605,157 @@ mod tests {
         let refreshed = yaml_content_with_managed_fields(object, &target, true).unwrap();
         assert_eq!(refreshed.with_managed_fields, None);
         assert_eq!(refreshed.decoded_with_managed_fields, None);
+    }
+
+    #[tokio::test]
+    async fn initial_content_keeps_request_identity_on_success_and_redacted_failure() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        for (status, body, succeeds) in [
+            (
+                "200 OK",
+                r#"{"kind":"Pod","apiVersion":"v1","metadata":{"name":"worker","namespace":"team"},"spec":{"containers":[]}}"#,
+                true,
+            ),
+            (
+                "403 Forbidden",
+                r#"{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","message":"denied fixture-sensitive-token","code":403}"#,
+                false,
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = Client::try_from(Config::new(
+                format!("http://{}", listener.local_addr().unwrap())
+                    .parse()
+                    .unwrap(),
+            ))
+            .unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0; 1024];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let length = socket.read(&mut chunk).await.unwrap();
+                    assert_ne!(length, 0);
+                    request.extend_from_slice(&chunk[..length]);
+                }
+                assert!(
+                    String::from_utf8_lossy(&request)
+                        .starts_with("GET /api/v1/namespaces/team/pods/worker")
+                );
+                socket.write_all(format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+                ).as_bytes()).await.unwrap();
+            });
+            let target = ResourceTarget {
+                kind: ResourceKind::Pods.into(),
+                namespace: Some("team".to_owned()),
+                name: "worker".to_owned(),
+            };
+            let connection = ConnectionOptions {
+                token: Some("fixture-sensitive-token".to_owned()),
+                ..ConnectionOptions::default()
+            };
+            let result = handle_action(
+                client,
+                "fixture",
+                &connection,
+                ActionIntent::Content {
+                    id: 91,
+                    target: target.clone(),
+                    content: ContentKind::Yaml,
+                },
+            )
+            .await;
+            let ActionResult::OpenedContent {
+                id,
+                target: returned,
+                result,
+            } = result
+            else {
+                panic!("initial content must retain its request identity");
+            };
+            assert_eq!(id, 91);
+            assert_eq!(returned, target);
+            if succeeds {
+                let ActionResult::Content { body, content, .. } = *result else {
+                    panic!("expected YAML content");
+                };
+                assert_eq!(content, ContentKind::Yaml);
+                assert!(body.contains("name: worker"));
+            } else {
+                let ActionResult::Error(error) = *result else {
+                    panic!("expected scoped opening failure");
+                };
+                assert!(error.contains("Forbidden"));
+                assert!(!error.contains("fixture-sensitive-token"));
+            }
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_fields_api_failure_keeps_request_identity_and_redacts_credentials() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::try_from(Config::new(
+            format!("http://{}", listener.local_addr().unwrap())
+                .parse()
+                .unwrap(),
+        ))
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let length = socket.read(&mut chunk).await.unwrap();
+                assert_ne!(length, 0);
+                request.extend_from_slice(&chunk[..length]);
+            }
+            assert!(
+                String::from_utf8_lossy(&request)
+                    .starts_with("GET /api/v1/namespaces/team/pods/worker")
+            );
+            let body = r#"{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","message":"denied fixture-sensitive-token","code":403}"#;
+            socket.write_all(format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+            ).as_bytes()).await.unwrap();
+        });
+        let target = ResourceTarget {
+            kind: ResourceKind::Pods.into(),
+            namespace: Some("team".to_owned()),
+            name: "worker".to_owned(),
+        };
+        let connection = ConnectionOptions {
+            token: Some("fixture-sensitive-token".to_owned()),
+            ..ConnectionOptions::default()
+        };
+        let result = handle_action(
+            client,
+            "fixture",
+            &connection,
+            ActionIntent::ManagedYaml {
+                id: 73,
+                target: target.clone(),
+                body: "kind: Pod".to_owned(),
+                decoded_body: None,
+            },
+        )
+        .await;
+        let ActionResult::ManagedYaml {
+            id,
+            target: returned,
+            result: Err(error),
+        } = result
+        else {
+            panic!("managed-fields errors must retain their request identity");
+        };
+        assert_eq!(id, 73);
+        assert_eq!(returned, target);
+        assert!(error.contains("Forbidden"));
+        assert!(!error.contains("fixture-sensitive-token"));
+        server.await.unwrap();
     }
 
     #[test]
@@ -5369,6 +7961,23 @@ mod tests {
         assert!(!service_account_subject_matches(
             &user,
             "argo",
+            "apiserver-admin",
+            None,
+        ));
+        let group_ns: Subject = serde_json::from_value(serde_json::json!({
+            "kind": "Group",
+            "name": "system:serviceaccounts:argo"
+        }))
+        .expect("group subject");
+        assert!(service_account_subject_matches(
+            &group_ns,
+            "argo",
+            "apiserver-admin",
+            None,
+        ));
+        assert!(!service_account_subject_matches(
+            &group_ns,
+            "default",
             "apiserver-admin",
             None,
         ));
@@ -5609,6 +8218,7 @@ mod tests {
         };
         assert!(
             ActionIntent::Content {
+                id: 1,
                 target: target.clone(),
                 content: ContentKind::Yaml,
             }
@@ -5633,6 +8243,7 @@ mod tests {
     fn typed_initial_list_publishes_rows_before_init_done() {
         let kind: ResourceDescriptor = ResourceKind::Pods.into();
         let request = WatchRequest {
+            instance: None,
             generation: 7,
             context: "demo".to_owned(),
             kind: kind.clone(),
@@ -5645,6 +8256,7 @@ mod tests {
         let mut progress = InitialListProgress::default();
         let mut revision = 0;
 
+        let columns: Arc<[TableColumn]> = Arc::from([]);
         for index in 0..INITIAL_LIST_PROGRESS_ROWS {
             apply_initial_row(
                 &mut initializing,
@@ -5660,6 +8272,7 @@ mod tests {
                 &mut progress,
                 &snapshots,
                 &request,
+                &columns,
                 &mut revision,
             );
         }
@@ -5679,6 +8292,7 @@ mod tests {
     fn typed_rows_progressively_replace_fast_rows_during_initialization() {
         let kind: ResourceDescriptor = ResourceKind::Pods.into();
         let request = WatchRequest {
+            instance: None,
             generation: 8,
             context: "demo".to_owned(),
             kind: kind.clone(),
@@ -5719,6 +8333,7 @@ mod tests {
             &mut state.initial_progress,
             &snapshots,
             &request,
+            &state.table_columns,
             &mut state.revision,
         );
         state.dirty = true;
@@ -5743,6 +8358,7 @@ mod tests {
     #[test]
     fn pod_cache_matches_only_unfiltered_all_namespace_pod_views() {
         let request = WatchRequest {
+            instance: None,
             generation: 1,
             context: "test".to_owned(),
             kind: ResourceKind::Pods.into(),
@@ -5759,6 +8375,13 @@ mod tests {
         let mut filtered = request.clone();
         filtered.label_selector = Some("app=api".to_owned());
         assert!(!is_all_namespace_pod_request(&filtered, "test"));
+        let mut instance = request.clone();
+        instance.instance = Some(ResourceTarget {
+            kind: ResourceKind::Pods.into(),
+            namespace: Some("default".to_owned()),
+            name: "api-0".to_owned(),
+        });
+        assert!(!is_all_namespace_pod_request(&instance, "test"));
         assert!(!is_all_namespace_pod_request(&request, "production"));
     }
 
@@ -5766,8 +8389,10 @@ mod tests {
     async fn pod_metrics_are_started_for_filtered_views() {
         let client = Client::try_from(Config::new("http://127.0.0.1:1".parse().unwrap())).unwrap();
         let settings = KubernetesSettings {
+            connection: ConnectionOptions::default(),
             initial_context: "test".to_owned(),
             publish_interval: Duration::from_millis(100),
+            refresh_interval: watch::channel(Duration::from_secs(5)).1,
             streaming_lists: false,
         };
         for field_selector in [
@@ -5778,6 +8403,7 @@ mod tests {
         ] {
             for namespace in [None, Some("default")] {
                 let request = WatchRequest {
+                    instance: None,
                     generation: 1,
                     context: "test".to_owned(),
                     kind: ResourceKind::Pods.into(),
@@ -5797,6 +8423,7 @@ mod tests {
     #[test]
     fn owner_uid_filters_are_local_and_match_exact_controller_uids() {
         let mut request = WatchRequest {
+            instance: None,
             generation: 1,
             context: "test".to_owned(),
             kind: ResourceKind::Pods.into(),
@@ -5909,6 +8536,31 @@ mod tests {
         let pod = row.pod_data().expect("fast row has Pod data");
         assert_eq!(pod.restarts, 3);
         assert_eq!(pod.node.as_ref(), "worker-1");
+    }
+
+    #[test]
+    fn progressive_deployment_rows_preserve_selector_for_pod_and_replica_set_navigation() {
+        let columns = vec![TableColumn {
+            name: Arc::from("Selector"),
+            format: Arc::from(""),
+            priority: 1,
+        }];
+        let row = ResourceRow::new("team", "api", "Ready", "1/1", "", 0).with_table_cells(vec![
+            TableCell {
+                text: Arc::from("app=api,tier in (web,worker)"),
+                timestamp_unix: None,
+            },
+        ]);
+        let row = hydrate_fast_initial_row(&ResourceKind::Deployments.into(), &columns, row);
+        let child = row
+            .child_resource_data()
+            .expect("progressive Deployment selector");
+        assert_eq!(child.kind.known_kind(), Some(ResourceKind::Pods));
+        assert_eq!(
+            child.label_selector.as_ref(),
+            "app=api,tier in (web,worker)"
+        );
+        assert_eq!(row.namespace.as_ref(), "team");
     }
 
     #[test]
@@ -6049,7 +8701,7 @@ mod tests {
                 )
             })
             .collect();
-        assert!(!expected.is_empty());
+        assert_ne!(expected.len(), 0);
         let kind = ResourceDescriptor::new(
             "apiregistration.k8s.io",
             "v1",
@@ -6060,6 +8712,7 @@ mod tests {
             crate::model::ResourceOperations::all(),
         );
         let request = WatchRequest {
+            instance: None,
             generation: 1,
             context: context.clone(),
             kind: kind.clone(),
@@ -6074,8 +8727,10 @@ mod tests {
         let task = tokio::spawn(run_watch(
             client,
             KubernetesSettings {
+                connection: ConnectionOptions::default(),
                 initial_context: context,
                 publish_interval: Duration::from_millis(100),
+                refresh_interval: watch::channel(Duration::from_secs(5)).1,
                 streaming_lists: false,
             },
             request,
@@ -6245,6 +8900,7 @@ mod tests {
             .await
             .expect("Kubernetes client");
         let request = WatchRequest {
+            instance: None,
             generation: 1,
             context: context.clone(),
             kind: ResourceKind::Pods.into(),
@@ -6257,8 +8913,10 @@ mod tests {
         let task = tokio::spawn(run_watch(
             client,
             KubernetesSettings {
+                connection: ConnectionOptions::default(),
                 initial_context: context,
                 publish_interval: Duration::from_millis(100),
+                refresh_interval: watch::channel(Duration::from_secs(5)).1,
                 streaming_lists: false,
             },
             request,
@@ -6310,6 +8968,7 @@ mod tests {
             .await
             .expect("Kubernetes client");
         let request = WatchRequest {
+            instance: None,
             generation: 1,
             context: context.clone(),
             kind: ResourceKind::Pods.into(),
@@ -6325,8 +8984,10 @@ mod tests {
         let task = tokio::spawn(run_watch(
             client,
             KubernetesSettings {
+                connection: ConnectionOptions::default(),
                 initial_context: context,
                 publish_interval: Duration::from_millis(100),
+                refresh_interval: watch::channel(Duration::from_secs(5)).1,
                 streaming_lists: true,
             },
             request,
@@ -6399,8 +9060,10 @@ mod tests {
         let mut cache = PodWatchCache::spawn(
             client,
             KubernetesSettings {
+                connection: ConnectionOptions::default(),
                 initial_context: context.clone(),
                 publish_interval: Duration::from_millis(100),
+                refresh_interval: watch::channel(Duration::from_secs(5)).1,
                 streaming_lists: true,
             },
             context.clone(),
@@ -6422,6 +9085,7 @@ mod tests {
         .expect("Pod cache warms within 15 seconds");
 
         let request = WatchRequest {
+            instance: None,
             generation: 42,
             context,
             kind: ResourceKind::Pods.into(),
@@ -6462,8 +9126,10 @@ mod tests {
         let manager = tokio::spawn(run_manager(
             client,
             KubernetesSettings {
+                connection: ConnectionOptions::default(),
                 initial_context: context.clone(),
                 publish_interval: Duration::from_millis(100),
+                refresh_interval: watch::channel(Duration::from_secs(5)).1,
                 streaming_lists: true,
             },
             request_rx,
@@ -6474,6 +9140,7 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(5)).await;
 
         let request = WatchRequest {
+            instance: None,
             generation: 77,
             context,
             kind,
@@ -6528,9 +9195,15 @@ mod tests {
             name,
         };
         let started = Instant::now();
-        let result = fetch_content(client, &context, &target, ContentKind::Yaml)
-            .await
-            .expect("YAML content");
+        let result = fetch_content(
+            client,
+            &context,
+            &ConnectionOptions::default(),
+            &target,
+            ContentKind::Yaml,
+        )
+        .await
+        .expect("YAML content");
         let elapsed = started.elapsed();
         let ActionResult::Content { body, .. } = result else {
             panic!("expected YAML content");
@@ -6540,3 +9213,7 @@ mod tests {
         assert!(elapsed < Duration::from_secs(30), "YAML took {elapsed:?}");
     }
 }
+
+#[cfg(test)]
+#[path = "batch_navigation_integration_tests.rs"]
+mod batch_navigation_integration_tests;

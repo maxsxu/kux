@@ -114,6 +114,43 @@ pub fn read_contexts(requested: Option<&str>) -> Result<ContextCatalog, String> 
         .map_err(|error| format!("Unable to read kubeconfig contexts: {error}"))
 }
 
+/// Read contexts from the selected kubeconfig and reflect connection overrides.
+///
+/// # Errors
+/// Returns a redacted file or parse diagnostic when configuration cannot load.
+pub fn read_contexts_with(
+    options: &crate::connection::ConnectionOptions,
+    requested: Option<&str>,
+) -> Result<ContextCatalog, String> {
+    let mut catalog = context_catalog(options.read_kubeconfig()?, requested);
+    for context in &mut catalog.contexts {
+        if let Some(cluster) = &options.cluster {
+            context.cluster = Some(cluster.clone());
+        }
+        if let Some(user) = &options.user {
+            context.user = Some(user.clone());
+        }
+    }
+    Ok(catalog)
+}
+
+#[must_use]
+pub fn fallback_contexts_with(
+    options: &crate::connection::ConnectionOptions,
+    requested: Option<&str>,
+) -> ContextCatalog {
+    read_contexts_with(options, requested).unwrap_or_else(|_| {
+        let active = requested.unwrap_or("current").to_owned();
+        let mut context = ContextInfo::synthetic(active.clone());
+        context.cluster.clone_from(&options.cluster);
+        context.user.clone_from(&options.user);
+        ContextCatalog {
+            active,
+            contexts: vec![context],
+        }
+    })
+}
+
 #[must_use]
 pub fn fallback_contexts(requested: Option<&str>) -> ContextCatalog {
     read_contexts(requested).unwrap_or_else(|_| {

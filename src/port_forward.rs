@@ -8,6 +8,7 @@ use tokio::{
 
 use crate::{
     app::{PortForwardInfo, PortForwardRequest, PortForwardState, ResourceTarget},
+    connection::ConnectionOptions,
     model::ResourceKind,
 };
 
@@ -28,6 +29,7 @@ struct Session {
 
 #[derive(Debug)]
 pub struct PortForwardManager {
+    connection: ConnectionOptions,
     program: OsString,
     next_id: u64,
     sessions: BTreeMap<u64, Session>,
@@ -40,8 +42,19 @@ impl PortForwardManager {
         Self::with_program("kubectl", events)
     }
 
+    #[must_use]
+    pub fn with_connection(
+        events: mpsc::Sender<PortForwardEvent>,
+        connection: ConnectionOptions,
+    ) -> Self {
+        let mut manager = Self::new(events);
+        manager.connection = connection;
+        manager
+    }
+
     fn with_program(program: impl Into<OsString>, events: mpsc::Sender<PortForwardEvent>) -> Self {
         Self {
+            connection: ConnectionOptions::default(),
             program: program.into(),
             next_id: 1,
             sessions: BTreeMap::new(),
@@ -75,7 +88,7 @@ impl PortForwardManager {
             ));
         }
 
-        let args = command_args(context, &request)?;
+        let args = command_args_with(&self.connection, context, &request)?;
         let mut command = Command::new(&self.program);
         command
             .args(args)
@@ -102,11 +115,14 @@ impl PortForwardManager {
         let events = self.events.clone();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
+        let connection = self.connection.clone();
         tokio::spawn(async move {
-            let stdout_task =
-                stdout.map(|stdout| tokio::spawn(relay_output(stdout, id, events.clone())));
-            let stderr_task =
-                stderr.map(|stderr| tokio::spawn(relay_output(stderr, id, events.clone())));
+            let stdout_task = stdout.map(|stdout| {
+                tokio::spawn(relay_output(stdout, id, events.clone(), connection.clone()))
+            });
+            let stderr_task = stderr.map(|stderr| {
+                tokio::spawn(relay_output(stderr, id, events.clone(), connection.clone()))
+            });
             let status = tokio::select! {
                 status = child.wait() => status,
                 _ = &mut stop_rx => {
@@ -204,9 +220,11 @@ async fn relay_output(
     reader: impl AsyncRead + Unpin,
     id: u64,
     events: mpsc::Sender<PortForwardEvent>,
+    connection: ConnectionOptions,
 ) {
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
+        let line = connection.redact(&line);
         if events
             .send(PortForwardEvent::Output { id, line })
             .await
@@ -234,6 +252,16 @@ fn command_args(context: &str, request: &PortForwardRequest) -> Result<Vec<OsStr
         OsString::from("--address"),
         OsString::from(&request.address),
     ]);
+    Ok(args)
+}
+
+fn command_args_with(
+    connection: &ConnectionOptions,
+    context: &str,
+    request: &PortForwardRequest,
+) -> Result<Vec<OsString>, String> {
+    let mut args = connection.kubectl_args(None);
+    args.extend(command_args(context, request)?);
     Ok(args)
 }
 
@@ -292,15 +320,52 @@ mod tests {
     }
 
     #[test]
+    fn connection_overrides_keep_port_forward_target_context_and_namespace() {
+        let options = ConnectionOptions {
+            kubeconfig: Some("/tmp/selected config".into()),
+            impersonate: Some("viewer".to_owned()),
+            ..ConnectionOptions::default()
+        };
+        let args = command_args_with(&options, "selected", &request(ResourceKind::Pods)).unwrap();
+        for (flag, value) in [
+            ("--kubeconfig", "/tmp/selected config"),
+            ("--as", "viewer"),
+            ("--context", "selected"),
+            ("--namespace", "crossplane-system"),
+        ] {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == flag && pair[1] == value)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn port_forward_output_redacts_explicit_bearer_tokens() {
+        let (events, mut received) = mpsc::channel(2);
+        let options = ConnectionOptions {
+            token: Some("fixture-token".to_owned()),
+            ..ConnectionOptions::default()
+        };
+        relay_output(&b"failure echoed fixture-token\n"[..], 7, events, options).await;
+        let Some(PortForwardEvent::Output { id, line }) = received.recv().await else {
+            panic!("output event");
+        };
+        assert_eq!(id, 7);
+        assert_eq!(line, "failure echoed [REDACTED]");
+    }
+
+    #[test]
     fn manager_starts_empty() {
         let (events, _) = mpsc::channel(4);
         let manager = PortForwardManager::new(events);
-        assert!(manager.sessions.is_empty());
+        assert_eq!(manager.sessions.len(), 0);
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn manager_tracks_and_stops_a_real_child_process() {
+        const CHILD_EVENT_TIMEOUT: Duration = Duration::from_secs(10);
         let fixture = std::env::temp_dir().join(format!("kux-fake-kubectl-{}", std::process::id()));
         fs::write(
             &fixture,
@@ -317,7 +382,7 @@ mod tests {
         let info = manager
             .start("demo", request(ResourceKind::Pods))
             .expect("start fake port forward");
-        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+        let event = tokio::time::timeout(CHILD_EVENT_TIMEOUT, event_rx.recv())
             .await
             .expect("fake forward output")
             .expect("forward event");
@@ -328,12 +393,17 @@ mod tests {
             PortForwardState::Running
         );
         assert_eq!(manager.summaries("demo").len(), 1);
-        assert!(manager.summaries("other").is_empty());
+        assert_eq!(manager.summaries("other").len(), 0);
         assert_eq!(
             manager.stop(info.id).map(|forward| forward.id),
             Some(info.id)
         );
-        assert!(manager.summaries_for("demo", &target).is_empty());
+        assert_eq!(manager.summaries_for("demo", &target).len(), 0);
+        let event = tokio::time::timeout(CHILD_EVENT_TIMEOUT, event_rx.recv())
+            .await
+            .expect("stopped child is reaped")
+            .expect("child exit event");
+        assert!(matches!(event, PortForwardEvent::Exited { id, .. } if id == info.id));
         fs::remove_file(fixture).unwrap();
     }
 }

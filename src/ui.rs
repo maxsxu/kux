@@ -4,7 +4,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, Widget, Wrap},
+    widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, Widget, Wrap},
 };
 
 use crate::{
@@ -18,9 +18,36 @@ use crate::{
     },
     model::{ResourceKind, SourceState, format_age, format_kubectl_age},
     source::LogRange,
+    theme::Skin,
 };
 
 const CYAN: Color = Color::Rgb(139, 233, 253);
+#[path = "ui_export.rs"]
+pub(crate) mod export;
+#[path = "ui_plugins.rs"]
+mod plugin_ui;
+#[path = "ui_preferences.rs"]
+mod preferences;
+pub use export::TableExportSnapshot;
+#[path = "ui_images.rs"]
+mod images;
+#[path = "ui_logs.rs"]
+mod merged_logs;
+#[path = "ui_pulses.rs"]
+mod pulses;
+#[path = "ui_rollback.rs"]
+mod rollback;
+#[path = "ui_sanitize.rs"]
+mod sanitize;
+#[path = "ui_screen_dumps.rs"]
+mod screen_dumps;
+#[path = "ui_transfers.rs"]
+mod transfers;
+#[cfg(test)]
+#[path = "ui_workloads.rs"]
+mod workload_tests;
+#[path = "ui_xray.rs"]
+mod xray;
 const PURPLE: Color = Color::Rgb(189, 147, 249);
 const GREEN: Color = Color::Rgb(80, 250, 123);
 const YELLOW: Color = Color::Rgb(241, 250, 140);
@@ -62,9 +89,21 @@ struct HeaderLayout {
     columns: Vec<HeaderHintColumn>,
 }
 
+pub fn draw_splash(frame: &mut Frame<'_>, app: &App) {
+    preferences::splash(frame, app);
+}
+
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
+    draw_inner(frame, app);
+    if app.ui.invert() {
+        preferences::invert_frame(frame);
+    }
+}
+
+fn draw_inner(frame: &mut Frame<'_>, app: &mut App) {
     app.clear_chooser_hitbox();
     let area = frame.area();
+    frame.render_widget(Block::default().style(preferences::body_style(app)), area);
     let fullscreen_content = app.overlay == Overlay::Content && app.ui.fullscreen();
     if fullscreen_content && app.input_mode == InputMode::Browse {
         draw_content(frame, app, area);
@@ -104,13 +143,20 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         Overlay::Content => draw_content(frame, app, body_area),
         Overlay::Details => draw_details(frame, app, body_area),
         Overlay::PortForwards => draw_port_forwards(frame, app, body_area),
+        Overlay::ScreenDumps => screen_dumps::draw(frame, app, body_area),
         _ => draw_resources(frame, app, body_area),
     }
 
     match app.overlay {
+        Overlay::PluginDialog => plugin_ui::draw_plugin_dialog(frame, app, area),
+        Overlay::ImageDialog => images::draw(frame, app, area),
+        Overlay::RollbackDialog => rollback::draw(frame, app, area),
+        Overlay::TransferDialog => transfers::draw(frame, app, area),
+        Overlay::SanitizeDialog => sanitize::draw(frame, app, area),
         Overlay::ConfirmDelete => draw_delete_confirmation(frame, app, area),
         Overlay::PortForwardDialog => draw_port_forward_dialog(frame, app, area),
-        Overlay::Aliases
+        Overlay::ScreenDumps
+        | Overlay::Aliases
         | Overlay::Namespaces
         | Overlay::Contexts
         | Overlay::Help
@@ -191,14 +237,18 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect, layout: &HeaderLayo
         return;
     }
     if app.is_logs_view() {
-        draw_header_menu_columns(frame, area, &layout.columns);
+        draw_header_menu_columns(&app.theme, frame, area, &layout.columns);
         return;
     }
     match layout.flow {
         HeaderFlow::Horizontal => {
             let mut x = area.x;
             if layout.show_logo {
-                draw_logo(frame, Rect::new(x, area.y, layout.logo_width, area.height));
+                draw_logo(
+                    &app.theme,
+                    frame,
+                    Rect::new(x, area.y, layout.logo_width, area.height),
+                );
                 x = x
                     .saturating_add(layout.logo_width)
                     .saturating_add(HEADER_LANE_SPACING);
@@ -213,6 +263,7 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect, layout: &HeaderLayo
                     .saturating_add(layout.info_width)
                     .saturating_add(HEADER_LANE_SPACING);
                 draw_header_menu_columns(
+                    &app.theme,
                     frame,
                     Rect::new(x, area.y, layout.menu_width, area.height),
                     &layout.columns,
@@ -230,6 +281,7 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect, layout: &HeaderLayo
                 let menu_y = area.y.saturating_add(info_height);
                 let bottom = area.y.saturating_add(area.height);
                 draw_header_menu_columns(
+                    &app.theme,
                     frame,
                     Rect::new(
                         area.x,
@@ -253,21 +305,28 @@ fn logo_width() -> u16 {
         .unwrap_or(0)
 }
 
-fn draw_logo(frame: &mut Frame<'_>, area: Rect) {
+fn draw_logo(skin: &Skin, frame: &mut Frame<'_>, area: Rect) {
     let logo = LOGO_ROWS.iter().enumerate().map(|(index, row)| {
         let color = if index < 3 { CYAN } else { PURPLE };
-        Line::from(Span::styled(*row, Style::default().fg(color).bold()))
+        Line::from(Span::styled(
+            *row,
+            Style::default()
+                .fg(skin.color("body.logoColor", color))
+                .bold(),
+        ))
     });
     frame.render_widget(Paragraph::new(logo.collect::<Vec<_>>()), area);
 }
 
-fn cluster_info_entries(app: &App) -> [(&'static str, &str); 4] {
+fn cluster_info_entries(app: &App) -> [(&'static str, &str); 6] {
     let context = app.active_context_info();
     [
         ("Context", &app.context),
         ("Cluster", context.cluster_display()),
         ("User", context.user_display()),
         ("Version", &app.server_version),
+        ("CPU", &app.cluster_cpu),
+        ("MEM", &app.cluster_mem),
     ]
 }
 
@@ -291,8 +350,14 @@ fn cluster_info_rows(app: &App, width: u16) -> Vec<Line<'static>> {
         .flat_map(|(label, value)| {
             wrap_styled_segments(
                 [
-                    (cluster_info_label(label), Style::default().fg(MUTED)),
-                    (value.to_owned(), Style::default().fg(CYAN)),
+                    (
+                        cluster_info_label(label),
+                        Style::default().fg(app.theme.color("info.sectionColor", MUTED)),
+                    ),
+                    (
+                        value.to_owned(),
+                        app.theme.style("info", Style::default().fg(CYAN)),
+                    ),
                 ],
                 width,
             )
@@ -345,6 +410,8 @@ fn draw_cluster_info(frame: &mut Frame<'_>, app: &App, area: Rect) {
 enum HeaderHintKind {
     Namespace,
     Action,
+    LogRange,
+    LogAction,
 }
 
 #[derive(Debug, Clone)]
@@ -423,10 +490,20 @@ fn log_action_hints(app: &App, compact: bool) -> Vec<HeaderHint> {
     .map(|(key, label, candidate)| HeaderHint {
         key: key.to_owned(),
         label: label.to_owned(),
-        kind: HeaderHintKind::Namespace,
+        kind: HeaderHintKind::LogRange,
         active: range == Some(candidate),
     })
     .collect::<Vec<_>>();
+    if app.can_toggle_all_log_containers() {
+        hints.push(action_hint(
+            "a",
+            if compact {
+                "AllContainers"
+            } else {
+                "Toggle AllContainers"
+            },
+        ));
+    }
     hints.extend([
         action_hint("shift-c", "Clear"),
         action_hint("c", "Copy"),
@@ -467,7 +544,15 @@ fn log_action_hints(app: &App, compact: bool) -> Vec<HeaderHint> {
         action_hint("w", if compact { "Wrap" } else { "Toggle Wrap" }),
     ]);
     for hint in &mut hints {
+        if hint.kind == HeaderHintKind::Action {
+            hint.kind = HeaderHintKind::LogAction;
+        }
         hint.active |= match hint.key.as_str() {
+            "a" => app.log_view.as_ref().is_some_and(|view| {
+                view.metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.all_containers)
+            }),
             "s" => app.log_view.as_ref().is_some_and(|view| view.auto_scroll),
             "shift-l" => app.log_view.as_ref().is_some_and(|view| view.column_lock),
             "f" => app.ui.fullscreen(),
@@ -526,7 +611,12 @@ fn fit_header_columns(columns: Vec<HeaderHintColumn>, available: u16) -> Vec<Hea
     visible
 }
 
-fn draw_header_menu_columns(frame: &mut Frame<'_>, area: Rect, columns: &[HeaderHintColumn]) {
+fn draw_header_menu_columns(
+    skin: &Skin,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    columns: &[HeaderHintColumn],
+) {
     if area.is_empty() || columns.is_empty() {
         return;
     }
@@ -542,7 +632,7 @@ fn draw_header_menu_columns(frame: &mut Frame<'_>, area: Rect, columns: &[Header
         Row::new(columns.iter().map(|column| {
             column.hints.get(row_index).map_or_else(
                 || Cell::from(""),
-                |hint| header_hint_cell(hint, column.key_width),
+                |hint| header_hint_cell(skin, hint, column.key_width),
             )
         }))
     });
@@ -553,7 +643,9 @@ fn draw_header_menu_columns(frame: &mut Frame<'_>, area: Rect, columns: &[Header
 }
 
 fn namespace_hints(app: &App) -> Vec<HeaderHint> {
-    if app.overlay == Overlay::Content && app.content_kind == Some(ContentKind::Yaml) {
+    if app.is_reference_view()
+        || (app.overlay == Overlay::Content && app.content_kind == Some(ContentKind::Yaml))
+    {
         return Vec::new();
     }
     std::iter::once(HeaderHint {
@@ -581,16 +673,10 @@ fn action_hints(app: &App) -> Vec<HeaderHint> {
     if app.is_logs_view() {
         return log_action_hints(app, false);
     }
-    let mut hints = if matches!(
-        app.overlay,
-        Overlay::ConfirmDelete | Overlay::PortForwardDialog | Overlay::PortForwards
-    ) {
-        Vec::new()
-    } else {
-        vec![action_hint(":", "Command"), action_hint("/", "Filter")]
-    };
+    let mut hints = command_hints(app);
     match app.overlay {
         Overlay::Content => hints.extend(content_action_hints(app)),
+        Overlay::ScreenDumps => hints.extend(screen_dumps::action_hints(app)),
         Overlay::Aliases => {
             hints.extend([
                 action_hint("enter", "Open"),
@@ -601,6 +687,7 @@ fn action_hints(app: &App) -> Vec<HeaderHint> {
         Overlay::Namespaces => {
             hints.extend([
                 action_hint("enter", "Switch"),
+                action_hint("u", "Use"),
                 action_hint("y", "YAML"),
                 action_hint("j/k", "Move"),
                 action_hint("esc", "Back"),
@@ -612,11 +699,13 @@ fn action_hints(app: &App) -> Vec<HeaderHint> {
         Overlay::Contexts => {
             hints.extend([
                 action_hint("enter", "Switch"),
+                action_hint("u", "Use"),
                 action_hint("c", "Copy Name"),
                 action_hint("j/k", "Move"),
                 action_hint("esc", "Back"),
             ]);
             if !app.read_only {
+                hints.push(action_hint("r", "Rename"));
                 hints.push(action_hint("ctrl-d", "Delete"));
             }
         }
@@ -630,7 +719,12 @@ fn action_hints(app: &App) -> Vec<HeaderHint> {
                 hints.push(action_hint("e", "Edit"));
             }
         }
-        Overlay::PortForwardDialog => {
+        Overlay::PortForwardDialog
+        | Overlay::PluginDialog
+        | Overlay::ImageDialog
+        | Overlay::RollbackDialog
+        | Overlay::TransferDialog
+        | Overlay::SanitizeDialog => {
             hints.extend([
                 action_hint("tab", "Next Field"),
                 action_hint("enter", "Select"),
@@ -639,11 +733,16 @@ fn action_hints(app: &App) -> Vec<HeaderHint> {
         }
         Overlay::PortForwards => {
             hints.extend([
+                action_hint("enter", "Benchmarks"),
+                action_hint("b", "Benchmark"),
+                action_hint("shift-p", "Sort Ports"),
+                action_hint("shift-u", "Sort URL"),
                 action_hint("j/k", "Move"),
                 action_hint("ctrl-d", "Stop"),
                 action_hint("esc", "Back"),
             ]);
         }
+        _ if app.is_reference_view() => hints.extend(reference_action_hints()),
         _ if app.is_policy_view() => {
             hints.extend([
                 action_hint("c", "Copy Name"),
@@ -654,14 +753,36 @@ fn action_hints(app: &App) -> Vec<HeaderHint> {
         _ if app.is_container_view() => hints.extend(container_action_hints(app)),
         _ => hints.extend(resource_action_hints(app)),
     }
+    if matches!(app.overlay, Overlay::None | Overlay::Content) && !app.is_reference_view() {
+        hints.push(action_hint("ctrl-s", "Save Dump"));
+    }
+    append_extension_hints(&mut hints, app);
     if app.filter_navigation_active() {
-        hints.retain(|hint| hint.key != "n");
+        hints.retain(|hint| hint.key != "n" && hint.key != "shift-n");
         hints.extend([
             action_hint("n", "Next Match"),
             action_hint("shift-n", "Previous Match"),
         ]);
     }
     hints
+}
+
+fn command_hints(app: &App) -> Vec<HeaderHint> {
+    if matches!(
+        app.overlay,
+        Overlay::ConfirmDelete
+            | Overlay::PortForwardDialog
+            | Overlay::PortForwards
+            | Overlay::PluginDialog
+            | Overlay::ImageDialog
+            | Overlay::RollbackDialog
+            | Overlay::TransferDialog
+            | Overlay::SanitizeDialog
+    ) {
+        Vec::new()
+    } else {
+        vec![action_hint(":", "Command"), action_hint("/", "Filter")]
+    }
 }
 
 fn content_action_hints(app: &App) -> Vec<HeaderHint> {
@@ -671,16 +792,29 @@ fn content_action_hints(app: &App) -> Vec<HeaderHint> {
         Some(
             ContentKind::Yaml
                 | ContentKind::SecretData
+                | ContentKind::HelmValues
+                | ContentKind::Describe
+                | ContentKind::ScreenDump
                 | ContentKind::Logs
                 | ContentKind::PreviousLogs
         )
     ) {
         hints.push(action_hint("c", "Copy"));
     }
-    if app.content_kind == Some(ContentKind::Yaml) {
+    if app.is_live_content() {
         if !app.read_only {
             hints.push(action_hint("e", "Edit"));
         }
+        hints.push(action_hint(
+            "r",
+            if app.content_auto_refresh() {
+                "Auto Refresh On"
+            } else {
+                "Auto Refresh Off"
+            },
+        ));
+    }
+    if app.content_kind == Some(ContentKind::Yaml) {
         hints.push(action_hint(
             "m",
             if app.ui.managed_fields() {
@@ -691,14 +825,18 @@ fn content_action_hints(app: &App) -> Vec<HeaderHint> {
         ));
     }
     if app.can_decode_content() {
-        hints.push(action_hint(
-            "x",
+        let label = if app.content_kind == Some(ContentKind::HelmValues) {
             if app.is_content_decoded() {
-                "Encoded"
+                "User Values"
             } else {
-                "Decode"
-            },
-        ));
+                "All Values"
+            }
+        } else if app.is_content_decoded() {
+            "Encoded"
+        } else {
+            "Decode"
+        };
+        hints.push(action_hint("x", label));
     }
     hints.extend([action_hint("w", "Wrap"), action_hint("f", "Fullscreen")]);
     if matches!(
@@ -710,6 +848,18 @@ fn content_action_hints(app: &App) -> Vec<HeaderHint> {
     hints
 }
 
+fn reference_action_hints() -> Vec<HeaderHint> {
+    vec![
+        action_hint("enter", "Goto"),
+        action_hint("ctrl-r", "Refresh"),
+        action_hint("shift-n", "Sort Name"),
+        action_hint("shift-p", "Sort Namespace"),
+        action_hint("shift-v", "Sort GVR"),
+        action_hint("c", "Copy Name"),
+        action_hint("esc", "Back"),
+    ]
+}
+
 fn container_action_hints(app: &App) -> Vec<HeaderHint> {
     let mut hints = vec![
         action_hint("enter", "Logs"),
@@ -718,16 +868,42 @@ fn container_action_hints(app: &App) -> Vec<HeaderHint> {
     ];
     if !app.read_only {
         hints.push(action_hint("s", "Shell"));
+        hints.push(action_hint("a", "Attach"));
+        hints.push(action_hint("shift-f", "Port Forward"));
+    }
+    hints.push(action_hint("f", "Port Forwards"));
+    if app.user_config.settings.image_scans.enable {
+        hints.push(action_hint("v", "Show Vulnerabilities"));
     }
     hints.extend([action_hint("c", "Copy Name"), action_hint("esc", "Back")]);
     hints
 }
 
-fn resource_action_hints(app: &App) -> Vec<HeaderHint> {
-    let enter_label = if app.kind.is_authorization_resource() {
+fn resource_enter_label(app: &App) -> String {
+    if app.kind.is_workloads() || app.kind.is_dir() || app.kind.is_pulses() || app.kind.is_xray() {
+        "Goto".to_owned()
+    } else if app.kind.is_scans() {
+        "View CVE".to_owned()
+    } else if app.kind.is_skins() {
+        "Apply Skin".to_owned()
+    } else if app.kind.is_benchmarks() {
+        "Results".to_owned()
+    } else if app.kind.is_helm() {
+        "Releases".to_owned()
+    } else if app.kind.is_helm_history() {
+        "Rollback".to_owned()
+    } else if app.kind.is_core_v1_namespace() {
+        "Pods".to_owned()
+    } else if app.kind.is_cron_job() {
+        "Jobs".to_owned()
+    } else if app.kind.is_job() {
+        "Pods".to_owned()
+    } else if app.kind.is_authorization_resource() {
         "Policy".to_owned()
     } else if app.kind.is_custom_resource_definition() {
         "Custom Resources".to_owned()
+    } else if let Some(jump) = app.user_config.custom_jump_for(&app.kind) {
+        jump.resource.clone()
     } else if let Some(child) = app
         .selected_row()
         .and_then(crate::model::ResourceRow::child_resource_data)
@@ -739,7 +915,46 @@ fn resource_action_hints(app: &App) -> Vec<HeaderHint> {
             Some(ResourceKind::Pods) => "Containers".to_owned(),
             _ => "Details".to_owned(),
         }
-    };
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn resource_action_hints(app: &App) -> Vec<HeaderHint> {
+    let enter_label = resource_enter_label(app);
+    if app.kind.is_subject() {
+        return vec![
+            action_hint("enter", &enter_label),
+            action_hint("c", "Copy Name"),
+            action_hint("?", "Help"),
+            action_hint("ctrl-r", "Refresh"),
+        ];
+    }
+    if app.kind.is_dir() {
+        return dir_action_hints(app, &enter_label);
+    }
+    if app.kind.is_pulses() {
+        return pulse_action_hints(&enter_label);
+    }
+    if app.kind.is_xray() {
+        return xray_action_hints(app, &enter_label);
+    }
+    if app.kind.is_scans() {
+        return scans_action_hints(&enter_label);
+    }
+    if app.kind.is_skins() {
+        return vec![
+            action_hint("enter", &enter_label),
+            action_hint("c", "Copy Name"),
+            action_hint("?", "Help"),
+            action_hint("ctrl-r", "Refresh"),
+        ];
+    }
+    if app.kind.is_benchmarks() {
+        return benchmark_action_hints(app, &enter_label);
+    }
+    if app.kind.is_helm() || app.kind.is_helm_history() {
+        return helm_action_hints(app, &enter_label);
+    }
     let mut hints = vec![
         action_hint("enter", &enter_label),
         action_hint("y", "YAML"),
@@ -749,15 +964,32 @@ fn resource_action_hints(app: &App) -> Vec<HeaderHint> {
         action_hint("?", "Help"),
         action_hint("ctrl-r", "Refresh"),
     ];
+    if app.kind.is_workloads() {
+        hints.extend([
+            action_hint("shift-k", "Sort Kind"),
+            action_hint("shift-r", "Sort Ready"),
+            action_hint("shift-a", "Sort Age"),
+        ]);
+    }
     if app.kind.is_core_v1_secret() {
         hints.push(action_hint("x", "Decode"));
     }
-    if app.kind.known_kind() == Some(ResourceKind::Pods) {
+    if app.kind.is_core_v1_namespace() {
+        hints.push(action_hint("u", "Use"));
+    } else if crate::source::supports_references(&app.kind) {
+        hints.push(action_hint("u", "UsedBy"));
+    }
+    if crate::source::supports_logs(&app.kind) {
         hints.push(action_hint("l", "Logs"));
         hints.push(action_hint("p", "Logs Previous"));
+    }
+    if app.kind.known_kind() == Some(ResourceKind::Pods) {
         hints.push(action_hint("o", "Node"));
         if !app.read_only {
             hints.push(action_hint("s", "Shell"));
+            hints.push(action_hint("a", "Attach"));
+            hints.push(action_hint("t", "Transfer"));
+            hints.push(action_hint("z", "Sanitize"));
         }
     }
     if matches!(
@@ -769,40 +1001,178 @@ fn resource_action_hints(app: &App) -> Vec<HeaderHint> {
             hints.push(action_hint("shift-f", "Port Forward"));
         }
     }
-    if app.selected_row().is_some_and(|row| row.owner.is_some())
-        || app.kind.known_kind() == Some(ResourceKind::Nodes)
+    if app.kind.known_kind() == Some(ResourceKind::Services) {
+        hints.push(action_hint("b", "Benchmark"));
+    }
+    if !app.kind.is_workloads()
+        && (app.selected_row().is_some_and(|row| row.owner.is_some())
+            || app.kind.known_kind() == Some(ResourceKind::Nodes))
     {
         hints.push(action_hint("shift-j", "Owner"));
     }
     if app.namespace.is_none() && app.kind.is_namespaced() {
         hints.push(action_hint("w", "Warp Namespace"));
     }
+    if app.kind.known_kind() == Some(ResourceKind::Deployments) {
+        hints.push(action_hint("z", "ReplicaSets"));
+    }
+    if app.user_config.settings.image_scans.enable && app.kind.supports_vulnerability_scans() {
+        hints.push(action_hint("v", "Show Vulnerabilities"));
+        hints.push(action_hint("shift-v", "Sort Vulnerabilities"));
+    }
     if !app.read_only {
+        append_mutation_action_hints(&mut hints, app);
+    }
+    hints
+}
+
+fn dir_action_hints(app: &App, enter_label: &str) -> Vec<HeaderHint> {
+    let mut hints = vec![
+        action_hint("enter", enter_label),
+        action_hint("y", "YAML"),
+        action_hint("c", "Copy Name"),
+        action_hint("?", "Help"),
+        action_hint("ctrl-r", "Refresh"),
+    ];
+    if !app.read_only {
+        hints.push(action_hint("a", "Apply"));
         hints.push(action_hint("e", "Edit"));
-        if app.kind.known_kind() == Some(ResourceKind::Nodes) {
-            let scheduling_action = if app
-                .selected_row()
-                .and_then(crate::model::ResourceRow::node_data)
-                .is_some_and(|data| data.unschedulable)
-            {
-                "Uncordon"
-            } else {
-                "Cordon"
-            };
-            hints.push(action_hint("u", scheduling_action));
-            hints.push(action_hint("r", "Drain"));
-        } else if app.is_restartable_workload() {
-            hints.push(action_hint("r", "Restart"));
-        }
+        hints.push(action_hint("ctrl-d", "Delete"));
+    }
+    hints
+}
+
+fn pulse_action_hints(enter_label: &str) -> Vec<HeaderHint> {
+    vec![
+        action_hint("enter", enter_label),
+        action_hint("tab", "Next"),
+        action_hint("shift-tab", "Prev"),
+        action_hint("?", "Help"),
+        action_hint("ctrl-r", "Refresh"),
+    ]
+}
+
+fn xray_action_hints(app: &App, enter_label: &str) -> Vec<HeaderHint> {
+    let mut hints = vec![
+        action_hint("enter", enter_label),
+        action_hint("x", "Expand/Collapse"),
+        action_hint("y", "YAML"),
+        action_hint("d", "Describe"),
+        action_hint("l", "Logs"),
+        action_hint("p", "Logs Previous"),
+        action_hint("c", "Copy Name"),
+        action_hint("?", "Help"),
+        action_hint("ctrl-r", "Refresh"),
+    ];
+    if !app.read_only {
+        hints.push(action_hint("s", "Shell"));
+        hints.push(action_hint("a", "Attach"));
+        hints.push(action_hint("e", "Edit"));
+        hints.push(action_hint("ctrl-d", "Delete"));
+        hints.push(action_hint("ctrl-k", "Kill"));
+    }
+    hints
+}
+
+fn scans_action_hints(enter_label: &str) -> Vec<HeaderHint> {
+    vec![
+        action_hint("enter", enter_label),
+        action_hint("shift-s", "Sort Severity"),
+        action_hint("shift-v", "Sort Vulnerability"),
+        action_hint("shift-l", "Sort Lib"),
+        action_hint("shift-f", "Sort Fixed-in"),
+        action_hint("c", "Copy Name"),
+        action_hint("?", "Help"),
+        action_hint("ctrl-r", "Refresh"),
+    ]
+}
+
+fn benchmark_action_hints(app: &App, enter_label: &str) -> Vec<HeaderHint> {
+    let mut hints = vec![
+        action_hint("enter", enter_label),
+        action_hint("y", "YAML"),
+        action_hint("c", "Copy Name"),
+        action_hint("?", "Help"),
+        action_hint("ctrl-r", "Refresh"),
+    ];
+    if !app.read_only {
         let delete_label = if app.marks.is_empty() {
             "Delete".to_owned()
         } else {
             format!("Delete ({})", app.marks.len())
         };
         hints.push(action_hint("ctrl-d", &delete_label));
-        hints.push(action_hint("ctrl-k", "Kill"));
     }
     hints
+}
+
+fn helm_action_hints(app: &App, enter_label: &str) -> Vec<HeaderHint> {
+    let mut hints = Vec::new();
+    if !app.kind.is_helm_history() || !app.read_only {
+        hints.push(action_hint("enter", enter_label));
+    }
+    hints.extend([
+        action_hint("v", "Values"),
+        action_hint("y", "YAML"),
+        action_hint("d", "Describe"),
+        action_hint("c", "Copy Name"),
+        action_hint("?", "Help"),
+        action_hint("ctrl-r", "Refresh"),
+    ]);
+    if app.kind.is_helm() && !app.read_only {
+        let delete_label = if app.marks.is_empty() {
+            "Delete".to_owned()
+        } else {
+            format!("Delete ({})", app.marks.len())
+        };
+        hints.push(action_hint("ctrl-d", &delete_label));
+    }
+    hints
+}
+
+fn append_mutation_action_hints(hints: &mut Vec<HeaderHint>, app: &App) {
+    hints.push(action_hint("e", "Edit"));
+    if app.kind.is_apps_v1_replica_set() {
+        hints.push(action_hint("ctrl-l", "Rollback"));
+    }
+    if crate::source::supports_images(&app.kind) {
+        hints.push(action_hint("i", "Set Image"));
+    }
+    if app.kind.is_scalable() {
+        hints.push(action_hint("s", "Scale"));
+    }
+    if app.kind.is_cron_job() {
+        hints.push(action_hint("t", "Trigger"));
+        hints.push(action_hint("s", "Suspend/Resume"));
+    }
+    if app.kind.known_kind() == Some(ResourceKind::Nodes) {
+        if app.user_config.node_shell_enabled(&app.context) {
+            hints.push(action_hint("s", "Shell"));
+        }
+        hints.push(action_hint("c", "Cordon"));
+        let scheduling_action = if app
+            .selected_row()
+            .and_then(crate::model::ResourceRow::node_data)
+            .is_some_and(|data| data.unschedulable)
+        {
+            "Uncordon"
+        } else {
+            "Cordon"
+        };
+        hints.push(action_hint("u", scheduling_action));
+        hints.push(action_hint("r", "Drain"));
+    } else if app.is_restartable_workload() {
+        hints.push(action_hint("r", "Restart"));
+    }
+    let delete_label = if app.marks.is_empty() {
+        "Delete".to_owned()
+    } else {
+        format!("Delete ({})", app.marks.len())
+    };
+    hints.push(action_hint("ctrl-d", &delete_label));
+    if !app.kind.is_workloads() {
+        hints.push(action_hint("ctrl-k", "Kill"));
+    }
 }
 
 fn action_hint(key: &str, label: &str) -> HeaderHint {
@@ -814,17 +1184,39 @@ fn action_hint(key: &str, label: &str) -> HeaderHint {
     }
 }
 
-fn header_hint_cell(hint: &HeaderHint, key_width: usize) -> Cell<'static> {
+fn header_hint_cell(skin: &Skin, hint: &HeaderHint, key_width: usize) -> Cell<'static> {
     let key = format!("<{}>", hint.key);
     let padding = " ".repeat(key_width.saturating_sub(key.chars().count()));
     let key_color = match hint.kind {
-        HeaderHintKind::Namespace => GREEN,
-        HeaderHintKind::Action => PINK,
+        HeaderHintKind::Namespace => skin.color("frame.menu.numKeyColor", GREEN),
+        HeaderHintKind::Action => skin.color("frame.menu.keyColor", PINK),
+        HeaderHintKind::LogRange => skin.color("views.logs.indicator.fgColor", GREEN),
+        HeaderHintKind::LogAction => skin.color("views.logs.indicator.fgColor", PINK),
     };
     let label_style = if hint.active {
-        Style::default().fg(Color::White).bg(SELECTED).bold()
+        skin.table_cursor(
+            skin.style("frame.menu", Style::default())
+                .fg(Color::White)
+                .bg(SELECTED)
+                .bold(),
+        )
     } else {
-        Style::default().fg(MUTED)
+        skin.style("frame.menu", Style::default().fg(MUTED))
+    };
+    let label_style = if matches!(
+        hint.kind,
+        HeaderHintKind::LogRange | HeaderHintKind::LogAction
+    ) {
+        skin.foreground(
+            if hint.active {
+                "views.logs.indicator.toggleOnColor"
+            } else {
+                "views.logs.indicator.toggleOffColor"
+            },
+            skin.component_style("views.logs.indicator", label_style),
+        )
+    } else {
+        label_style
     };
     Cell::from(Line::from(vec![
         Span::styled(key, Style::default().fg(key_color).bold()),
@@ -833,11 +1225,12 @@ fn header_hint_cell(hint: &HeaderHint, key_width: usize) -> Cell<'static> {
     ]))
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ViewColumn {
     label: String,
     field: Option<SortField>,
     table_index: Option<usize>,
+    json_path: Option<String>,
     table_age: bool,
     kubectl_age: bool,
     width: Constraint,
@@ -854,6 +1247,7 @@ fn view_column(
         label: label.to_owned(),
         field: Some(field),
         table_index: None,
+        json_path: None,
         table_age: false,
         kubectl_age: false,
         width,
@@ -862,11 +1256,24 @@ fn view_column(
 }
 
 fn columns_for_view(app: &App, width: u16) -> Vec<ViewColumn> {
-    let scrollable_pods = is_pod_list(app);
+    columns_for_view_options(app, width, false)
+}
+
+#[allow(clippy::too_many_lines)]
+fn columns_for_view_options(app: &App, width: u16, include_hidden: bool) -> Vec<ViewColumn> {
+    if app.is_reference_view() {
+        return vec![
+            view_column("NAMESPACE", SortField::Namespace, Constraint::Fill(2), 0),
+            view_column("NAME", SortField::Name, Constraint::Fill(4), 0),
+            view_column("GVR", SortField::Details, Constraint::Fill(4), 0),
+        ];
+    }
+    let scrollable_resources = is_scrollable_resource_list(app);
     let mut columns = vec![ViewColumn {
         label: String::new(),
         field: None,
         table_index: None,
+        json_path: None,
         table_age: false,
         kubectl_age: false,
         width: Constraint::Length(2),
@@ -874,8 +1281,9 @@ fn columns_for_view(app: &App, width: u16) -> Vec<ViewColumn> {
     }];
     let show_namespace = app.is_resource_view()
         && app.kind.is_namespaced()
-        && (app.namespace.is_none() || app.ui.wide())
-        && (scrollable_pods || width >= 64);
+        && !app.kind.is_workloads()
+        && (include_hidden || app.namespace.is_none() || app.ui.wide())
+        && (scrollable_resources || width >= 64);
     if show_namespace {
         columns.push(view_column(
             "NAMESPACE",
@@ -887,25 +1295,52 @@ fn columns_for_view(app: &App, width: u16) -> Vec<ViewColumn> {
     let kind_columns = if app.is_policy_view() {
         policy_columns()
     } else if app.is_container_view() {
-        container_columns()
+        container_columns(include_hidden || app.ui.wide())
     } else if app.kind.is_api_service() {
         api_service_columns(app)
     } else if !app.snapshot.table_columns.is_empty() {
-        server_table_columns(app, show_namespace)
+        server_table_columns(app, show_namespace, include_hidden)
     } else {
         match app.kind.known_kind() {
-            Some(ResourceKind::Pods) => pod_columns(),
-            Some(ResourceKind::Nodes) => node_columns(app),
-            _ => generic_columns(app.ui.wide()),
+            Some(ResourceKind::Pods) => pod_columns(
+                include_hidden || app.ui.wide(),
+                !app.active_port_forwards.is_empty(),
+            ),
+            Some(ResourceKind::Nodes) => node_columns(app, include_hidden || app.ui.wide()),
+            _ => generic_columns(include_hidden || app.ui.wide()),
         }
     };
     columns.extend(
-        kind_columns
-            .into_iter()
-            .filter(|column| scrollable_pods || width >= column.visible_from),
+        kind_columns.into_iter().filter(|column| {
+            include_hidden || scrollable_resources || width >= column.visible_from
+        }),
     );
-    if scrollable_pods {
-        // Pod names must not share a shrinking Fill constraint with other columns.
+    if app.user_config.settings.image_scans.enable
+        && (app.is_container_view()
+            || (app.is_resource_view() && app.kind.supports_vulnerability_scans()))
+        && !columns
+            .iter()
+            .any(|col| col.label.eq_ignore_ascii_case("VS"))
+    {
+        let insert_idx = columns
+            .iter()
+            .position(|col| col.label.eq_ignore_ascii_case("NAME"))
+            .map_or(columns.len(), |idx| idx + 1);
+        columns.insert(
+            insert_idx,
+            view_column("VS", SortField::VulnScore, Constraint::Length(6), 0),
+        );
+    }
+    if app.is_resource_view()
+        && let Some(custom_view) = app
+            .user_config
+            .custom_view_for(&app.kind, app.namespace.as_deref())
+        && !custom_view.columns.is_empty()
+    {
+        columns = apply_custom_view_columns(app, &columns, custom_view, include_hidden);
+    }
+    if scrollable_resources && width != u16::MAX {
+        // Resource names must not share a shrinking Fill constraint with other columns.
         // Measure every loaded row so vertical scrolling cannot truncate a longer name.
         for column in &mut columns {
             if matches!(column.width, Constraint::Fill(_)) {
@@ -917,6 +1352,9 @@ fn columns_for_view(app: &App, width: u16) -> Vec<ViewColumn> {
                         Some(SortField::Namespace) => row.namespace.len(),
                         Some(SortField::Name) => row.name.len(),
                         Some(SortField::Node) => row.pod_data().map_or(0, |pod| pod.node.len()),
+                        Some(SortField::Details) if column.label == "IMAGE" => {
+                            row.container_data().map_or(0, |c| c.image.len())
+                        }
                         _ => 0,
                     })
                     .max()
@@ -929,12 +1367,143 @@ fn columns_for_view(app: &App, width: u16) -> Vec<ViewColumn> {
     columns
 }
 
+/// Plugin column variables use the same formatting as the table, including wide columns.
+/// This is a read-only projection and does not modify viewport or selection state.
+pub(crate) fn plugin_column_values(
+    app: &App,
+    row: &crate::model::ResourceRow,
+) -> Vec<(String, String)> {
+    columns_for_view_options(app, u16::MAX, true)
+        .into_iter()
+        .filter(|column| !column.label.is_empty())
+        .map(|column| {
+            let value = if let Some(path) = &column.json_path {
+                row.json_path_value(path)
+            } else if column.kubectl_age {
+                format_kubectl_age(row.age_seconds(app.now_unix))
+            } else if let Some(index) = column.table_index {
+                table_column_value(row, index, column.table_age, app.now_unix)
+            } else if let Some(field) = column.field {
+                if field == SortField::VulnScore {
+                    crate::app::row_vuln_score(row, &app.user_config.settings.image_scans)
+                } else {
+                    column_value(row, field, app.now_unix)
+                }
+            } else {
+                computed_column_value(row, &column.label)
+            };
+            (column.label, value)
+        })
+        .collect()
+}
+
+fn apply_custom_view_columns(
+    app: &App,
+    base_columns: &[ViewColumn],
+    custom_view: &crate::config::CustomViewSpec,
+    include_hidden: bool,
+) -> Vec<ViewColumn> {
+    let mut out = Vec::with_capacity(custom_view.columns.len() + 2);
+    if let Some(mark_col) = base_columns.first().filter(|col| col.label.is_empty()) {
+        out.push(mark_col.clone());
+    }
+    let has_explicit_ns = custom_view
+        .columns
+        .iter()
+        .any(|col| col.name.eq_ignore_ascii_case("namespace"));
+    if !has_explicit_ns
+        && let Some(ns_col) = base_columns
+            .iter()
+            .find(|col| col.label.eq_ignore_ascii_case("NAMESPACE"))
+    {
+        out.push(ns_col.clone());
+    }
+    for spec in &custom_view.columns {
+        if !include_hidden {
+            if spec.is_hidden() {
+                continue;
+            }
+            if spec.is_wide_only() && !app.ui.wide() {
+                continue;
+            }
+        }
+        if let Some(path) = &spec.json_path {
+            let label = spec.name.to_ascii_uppercase();
+            let content_width = app
+                .snapshot
+                .rows
+                .iter()
+                .take(200)
+                .map(|row| row.json_path_value(path).chars().count())
+                .max()
+                .unwrap_or(0)
+                .max(label.chars().count())
+                .clamp(4, 48);
+            out.push(ViewColumn {
+                label,
+                field: None,
+                table_index: None,
+                json_path: Some(path.clone()),
+                table_age: false,
+                kubectl_age: false,
+                width: Constraint::Length(u16::try_from(content_width).unwrap_or(48)),
+                visible_from: 0,
+            });
+        } else if let Some(existing) = base_columns
+            .iter()
+            .find(|col| col.label.eq_ignore_ascii_case(&spec.name))
+        {
+            out.push(existing.clone());
+        } else if spec.name.eq_ignore_ascii_case("labels") {
+            let content_width = app
+                .snapshot
+                .rows
+                .iter()
+                .take(200)
+                .map(|row| row.labels.chars().count())
+                .max()
+                .unwrap_or(0)
+                .max("LABELS".len())
+                .clamp(6, 48);
+            out.push(ViewColumn {
+                label: "LABELS".to_owned(),
+                field: None,
+                table_index: None,
+                json_path: Some(".metadata.labels".to_owned()),
+                table_age: false,
+                kubectl_age: false,
+                width: Constraint::Length(u16::try_from(content_width).unwrap_or(48)),
+                visible_from: 0,
+            });
+        }
+    }
+    out
+}
+
 fn is_pod_list(app: &App) -> bool {
     app.is_resource_view() && app.kind.known_kind() == Some(ResourceKind::Pods)
 }
 
+fn is_scrollable_resource_list(app: &App) -> bool {
+    is_pod_list(app)
+        || (app.is_resource_view() && app.kind.is_workloads())
+        || (app.is_resource_view()
+            && matches!(
+                app.kind.known_kind(),
+                Some(
+                    ResourceKind::Nodes
+                        | ResourceKind::Deployments
+                        | ResourceKind::StatefulSets
+                        | ResourceKind::DaemonSets
+                        | ResourceKind::Services
+                )
+            ))
+        || (app.is_resource_view() && !app.snapshot.table_columns.is_empty())
+        || app.is_container_view()
+}
+
 fn resource_table_width(app: &App, columns: &[ViewColumn], viewport_width: u16) -> u16 {
-    if !is_pod_list(app) {
+    if !is_scrollable_resource_list(app) {
         return viewport_width;
     }
     columns
@@ -949,7 +1518,12 @@ fn resource_table_width(app: &App, columns: &[ViewColumn], viewport_width: u16) 
         .max(viewport_width)
 }
 
-fn server_table_columns(app: &App, namespace_already_shown: bool) -> Vec<ViewColumn> {
+#[allow(clippy::too_many_lines)]
+fn server_table_columns(
+    app: &App,
+    namespace_already_shown: bool,
+    include_hidden: bool,
+) -> Vec<ViewColumn> {
     let has_age = app
         .snapshot
         .table_columns
@@ -959,16 +1533,56 @@ fn server_table_columns(app: &App, namespace_already_shown: bool) -> Vec<ViewCol
         .table_columns
         .iter()
         .enumerate()
-        .filter(|(_, column)| app.ui.wide() || column.priority == 0)
+        .filter(|(_, column)| include_hidden || app.ui.wide() || column.priority == 0)
         .filter(|(_, column)| {
             !namespace_already_shown || !column.name.eq_ignore_ascii_case("namespace")
         })
         .map(|(index, column)| {
-            let table_age = !has_age && is_created_at_column(&column.name);
+            let table_age = ((app.kind.is_workloads()
+                || app.kind.is_helm()
+                || app.kind.is_benchmarks()
+                || matches!(
+                    app.kind.known_kind(),
+                    Some(
+                        ResourceKind::Deployments
+                            | ResourceKind::StatefulSets
+                            | ResourceKind::DaemonSets
+                            | ResourceKind::Services
+                    )
+                )
+                || app.kind.is_apps_v1_replica_set())
+                && column.name.eq_ignore_ascii_case("age"))
+                || (!has_age && is_created_at_column(&column.name));
             let field = match column.name.to_ascii_lowercase().as_str() {
+                "kind" if app.kind.is_workloads() => Some(SortField::Kind),
+                "kind" if app.kind.is_subject() => Some(SortField::Status),
+                "first location" if app.kind.is_subject() => Some(SortField::Ready),
+                "revision" if app.kind.is_helm() || app.kind.is_helm_history() => {
+                    Some(SortField::Ready)
+                }
+                "req/s" if app.kind.is_benchmarks() => Some(SortField::Ready),
+                "report" if app.kind.is_benchmarks() => Some(SortField::Details),
+                "chart" if app.kind.is_helm() => Some(SortField::Details),
+                "description" if app.kind.is_helm_history() => Some(SortField::Details),
+                "path" if app.kind.is_dir() => Some(SortField::Name),
+                "severity" if app.kind.is_scans() => Some(SortField::Status),
+                "vulnerability" if app.kind.is_scans() => Some(SortField::Name),
+                "library" if app.kind.is_scans() => Some(SortField::Details),
+                "fixed-in" if app.kind.is_scans() => Some(SortField::Ready),
+                "origin" if app.kind.is_skins() => Some(SortField::Details),
+                "message" | "claim" | "volume" | "data" => Some(SortField::Details),
+                "valid"
+                    if app.kind.is_workloads()
+                        || app.kind.is_helm()
+                        || app.kind.is_helm_history()
+                        || app.kind.is_benchmarks() =>
+                {
+                    Some(SortField::Validity)
+                }
+                "namespace" => Some(SortField::Namespace),
                 "name" => Some(SortField::Name),
-                "status" => Some(SortField::Status),
-                "ready" => Some(SortField::Ready),
+                "status" | "type" | "phase" | "available" => Some(SortField::Status),
+                "ready" | "completions" | "reason" => Some(SortField::Ready),
                 "age" => Some(SortField::Age),
                 _ if table_age => Some(SortField::Age),
                 _ => None,
@@ -1005,6 +1619,7 @@ fn server_table_columns(app: &App, namespace_already_shown: bool) -> Vec<ViewCol
                 label,
                 field,
                 table_index: Some(index),
+                json_path: None,
                 table_age,
                 kubectl_age: false,
                 width,
@@ -1022,6 +1637,21 @@ fn is_created_at_column(name: &str) -> bool {
 }
 
 fn resource_list_scope(app: &App) -> &str {
+    if app.kind.is_dir()
+        && let Some(path) = app.field_selector.as_deref()
+    {
+        return path.strip_prefix("path=").unwrap_or(path);
+    }
+    if app.kind.is_helm_history()
+        && let Some(release) = app.field_selector.as_deref()
+    {
+        return release.strip_prefix("release=").unwrap_or(release);
+    }
+    if app.kind.is_benchmarks()
+        && let Some(filter) = app.field_selector.as_deref()
+    {
+        return filter;
+    }
     if app.kind.known_kind() == Some(ResourceKind::Pods)
         && let Some(node) = app
             .field_selector
@@ -1096,24 +1726,40 @@ fn policy_columns() -> Vec<ViewColumn> {
     ]
 }
 
-fn container_columns() -> Vec<ViewColumn> {
-    vec![
-        view_column("NAME", SortField::Name, Constraint::Fill(4), 0),
-        view_column("READY", SortField::Ready, Constraint::Length(7), 44),
-        view_column("STATUS", SortField::Status, Constraint::Length(20), 0),
-        view_column("RESTARTS", SortField::Restarts, Constraint::Length(9), 64),
-        view_column("IMAGE", SortField::Details, Constraint::Fill(5), 52),
-        view_column("AGE", SortField::Age, Constraint::Length(8), 76),
-    ]
+fn plain_view_column(label: &'static str, width: Constraint, visible_from: u16) -> ViewColumn {
+    ViewColumn {
+        label: label.to_owned(),
+        field: None,
+        table_index: None,
+        json_path: None,
+        table_age: false,
+        kubectl_age: false,
+        width,
+        visible_from,
+    }
 }
 
-fn pod_columns() -> Vec<ViewColumn> {
-    vec![
-        view_column("NAME", SortField::Name, Constraint::Fill(5), 0),
-        view_column("READY", SortField::Ready, Constraint::Length(7), 46),
-        view_column("STATUS", SortField::Status, Constraint::Length(18), 0),
-        view_column("RESTARTS", SortField::Restarts, Constraint::Length(9), 68),
+fn container_columns(wide: bool) -> Vec<ViewColumn> {
+    let mut columns = vec![
+        plain_view_column("INDEX", Constraint::Length(6), 0),
+        view_column("NAME", SortField::Name, Constraint::Fill(4), 0),
+        plain_view_column("PF", Constraint::Length(3), 0),
+        view_column("IMAGE", SortField::Details, Constraint::Fill(5), 52),
+        view_column("READY", SortField::Ready, Constraint::Length(7), 44),
+        view_column("STATE", SortField::Status, Constraint::Length(18), 0),
+        plain_view_column("INIT", Constraint::Length(5), 0),
+        view_column("RESTARTS", SortField::Restarts, Constraint::Length(9), 64),
+        plain_view_column("PROBES(L:R)", Constraint::Length(12), 70),
         view_column("CPU", SortField::Cpu, Constraint::Length(8), 84),
+        view_column("MEM", SortField::Memory, Constraint::Length(10), 92),
+    ];
+    if wide {
+        columns.extend([
+            plain_view_column("CPU/R:L", Constraint::Length(12), 0),
+            plain_view_column("MEM/R:L", Constraint::Length(14), 0),
+        ]);
+    }
+    columns.extend([
         view_column(
             "%CPU/R",
             SortField::CpuRequestPercent,
@@ -1126,7 +1772,6 @@ fn pod_columns() -> Vec<ViewColumn> {
             Constraint::Length(8),
             116,
         ),
-        view_column("MEM", SortField::Memory, Constraint::Length(10), 92),
         view_column(
             "%MEM/R",
             SortField::MemoryRequestPercent,
@@ -1139,12 +1784,86 @@ fn pod_columns() -> Vec<ViewColumn> {
             Constraint::Length(8),
             148,
         ),
-        view_column("NODE", SortField::Node, Constraint::Fill(3), 76),
-        view_column("AGE", SortField::Age, Constraint::Length(8), 38),
-    ]
+        plain_view_column("PORTS", Constraint::Length(16), 88),
+        view_column("AGE", SortField::Age, Constraint::Length(8), 76),
+    ]);
+    columns
 }
 
-fn node_columns(app: &App) -> Vec<ViewColumn> {
+fn pod_columns(wide: bool, has_pf: bool) -> Vec<ViewColumn> {
+    let mut columns = vec![view_column("NAME", SortField::Name, Constraint::Fill(5), 0)];
+    if wide || has_pf {
+        columns.push(plain_view_column("PF", Constraint::Length(3), 0));
+    }
+    columns.extend([
+        view_column("READY", SortField::Ready, Constraint::Length(7), 46),
+        view_column("STATUS", SortField::Status, Constraint::Length(18), 0),
+        view_column("RESTARTS", SortField::Restarts, Constraint::Length(9), 68),
+        view_column("CPU", SortField::Cpu, Constraint::Length(8), 84),
+        view_column("MEM", SortField::Memory, Constraint::Length(10), 92),
+    ]);
+    if wide {
+        columns.extend([
+            plain_view_column("CPU/R:L", Constraint::Length(12), 0),
+            plain_view_column("MEM/R:L", Constraint::Length(14), 0),
+        ]);
+    }
+    columns.extend([
+        view_column(
+            "%CPU/R",
+            SortField::CpuRequestPercent,
+            Constraint::Length(8),
+            100,
+        ),
+        view_column(
+            "%CPU/L",
+            SortField::CpuLimitPercent,
+            Constraint::Length(8),
+            116,
+        ),
+        view_column(
+            "%MEM/R",
+            SortField::MemoryRequestPercent,
+            Constraint::Length(8),
+            132,
+        ),
+        view_column(
+            "%MEM/L",
+            SortField::MemoryLimitPercent,
+            Constraint::Length(8),
+            148,
+        ),
+    ]);
+    if wide {
+        columns.extend([
+            plain_view_column("IP", Constraint::Length(15), 0),
+            view_column("NODE", SortField::Node, Constraint::Fill(3), 0),
+        ]);
+    } else {
+        columns.extend([
+            plain_view_column("IP", Constraint::Length(15), 72),
+            view_column("NODE", SortField::Node, Constraint::Fill(3), 76),
+        ]);
+    }
+    if wide {
+        columns.extend([
+            plain_view_column("NOMINATED NODE", Constraint::Length(15), 0),
+            plain_view_column("READINESS GATES", Constraint::Length(16), 0),
+            plain_view_column("QOS", Constraint::Length(11), 0),
+            plain_view_column("LABELS", Constraint::Length(24), 0),
+            plain_view_column("VALID", Constraint::Length(10), 0),
+        ]);
+    }
+    columns.push(view_column(
+        "AGE",
+        SortField::Age,
+        Constraint::Length(8),
+        38,
+    ));
+    columns
+}
+
+fn node_columns(app: &App, wide: bool) -> Vec<ViewColumn> {
     let status_width = app
         .snapshot
         .rows
@@ -1155,7 +1874,7 @@ fn node_columns(app: &App) -> Vec<ViewColumn> {
         .clamp(8, 32);
     let status_width = u16::try_from(status_width).unwrap_or(32);
 
-    vec![
+    let mut columns = vec![
         view_column("NAME", SortField::Name, Constraint::Fill(5), 0),
         view_column(
             "STATUS",
@@ -1163,27 +1882,51 @@ fn node_columns(app: &App) -> Vec<ViewColumn> {
             Constraint::Length(status_width),
             0,
         ),
+        view_column("ROLE", SortField::Ready, Constraint::Length(16), 54),
+        plain_view_column("ARCH", Constraint::Length(13), 80),
         view_column("TAINTS", SortField::Taints, Constraint::Length(8), 70),
         view_column("VERSION", SortField::Version, Constraint::Length(22), 88),
+    ];
+    if wide {
+        columns.extend([
+            plain_view_column("KERNEL", Constraint::Length(20), 0),
+            plain_view_column("OS", Constraint::Length(22), 0),
+            plain_view_column("INTERNAL-IP", Constraint::Length(15), 0),
+            plain_view_column("EXTERNAL-IP", Constraint::Length(15), 0),
+        ]);
+    }
+    columns.extend([
         view_column("PODS", SortField::Pods, Constraint::Length(7), 62),
         view_column("CPU", SortField::Cpu, Constraint::Length(8), 102),
+        view_column("MEM", SortField::Memory, Constraint::Length(10), 108),
+        view_column("%CPU", SortField::CpuPercent, Constraint::Length(7), 132),
+        view_column("%MEM", SortField::MemoryPercent, Constraint::Length(7), 160),
         view_column(
             "CPU/A",
             SortField::CpuAllocatable,
             Constraint::Length(8),
             118,
         ),
-        view_column("%CPU", SortField::CpuPercent, Constraint::Length(7), 132),
-        view_column("MEM", SortField::Memory, Constraint::Length(10), 108),
         view_column(
             "MEM/A",
             SortField::MemoryAllocatable,
             Constraint::Length(10),
             146,
         ),
-        view_column("%MEM", SortField::MemoryPercent, Constraint::Length(7), 160),
-        view_column("AGE", SortField::Age, Constraint::Length(8), 38),
-    ]
+    ]);
+    if wide {
+        columns.extend([
+            plain_view_column("LABELS", Constraint::Length(24), 0),
+            plain_view_column("VALID", Constraint::Length(10), 0),
+        ]);
+    }
+    columns.push(view_column(
+        "AGE",
+        SortField::Age,
+        Constraint::Length(8),
+        38,
+    ));
+    columns
 }
 
 fn generic_columns(wide: bool) -> Vec<ViewColumn> {
@@ -1210,8 +1953,16 @@ fn generic_columns(wide: bool) -> Vec<ViewColumn> {
 }
 
 fn draw_resources(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    if app.kind.is_pulses() && app.is_resource_view() {
+        pulses::draw(frame, app, area);
+        return;
+    }
+    if app.kind.is_xray() && app.is_resource_view() {
+        xray::draw(frame, app, area);
+        return;
+    }
     let show_header = !matches!(app.snapshot.state, SourceState::Loading { loaded: 0 });
-    let viewport_height = usize::from(area.height.saturating_sub(if show_header { 3 } else { 2 }));
+    let viewport_height = usize::from(area.height.saturating_sub(if show_header { 4 } else { 2 }));
     app.set_viewport_height(viewport_height);
     let columns = columns_for_view(app, area.width);
     let table_width = resource_table_width(app, &columns, area.width.saturating_sub(2));
@@ -1223,68 +1974,74 @@ fn draw_resources(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     };
     let filter_matcher = FilterMatcher::new(filter);
 
+    let active_ns_for_table = app
+        .kind
+        .is_core_v1_namespace()
+        .then_some(app.namespace.as_deref())
+        .flatten();
     let rows = app.visible_rows().map(|(position, item)| {
         let selected = position == app.selected;
         let marked = app.marks.contains(&item.key);
-        let style = resource_row_style(position, selected);
+        let style = resource_row_style(&app.theme, position, selected);
         let cells = columns.iter().map(|column| {
             resource_cell(
+                &app.theme,
                 column,
                 item,
                 selected,
                 marked,
                 app.now_unix,
                 &filter_matcher,
+                &app.user_config.settings,
+                active_ns_for_table,
             )
         });
         Row::new(cells).style(style)
     });
 
     let widths: Vec<_> = columns.iter().map(|column| column.width).collect();
-    let filter_suffix = if filter.is_empty() {
-        String::new()
-    } else {
-        format!(" /{filter}")
-    };
-    let visible_count = app.filtered.len();
-    let title = match &app.list_mode {
-        ListMode::Resources => format!(
-            " {}({})[{}]{} ",
-            app.kind.plural_name(),
-            resource_list_scope(app),
-            visible_count,
-            filter_suffix
-        ),
-        ListMode::Containers { namespace, pod } => {
-            format!(" containers({namespace}/{pod})[{visible_count}]{filter_suffix} ")
-        }
-        ListMode::Policy { title } => {
-            format!(" {title}[{visible_count}]{filter_suffix} ")
-        }
-    };
+    let title = resource_view_title(app, filter);
     let hitbox_widths = widths.clone();
     let block = notice_block(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(BODY_BORDER))
-            .title(Span::styled(title, Style::default().fg(CYAN).bold()))
+            .border_style(Style::default().fg(app.theme.color("frame.border.fgColor", BODY_BORDER)))
+            .title(Span::styled(
+                title,
+                app.theme
+                    .style("frame.title", Style::default().fg(CYAN).bold()),
+            ))
             .title_alignment(Alignment::Center),
         app,
     );
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let mut table = Table::new(rows, widths).column_spacing(1);
+    let mut table = Table::new(rows, widths)
+        .style(app.theme.style("views.table", Style::default()))
+        .column_spacing(1);
     if show_header {
         let header_cells = columns.iter().map(|column| {
             column.field.map_or_else(
-                || Cell::from(column.label.clone()).style(Style::default().fg(CYAN).bold()),
+                || {
+                    Cell::from(column.label.clone()).style(
+                        app.theme
+                            .style("views.table.header", Style::default().fg(CYAN).bold()),
+                    )
+                },
                 |field| column_header(app, &column.label, field),
             )
         });
         table = table.header(Row::new(header_cells).bottom_margin(1));
     }
-    draw_scrolled_table(frame, table, inner, table_width, app.list_horizontal_scroll);
+    draw_scrolled_table(
+        frame,
+        table,
+        inner,
+        table_width,
+        app.list_horizontal_scroll,
+        preferences::body_style(app),
+    );
     if show_header {
         update_column_hitboxes(app, area, &hitbox_widths, &columns);
     } else {
@@ -1293,21 +2050,58 @@ fn draw_resources(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     update_resource_rows_hitbox(app, area, show_header);
 
     if app.filtered.is_empty() {
-        let message = match &app.snapshot.state {
-            SourceState::Loading { loaded: 0 } => "Waiting for resources…",
-            SourceState::Loading { .. } => "Loading more resources…",
-            SourceState::Error(error) => error.as_ref(),
-            SourceState::Ready if app.filter_error.is_some() => "Invalid regular expression",
-            SourceState::Ready if app.query.is_empty() => "No resources found",
-            SourceState::Ready => "No resources match the filter",
-        };
-        frame.render_widget(
-            Paragraph::new(message)
-                .alignment(Alignment::Center)
-                .style(Style::default().fg(MUTED)),
-            centered_rect(70, 3, area),
-        );
+        draw_empty_resources(frame, app, area);
     }
+}
+
+fn resource_view_title(app: &App, filter: &str) -> String {
+    let filter_suffix = if filter.is_empty() {
+        String::new()
+    } else {
+        format!(" /{filter}")
+    };
+    let visible_count = app.filtered.len();
+    match &app.list_mode {
+        ListMode::Resources if app.instance.is_some() => {
+            let instance = app.instance.as_ref().expect("instance view");
+            let identity = instance.namespace.as_ref().map_or_else(
+                || instance.name.clone(),
+                |namespace| format!("{namespace}/{}", instance.name),
+            );
+            format!(
+                " {}({identity})[{visible_count}]{filter_suffix} ",
+                app.kind.plural_name()
+            )
+        }
+        ListMode::Resources => format!(
+            " {}({})[{visible_count}]{filter_suffix} ",
+            app.kind.plural_name(),
+            resource_list_scope(app)
+        ),
+        ListMode::Containers { namespace, pod } => {
+            format!(" containers({namespace}/{pod})[{visible_count}]{filter_suffix} ")
+        }
+        ListMode::Policy { title } | ListMode::References { title } => {
+            format!(" {title}[{visible_count}]{filter_suffix} ")
+        }
+    }
+}
+
+fn draw_empty_resources(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let message = match &app.snapshot.state {
+        SourceState::Loading { loaded: 0 } => "Waiting for resources…",
+        SourceState::Loading { .. } => "Loading more resources…",
+        SourceState::Error(error) => error.as_ref(),
+        SourceState::Ready if app.filter_error.is_some() => "Invalid regular expression",
+        SourceState::Ready if app.query.is_empty() => "No resources found",
+        SourceState::Ready => "No resources match the filter",
+    };
+    frame.render_widget(
+        Paragraph::new(message)
+            .alignment(Alignment::Center)
+            .style(app.theme.style("views.table", Style::default().fg(MUTED))),
+        centered_rect(70, 3, area),
+    );
 }
 
 fn draw_scrolled_table(
@@ -1316,6 +2110,7 @@ fn draw_scrolled_table(
     viewport: Rect,
     width: u16,
     scroll: u16,
+    base_style: Style,
 ) {
     if width <= viewport.width {
         frame.render_widget(table, viewport);
@@ -1325,6 +2120,7 @@ fn draw_scrolled_table(
     // horizontal viewport. Keep the border/title outside this scrolling buffer.
     let area = Rect::new(0, 0, width, viewport.height);
     let mut buffer = Buffer::empty(area);
+    buffer.set_style(area, base_style);
     table.render(area, &mut buffer);
     let target = frame.buffer_mut();
     for y in 0..viewport.height {
@@ -1334,29 +2130,58 @@ fn draw_scrolled_table(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resource_cell(
+    skin: &Skin,
     column: &ViewColumn,
     row: &crate::model::ResourceRow,
     selected: bool,
     marked: bool,
     now_unix: i64,
     filter_matcher: &FilterMatcher,
+    settings: &crate::config::Settings,
+    active_ns_for_table: Option<&str>,
 ) -> Cell<'static> {
-    let value = if column.kubectl_age {
+    let value = if let Some(path) = &column.json_path {
+        row.json_path_value(path)
+    } else if column.kubectl_age {
         format_kubectl_age(row.age_seconds(now_unix))
     } else if let Some(index) = column.table_index {
-        table_column_value(row, index, column.table_age, now_unix)
+        let mut val = table_column_value(row, index, column.table_age, now_unix);
+        if index == 0 && active_ns_for_table == Some(row.name.as_ref()) {
+            val.push_str("(*)");
+        }
+        val
     } else if let Some(field) = column.field {
-        column_value(row, field, now_unix)
+        if field == SortField::VulnScore {
+            crate::app::row_vuln_score(row, &settings.image_scans)
+        } else if field == SortField::Name && active_ns_for_table == Some(row.name.as_ref()) {
+            format!("{}(*)", row.name)
+        } else {
+            column_value(row, field, now_unix)
+        }
+    } else if !column.label.is_empty() {
+        computed_column_value(row, &column.label)
     } else {
         return Cell::from(if marked { "●" } else { "" }).style(if selected || !marked {
             Style::default()
         } else {
-            Style::default().fg(PINK).bold()
+            Style::default()
+                .fg(skin.color("views.table.markColor", PINK))
+                .bold()
         });
     };
 
-    let cell = highlighted_cell(value.clone(), filter_matcher);
+    let cell = highlighted_cell(skin, value.clone(), filter_matcher);
+    if !selected
+        && matches!(row.data, crate::model::ResourceData::Workload { .. })
+        && row.status.as_ref() == "DEGRADED"
+    {
+        return cell.style(skin.foreground(
+            "frame.status.pendingColor",
+            skin.style("views.table", Style::default().fg(YELLOW)),
+        ));
+    }
     let Some(field) = column.field else {
         return cell;
     };
@@ -1364,24 +2189,44 @@ fn resource_cell(
         cell
     } else if is_policy_verb(field) {
         cell.style(if policy_verb_allowed(row, field) {
-            Style::default().fg(GREEN)
+            skin.foreground(
+                "frame.status.addColor",
+                skin.style("views.table", Style::default().fg(GREEN)),
+            )
         } else {
-            Style::default().fg(ORANGE)
+            skin.foreground(
+                "frame.status.pendingColor",
+                skin.style("views.table", Style::default().fg(ORANGE)),
+            )
         })
     } else {
-        cell.style(resource_value_style(field, row, &value, now_unix))
+        cell.style(resource_value_style(
+            skin,
+            field,
+            row,
+            &value,
+            now_unix,
+            &settings.thresholds,
+        ))
     }
 }
 
-fn filter_match_style() -> Style {
-    Style::default().fg(SELECTED).bg(YELLOW).bold()
+fn filter_match_style(skin: &Skin) -> Style {
+    Style::default()
+        .fg(skin.color("views.table.cursorFgColor", SELECTED))
+        .bg(skin.color("frame.title.filterColor", YELLOW))
+        .bold()
 }
 
-fn highlighted_cell(value: String, matcher: &FilterMatcher) -> Cell<'static> {
-    Cell::from(highlight_line_matches(Line::raw(value), matcher))
+fn highlighted_cell(skin: &Skin, value: String, matcher: &FilterMatcher) -> Cell<'static> {
+    Cell::from(highlight_line_matches(skin, Line::raw(value), matcher))
 }
 
-fn highlight_line_matches(line: Line<'static>, matcher: &FilterMatcher) -> Line<'static> {
+fn highlight_line_matches(
+    skin: &Skin,
+    line: Line<'static>,
+    matcher: &FilterMatcher,
+) -> Line<'static> {
     let text = line.to_string();
     let ranges = matcher.match_ranges(&text);
     if ranges.is_empty() {
@@ -1411,7 +2256,7 @@ fn highlight_line_matches(line: Line<'static>, matcher: &FilterMatcher) -> Line<
                 .iter()
                 .any(|(match_start, match_end)| *match_start <= start && *match_end >= finish);
             let style = if is_match {
-                span.style.patch(filter_match_style())
+                span.style.patch(filter_match_style(skin))
             } else {
                 span.style
             };
@@ -1425,35 +2270,74 @@ fn highlight_line_matches(line: Line<'static>, matcher: &FilterMatcher) -> Line<
     Line::from(highlighted)
 }
 
-fn resource_row_style(position: usize, selected: bool) -> Style {
+fn resource_row_style(skin: &Skin, position: usize, selected: bool) -> Style {
     if selected {
-        return Style::default().fg(Color::White).bg(SELECTED).bold();
+        return skin.table_cursor(
+            skin.style("views.table", Style::default())
+                .fg(Color::White)
+                .bg(SELECTED)
+                .bold(),
+        );
     }
     if position % 2 == 1 {
-        Style::default().bg(ROW_ALT)
+        skin.style("views.table", Style::default().bg(ROW_ALT))
     } else {
-        Style::default()
+        skin.style("views.table", Style::default())
     }
 }
 
 fn resource_value_style(
+    skin: &Skin,
     field: SortField,
     row: &crate::model::ResourceRow,
     value: &str,
     now_unix: i64,
+    thresholds: &crate::config::ThresholdSettings,
 ) -> Style {
-    match field {
-        SortField::Namespace | SortField::Node => Style::default().fg(PURPLE),
+    let base = match field {
+        SortField::Kind | SortField::Namespace | SortField::Node => Style::default().fg(PURPLE),
         SortField::Name => Style::default().fg(CYAN),
-        SortField::Status => status_style(value).bold(),
-        SortField::Ready | SortField::Binding => readiness_style(value),
+        SortField::Status => return status_style(skin, value).bold(),
+        SortField::Ready | SortField::Binding => return readiness_style(skin, value),
         SortField::Age => Style::default().fg(age_color(row.age_seconds(now_unix))),
-        SortField::Version | SortField::Details => Style::default().fg(MUTED),
+        SortField::Validity | SortField::Version | SortField::Details => Style::default().fg(MUTED),
+        SortField::VulnScore => Style::default().fg(YELLOW),
+        SortField::CpuRequestPercent | SortField::CpuLimitPercent | SortField::CpuPercent => {
+            if let Some(pct) = value.strip_suffix('%').and_then(|s| s.parse::<u8>().ok()) {
+                return threshold_style(skin, pct, &thresholds.cpu);
+            }
+            Style::default()
+        }
+        SortField::MemoryRequestPercent
+        | SortField::MemoryLimitPercent
+        | SortField::MemoryPercent => {
+            if let Some(pct) = value.strip_suffix('%').and_then(|s| s.parse::<u8>().ok()) {
+                return threshold_style(skin, pct, &thresholds.memory);
+            }
+            Style::default()
+        }
         _ => Style::default(),
+    };
+    skin.style("views.table", base)
+}
+
+fn threshold_style(skin: &Skin, pct: u8, threshold: &crate::config::SeverityThreshold) -> Style {
+    if pct >= threshold.critical {
+        skin.foreground(
+            "frame.status.errorColor",
+            skin.style("views.table", Style::default().fg(RED).bold()),
+        )
+    } else if pct >= threshold.warn {
+        skin.foreground(
+            "frame.status.pendingColor",
+            skin.style("views.table", Style::default().fg(ORANGE)),
+        )
+    } else {
+        skin.style("views.table", Style::default())
     }
 }
 
-fn readiness_style(value: &str) -> Style {
+fn readiness_style(skin: &Skin, value: &str) -> Style {
     let normalized = value.trim().to_ascii_lowercase();
     let is_ready_fraction = normalized
         .split_once('/')
@@ -1468,7 +2352,14 @@ fn readiness_style(value: &str) -> Style {
     } else {
         ORANGE
     };
-    Style::default().fg(color)
+    let key = if color == GREEN {
+        "frame.status.addColor"
+    } else if color == ORANGE {
+        "frame.status.pendingColor"
+    } else {
+        "frame.status.completedColor"
+    };
+    skin.foreground(key, skin.style("views.table", Style::default().fg(color)))
 }
 
 const fn age_color(age_seconds: u64) -> Color {
@@ -1567,43 +2458,76 @@ fn update_resource_rows_hitbox(app: &mut App, area: Rect, show_header: bool) {
     );
 }
 
+#[allow(clippy::too_many_lines)]
 fn column_value(row: &crate::model::ResourceRow, field: SortField, now_unix: i64) -> String {
     let pod = row.pod_data();
     let node = row.node_data();
+    let container = row.container_data();
     match field {
+        SortField::Kind => match &row.data {
+            crate::model::ResourceData::Workload { kind } => kind.gvr(),
+            _ => String::new(),
+        },
+        SortField::Validity => {
+            if row.status.as_ref() == "DEGRADED" {
+                "DEGRADED".to_owned()
+            } else {
+                String::new()
+            }
+        }
+        SortField::VulnScore => "n/a".to_owned(),
         SortField::Namespace => row.namespace.to_string(),
         SortField::Name => row.name.to_string(),
         SortField::Ready | SortField::Binding => row.ready.to_string(),
         SortField::Status | SortField::ApiGroup => row.status.to_string(),
         SortField::Restarts => pod.map_or_else(
-            || {
-                row.container_data()
-                    .map_or_else(|| "-".to_owned(), |data| data.restarts.to_string())
-            },
+            || container.map_or_else(|| "-".to_owned(), |data| data.restarts.to_string()),
             |data| data.restarts.to_string(),
         ),
         SortField::Cpu => format_cpu(
             pod.and_then(|data| data.cpu_millis)
-                .or_else(|| node.and_then(|data| data.cpu_millis)),
+                .or_else(|| node.and_then(|data| data.cpu_millis))
+                .or_else(|| container.and_then(|data| data.cpu_millis)),
         ),
         SortField::CpuRequestPercent => pod.map_or_else(
-            || "-".to_owned(),
+            || {
+                container.map_or_else(
+                    || "-".to_owned(),
+                    |data| format_percent(data.cpu_millis, data.cpu_request_millis),
+                )
+            },
             |data| format_percent(data.cpu_millis, data.cpu_request_millis),
         ),
         SortField::CpuLimitPercent => pod.map_or_else(
-            || "-".to_owned(),
+            || {
+                container.map_or_else(
+                    || "-".to_owned(),
+                    |data| format_percent(data.cpu_millis, data.cpu_limit_millis),
+                )
+            },
             |data| format_percent(data.cpu_millis, data.cpu_limit_millis),
         ),
         SortField::Memory => format_memory(
             pod.and_then(|data| data.memory_bytes)
-                .or_else(|| node.and_then(|data| data.memory_bytes)),
+                .or_else(|| node.and_then(|data| data.memory_bytes))
+                .or_else(|| container.and_then(|data| data.memory_bytes)),
         ),
         SortField::MemoryRequestPercent => pod.map_or_else(
-            || "-".to_owned(),
+            || {
+                container.map_or_else(
+                    || "-".to_owned(),
+                    |data| format_percent(data.memory_bytes, data.memory_request_bytes),
+                )
+            },
             |data| format_percent(data.memory_bytes, data.memory_request_bytes),
         ),
         SortField::MemoryLimitPercent => pod.map_or_else(
-            || "-".to_owned(),
+            || {
+                container.map_or_else(
+                    || "-".to_owned(),
+                    |data| format_percent(data.memory_bytes, data.memory_limit_bytes),
+                )
+            },
             |data| format_percent(data.memory_bytes, data.memory_limit_bytes),
         ),
         SortField::Node => pod.map_or_else(|| "-".to_owned(), |data| data.node.to_string()),
@@ -1628,7 +2552,7 @@ fn column_value(row: &crate::model::ResourceRow, field: SortField, now_unix: i64
             || "-".to_owned(),
             |data| format_percent(data.memory_bytes, data.memory_allocatable_bytes),
         ),
-        SortField::Age => format_age(row.age_seconds(now_unix)),
+        SortField::Age => resource_age(row, now_unix),
         SortField::Details => row.details.to_string(),
         SortField::Get
         | SortField::List
@@ -1647,6 +2571,193 @@ fn column_value(row: &crate::model::ResourceRow, field: SortField, now_unix: i64
     }
 }
 
+#[allow(clippy::too_many_lines)]
+pub(super) fn computed_column_value(row: &crate::model::ResourceRow, label: &str) -> String {
+    let pod = row.pod_data();
+    let node = row.node_data();
+    let container = row.container_data();
+    match label {
+        "PF" => {
+            if row
+                .port_forward_ports
+                .as_ref()
+                .is_some_and(|ports| !ports.is_empty())
+            {
+                "●".to_owned()
+            } else {
+                String::new()
+            }
+        }
+        "CPU/R:L" => {
+            if let Some(data) = pod {
+                format!(
+                    "{}:{}",
+                    format_cpu(Some(data.cpu_request_millis)),
+                    format_cpu(Some(data.cpu_limit_millis))
+                )
+            } else if let Some(data) = container {
+                format!(
+                    "{}:{}",
+                    format_cpu(Some(data.cpu_request_millis)),
+                    format_cpu(Some(data.cpu_limit_millis))
+                )
+            } else {
+                "0m:0m".to_owned()
+            }
+        }
+        "MEM/R:L" => {
+            if let Some(data) = pod {
+                format!(
+                    "{}:{}",
+                    format_memory(Some(data.memory_request_bytes)),
+                    format_memory(Some(data.memory_limit_bytes))
+                )
+            } else if let Some(data) = container {
+                format!(
+                    "{}:{}",
+                    format_memory(Some(data.memory_request_bytes)),
+                    format_memory(Some(data.memory_limit_bytes))
+                )
+            } else {
+                "0Mi:0Mi".to_owned()
+            }
+        }
+        "IP" => pod.map_or_else(
+            || "<none>".to_owned(),
+            |data| {
+                if data.ip.is_empty() {
+                    "<none>".to_owned()
+                } else {
+                    data.ip.to_string()
+                }
+            },
+        ),
+        "NOMINATED NODE" => pod.map_or_else(
+            || "<none>".to_owned(),
+            |data| {
+                if data.nominated_node.is_empty() {
+                    "<none>".to_owned()
+                } else {
+                    data.nominated_node.to_string()
+                }
+            },
+        ),
+        "READINESS GATES" => pod.map_or_else(
+            || "<none>".to_owned(),
+            |data| {
+                if data.readiness_gates.is_empty() {
+                    "<none>".to_owned()
+                } else {
+                    data.readiness_gates.to_string()
+                }
+            },
+        ),
+        "QOS" => pod.map_or_else(
+            || "BestEffort".to_owned(),
+            |data| {
+                if data.qos.is_empty() {
+                    "BestEffort".to_owned()
+                } else {
+                    data.qos.to_string()
+                }
+            },
+        ),
+        "LABELS" => row.labels.to_string(),
+        "VALID" => {
+            if matches!(
+                row.status.as_ref(),
+                "Ready" | "Running" | "Completed" | "Active" | "Bound"
+            ) {
+                String::new()
+            } else {
+                row.status.to_string()
+            }
+        }
+        "ARCH" => node.map_or_else(
+            || "<none>".to_owned(),
+            |data| {
+                if data.arch.is_empty() {
+                    "<none>".to_owned()
+                } else {
+                    data.arch.to_string()
+                }
+            },
+        ),
+        "KERNEL" => node.map_or_else(
+            || "<none>".to_owned(),
+            |data| {
+                if data.kernel.is_empty() {
+                    "<none>".to_owned()
+                } else {
+                    data.kernel.to_string()
+                }
+            },
+        ),
+        "OS" => node.map_or_else(
+            || "<none>".to_owned(),
+            |data| {
+                if data.os_image.is_empty() {
+                    "<none>".to_owned()
+                } else {
+                    data.os_image.to_string()
+                }
+            },
+        ),
+        "INTERNAL-IP" => node.map_or_else(
+            || "<none>".to_owned(),
+            |data| {
+                if data.internal_ip.is_empty() {
+                    "<none>".to_owned()
+                } else {
+                    data.internal_ip.to_string()
+                }
+            },
+        ),
+        "EXTERNAL-IP" => node.map_or_else(
+            || "<none>".to_owned(),
+            |data| {
+                if data.external_ip.is_empty() {
+                    "<none>".to_owned()
+                } else {
+                    data.external_ip.to_string()
+                }
+            },
+        ),
+        "INDEX" => container.map_or_else(
+            || "1".to_owned(),
+            |data| {
+                if data.index.is_empty() {
+                    "1".to_owned()
+                } else {
+                    data.index.to_string()
+                }
+            },
+        ),
+        "INIT" => container.map_or_else(
+            || "×".to_owned(),
+            |data| {
+                if data.init.is_empty() {
+                    "×".to_owned()
+                } else {
+                    data.init.to_string()
+                }
+            },
+        ),
+        "PROBES(L:R)" => container.map_or_else(
+            || "off:off".to_owned(),
+            |data| {
+                if data.probes.is_empty() {
+                    "off:off".to_owned()
+                } else {
+                    data.probes.to_string()
+                }
+            },
+        ),
+        "PORTS" => container.map_or_else(String::new, |data| data.ports.to_string()),
+        _ => String::new(),
+    }
+}
+
 fn table_column_value(
     row: &crate::model::ResourceRow,
     index: usize,
@@ -1654,11 +2765,19 @@ fn table_column_value(
     now_unix: i64,
 ) -> String {
     if as_age {
-        return format_age(row.age_seconds(now_unix));
+        return resource_age(row, now_unix);
     }
     row.table_cells
         .get(index)
         .map_or_else(String::new, |cell| cell.text.to_string())
+}
+
+fn resource_age(row: &crate::model::ResourceRow, now_unix: i64) -> String {
+    if row.created_unix == 0 && matches!(row.data, crate::model::ResourceData::Workload { .. }) {
+        "<unknown>".to_owned()
+    } else {
+        format_age(row.age_seconds(now_unix))
+    }
 }
 
 fn policy_verb_allowed(row: &crate::model::ResourceRow, field: SortField) -> bool {
@@ -1705,11 +2824,20 @@ fn column_header(app: &App, label: &str, field: SortField) -> Cell<'static> {
         ""
     };
     let style = if selected_field == field {
-        Style::default().fg(YELLOW).bold()
+        app.theme.foreground(
+            "views.table.header.selectedSortColumnColor",
+            app.theme
+                .style("views.table.header", Style::default().fg(YELLOW).bold()),
+        )
     } else if app.sort_field == field {
-        Style::default().fg(ORANGE).bold()
+        app.theme.foreground(
+            "views.table.header.sorterColor",
+            app.theme
+                .style("views.table.header", Style::default().fg(ORANGE).bold()),
+        )
     } else {
-        Style::default().fg(CYAN).bold()
+        app.theme
+            .style("views.table.header", Style::default().fg(CYAN).bold())
     };
     Cell::from(format!("{label}{suffix}")).style(style)
 }
@@ -1719,6 +2847,7 @@ fn draw_input_view(frame: &mut Frame<'_>, app: &App, area: Rect) {
         InputMode::Command => (
             " Command ",
             prompt_line(
+                &app.theme,
                 ":",
                 &app.input,
                 None,
@@ -1728,6 +2857,7 @@ fn draw_input_view(frame: &mut Frame<'_>, app: &App, area: Rect) {
         InputMode::Filter => (
             " Filter ",
             prompt_line(
+                &app.theme,
                 "/",
                 &app.input,
                 app.filter_error.as_deref(),
@@ -1738,7 +2868,21 @@ fn draw_input_view(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ),
         InputMode::Browse => return,
     };
-    frame.render_widget(Paragraph::new(line).block(popup_block(title)), area);
+    frame.render_widget(
+        Paragraph::new(line)
+            .style(app.theme.style("prompt", Style::default()))
+            .block(
+                popup_block(&app.theme, title).border_style(Style::default().fg(app.theme.color(
+                    if app.input_mode == InputMode::Command {
+                        "prompt.border.command"
+                    } else {
+                        "prompt.border.default"
+                    },
+                    CYAN,
+                ))),
+            ),
+        area,
+    );
 }
 
 fn command_completion_hint(app: &App) -> Option<String> {
@@ -1750,6 +2894,7 @@ fn command_completion_hint(app: &App) -> Option<String> {
 }
 
 fn prompt_line(
+    skin: &Skin,
     prefix: &str,
     input: &str,
     error: Option<&str>,
@@ -1758,15 +2903,27 @@ fn prompt_line(
     let mut spans = vec![
         Span::styled(
             format!(" {prefix}"),
-            Style::default().fg(Color::Black).bg(CYAN).bold(),
+            skin.style("prompt", Style::default().fg(Color::Black).bg(CYAN).bold()),
         ),
-        Span::styled(format!("{input}▏"), Style::default().fg(YELLOW)),
+        Span::styled(
+            format!("{input}▏"),
+            skin.style("prompt", Style::default().fg(YELLOW)),
+        ),
     ];
     if let Some(hint) = hint {
-        spans.push(Span::styled(hint.to_owned(), Style::default().fg(MUTED)));
+        spans.push(Span::styled(
+            hint.to_owned(),
+            skin.foreground(
+                "prompt.suggestColor",
+                skin.style("prompt", Style::default().fg(MUTED)),
+            ),
+        ));
     }
     if let Some(error) = error {
-        spans.push(Span::styled(format!("  {error}"), Style::default().fg(RED)));
+        spans.push(Span::styled(
+            format!("  {error}"),
+            skin.foreground("frame.status.errorColor", Style::default().fg(RED)),
+        ));
     }
     Line::from(spans)
 }
@@ -1811,6 +2968,8 @@ const HELP_CATEGORIES: &[HelpCategory] = &[
             ("Enter", "Open selected resource"),
             ("Space", "Mark resource"),
             ("Ctrl-Space", "Mark range"),
+            ("Ctrl-S", "Export filtered table or content"),
+            (":screendump / :sd", "Browse saved exports"),
             ("Ctrl-\\", "Clear marks"),
             ("c / n", "Copy name / namespace"),
             ("c in content", "Copy YAML / Secret data / logs"),
@@ -1820,7 +2979,21 @@ const HELP_CATEGORIES: &[HelpCategory] = &[
             ("f / :pf", "Open the context port-forward list"),
             ("Shift-F", "Start Pod/Service port forward"),
             ("s on Pods", "Open an interactive pod shell"),
+            (
+                "s on Nodes",
+                "Open a node debug shell (when nodeShell enabled)",
+            ),
+            ("a on Pods/containers", "Attach to the container process"),
             ("Shift-J", "Open controller owner"),
+            ("u on ConfigMap/Secret/PVC/SA/PC", "UsedBy references"),
+            ("Enter in UsedBy", "Go to selected reference"),
+            (":workloads / :wk", "Open aggregate workloads"),
+            ("Enter in Workloads", "Go to selected instance"),
+            (":users / :groups", "Open RBAC users or groups"),
+            (":can u:|g:|s:<subject>", "Open subject RBAC policy"),
+            ("u / Enter on Namespaces", "Use namespace / open Pods"),
+            ("u / r in Contexts", "Use / rename kubeconfig context"),
+            ("Shift-V in UsedBy", "Sort references by GVR"),
             ("Mouse", "Click row to select"),
         ],
     ),
@@ -1847,6 +3020,7 @@ const HELP_CATEGORIES: &[HelpCategory] = &[
             ("Shift-O", "Sort selected column"),
             ("Shift-N / A", "Sort name / age outside filter"),
             ("Shift-P / S", "Sort namespace / status"),
+            ("Shift-K / R in Workloads", "Sort kind / ready"),
             ("Mouse", "Click column header to sort"),
         ],
     ),
@@ -1857,12 +3031,23 @@ const HELP_CATEGORIES: &[HelpCategory] = &[
             ("Ctrl-K", "Kill immediately"),
             ("u on Nodes", "Cordon / uncordon node"),
             ("r on Nodes", "Drain node with confirmation"),
+            ("s on scalable resources", "Set desired replicas"),
+            ("z on Deployments", "Open ReplicaSets"),
+            ("ctrl-l on ReplicaSets", "Rollback selected revision"),
+            ("enter on CronJobs", "Open Jobs"),
+            ("enter on Jobs", "Open Pods"),
+            ("t on CronJobs", "Trigger marked / current CronJobs"),
+            ("s on CronJobs", "Toggle suspension"),
+            (
+                ":suspend / :resume",
+                "Suspend / resume marked Jobs or CronJobs",
+            ),
             ("Ctrl-Z", "Toggle faults"),
         ],
     ),
 ];
 
-fn help_category_lines(categories: &[HelpCategory]) -> Vec<Line<'static>> {
+fn help_category_lines(skin: &Skin, categories: &[HelpCategory]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for (category_index, (category, entries)) in categories.iter().enumerate() {
         if category_index > 0 {
@@ -1870,15 +3055,30 @@ fn help_category_lines(categories: &[HelpCategory]) -> Vec<Line<'static>> {
         }
         lines.push(Line::from(Span::styled(
             format!("  {category}"),
-            Style::default().fg(CYAN).bold(),
+            skin.foreground(
+                "help.sectionColor",
+                skin.style("help", Style::default().fg(CYAN).bold()),
+            ),
         )));
         for (key, action) in *entries {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("  {:<24}", format!("<{key}>")),
-                    Style::default().fg(GREEN).bold(),
+                    skin.foreground(
+                        if key.chars().all(|character| {
+                            character.is_ascii_digit() || matches!(character, '…' | '–' | '-')
+                        }) {
+                            "help.numKeyColor"
+                        } else {
+                            "help.keyColor"
+                        },
+                        skin.style("help", Style::default().fg(GREEN).bold()),
+                    ),
                 ),
-                Span::styled((*action).to_owned(), Style::default().fg(Color::White)),
+                Span::styled(
+                    (*action).to_owned(),
+                    skin.style("help", Style::default().fg(Color::White)),
+                ),
             ]));
         }
     }
@@ -1887,11 +3087,17 @@ fn help_category_lines(categories: &[HelpCategory]) -> Vec<Line<'static>> {
 
 fn draw_help(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let title = format!(" Help · {} ", app.kind.label());
-    let block = notice_block(popup_block(&title).title_alignment(Alignment::Center), app);
+    let block = notice_block(
+        popup_block(&app.theme, &title)
+            .style(app.theme.style("help", Style::default()))
+            .title_alignment(Alignment::Center),
+        app,
+    );
     if area.width >= HELP_TWO_COLUMN_MIN_WIDTH {
         let inner = block.inner(area);
-        let left = help_category_lines(&HELP_CATEGORIES[..2]);
-        let right = help_category_lines(&HELP_CATEGORIES[2..]);
+        let mut left = help_category_lines(&app.theme, &HELP_CATEGORIES[..2]);
+        append_custom_hotkey_help(&mut left, app);
+        let right = help_category_lines(&app.theme, &HELP_CATEGORIES[2..]);
         app.set_content_scroll_extent(left.len().max(right.len()), inner.height);
         frame.render_widget(block, area);
         let columns = Layout::horizontal([
@@ -1901,25 +3107,91 @@ fn draw_help(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         ])
         .split(inner);
         frame.render_widget(
-            Paragraph::new(left).scroll((app.content_scroll, app.content_horizontal_scroll)),
+            Paragraph::new(left)
+                .style(app.theme.style("help", Style::default()))
+                .scroll((app.content_scroll, app.content_horizontal_scroll)),
             columns[0],
         );
         frame.render_widget(
-            Paragraph::new(right).scroll((app.content_scroll, app.content_horizontal_scroll)),
+            Paragraph::new(right)
+                .style(app.theme.style("help", Style::default()))
+                .scroll((app.content_scroll, app.content_horizontal_scroll)),
             columns[2],
         );
         return;
     }
 
-    let lines = help_category_lines(HELP_CATEGORIES);
+    let mut lines = help_category_lines(&app.theme, HELP_CATEGORIES);
+    append_custom_hotkey_help(&mut lines, app);
     let inner_height = block.inner(area).height;
     app.set_content_scroll_extent(lines.len(), inner_height);
     frame.render_widget(
         Paragraph::new(lines)
+            .style(app.theme.style("help", Style::default()))
             .block(block)
             .scroll((app.content_scroll, app.content_horizontal_scroll)),
         area,
     );
+}
+
+fn append_extension_hints(hints: &mut Vec<HeaderHint>, app: &App) {
+    if !matches!(
+        app.overlay,
+        Overlay::None | Overlay::Contexts | Overlay::Namespaces
+    ) {
+        return;
+    }
+    for hotkey in &app.user_config.hotkeys {
+        hints.retain(|hint| !hint.key.eq_ignore_ascii_case(&hotkey.shortcut));
+        hints.push(action_hint(&hotkey.shortcut, &hotkey.description));
+    }
+    for plugin in app.visible_plugins() {
+        hints.retain(|hint| !hint.key.eq_ignore_ascii_case(&plugin.shortcut));
+        hints.push(action_hint(&plugin.shortcut, &plugin.description));
+    }
+}
+
+fn append_custom_hotkey_help(lines: &mut Vec<Line<'static>>, app: &App) {
+    let plugins = app.visible_plugins();
+    let entries = app
+        .user_config
+        .hotkeys
+        .iter()
+        .map(|hotkey| {
+            (
+                hotkey.shortcut.clone(),
+                format!("{} (: {})", hotkey.description, hotkey.command),
+            )
+        })
+        .chain(
+            plugins
+                .into_iter()
+                .map(|plugin| (plugin.shortcut.clone(), plugin.description.clone())),
+        )
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return;
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "  CUSTOM HOTKEYS / PLUGINS",
+        app.theme.foreground(
+            "help.sectionColor",
+            app.theme.style("help", Style::default().fg(CYAN).bold()),
+        ),
+    ));
+    for (shortcut, description) in entries {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {:<24}", format!("<{shortcut}>")),
+                app.theme.foreground(
+                    "help.keyColor",
+                    app.theme.style("help", Style::default().fg(GREEN).bold()),
+                ),
+            ),
+            Span::raw(description),
+        ]));
+    }
 }
 
 fn chooser_window(visible: &[usize], selected: usize, capacity: usize) -> (usize, Vec<usize>) {
@@ -1951,7 +3223,9 @@ fn draw_empty_chooser(frame: &mut Frame<'_>, app: &App, area: Rect, title: &str,
         Paragraph::new(format!("No {noun} match /{}", app.body_filter()))
             .alignment(Alignment::Center)
             .block(notice_block(
-                popup_block(title).title_alignment(Alignment::Center),
+                popup_block(&app.theme, title)
+                    .style(app.theme.style("views.table", Style::default()))
+                    .title_alignment(Alignment::Center),
                 app,
             )),
         area,
@@ -1988,12 +3262,24 @@ fn draw_aliases(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 .map(|resource| (*index, resource))
         })
         .map(|(index, resource)| {
+            let mut aliases = resource.command_aliases();
+            for (custom_alias, target) in &app.user_config.aliases {
+                if target == &resource.gvr() || target == &resource.qualified_name() {
+                    aliases.push(custom_alias.clone());
+                }
+            }
             Row::new([
-                highlighted_cell(resource.qualified_name(), &matcher),
-                highlighted_cell(resource.command_aliases().join(" "), &matcher),
+                highlighted_cell(&app.theme, resource.qualified_name(), &matcher),
+                highlighted_cell(&app.theme, aliases.join(" "), &matcher),
             ])
             .style(if index == app.overlay_selected {
-                Style::default().fg(Color::White).bg(SELECTED).bold()
+                app.theme.table_cursor(
+                    app.theme
+                        .style("views.table", Style::default())
+                        .fg(Color::White)
+                        .bg(SELECTED)
+                        .bold(),
+                )
             } else {
                 Style::default()
             })
@@ -2005,9 +3291,16 @@ fn draw_aliases(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             rows,
             [Constraint::Percentage(35), Constraint::Percentage(65)],
         )
-        .header(Row::new(["RESOURCE", "ALIASES"]).style(Style::default().fg(YELLOW).bold()))
+        .header(
+            Row::new(["RESOURCE", "ALIASES"]).style(
+                app.theme
+                    .style("views.table.header", Style::default().fg(YELLOW).bold()),
+            ),
+        )
         .block(notice_block(
-            popup_block(&title).title_alignment(Alignment::Center),
+            popup_block(&app.theme, &title)
+                .style(app.theme.style("views.table", Style::default()))
+                .title_alignment(Alignment::Center),
             app,
         )),
         area,
@@ -2038,13 +3331,29 @@ fn draw_namespaces(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             let age = namespace
                 .age_seconds(app.now_unix)
                 .map_or_else(|| "-".to_owned(), format_age);
+            let active = if namespace.name == "<all>" {
+                app.namespace.is_none()
+            } else {
+                app.namespace.as_deref() == Some(namespace.name.as_str())
+            };
+            let display_name = if active {
+                format!("{}(*)", namespace.name)
+            } else {
+                namespace.name.clone()
+            };
             Row::new([
-                highlighted_cell(namespace.name.clone(), &matcher),
-                highlighted_cell(namespace.status.clone(), &matcher),
-                highlighted_cell(age, &matcher),
+                highlighted_cell(&app.theme, display_name, &matcher),
+                highlighted_cell(&app.theme, namespace.status.clone(), &matcher),
+                highlighted_cell(&app.theme, age, &matcher),
             ])
             .style(if index == app.overlay_selected {
-                Style::default().fg(Color::White).bg(SELECTED).bold()
+                app.theme.table_cursor(
+                    app.theme
+                        .style("views.table", Style::default())
+                        .fg(Color::White)
+                        .bg(SELECTED)
+                        .bold(),
+                )
             } else {
                 Style::default()
             })
@@ -2060,9 +3369,16 @@ fn draw_namespaces(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 Constraint::Length(10),
             ],
         )
-        .header(Row::new(["NAME", "STATUS", "AGE"]).style(Style::default().fg(YELLOW).bold()))
+        .header(
+            Row::new(["NAME", "STATUS", "AGE"]).style(
+                app.theme
+                    .style("views.table.header", Style::default().fg(YELLOW).bold()),
+            ),
+        )
         .block(notice_block(
-            popup_block(&title).title_alignment(Alignment::Center),
+            popup_block(&app.theme, &title)
+                .style(app.theme.style("views.table", Style::default()))
+                .title_alignment(Alignment::Center),
             app,
         )),
         area,
@@ -2152,20 +3468,30 @@ fn draw_contexts(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     } else {
                         " "
                     }),
-                    ContextColumn::Name => highlighted_cell(context.name.clone(), &matcher),
+                    ContextColumn::Name => {
+                        highlighted_cell(&app.theme, context.name.clone(), &matcher)
+                    }
                     ContextColumn::Cluster => {
-                        highlighted_cell(context.cluster_display().to_owned(), &matcher)
+                        highlighted_cell(&app.theme, context.cluster_display().to_owned(), &matcher)
                     }
                     ContextColumn::User => {
-                        highlighted_cell(context.user_display().to_owned(), &matcher)
+                        highlighted_cell(&app.theme, context.user_display().to_owned(), &matcher)
                     }
-                    ContextColumn::Namespace => {
-                        highlighted_cell(context.namespace_display().to_owned(), &matcher)
-                    }
+                    ContextColumn::Namespace => highlighted_cell(
+                        &app.theme,
+                        context.namespace_display().to_owned(),
+                        &matcher,
+                    ),
                 })
                 .collect::<Vec<_>>();
             Row::new(cells).style(if index == app.overlay_selected {
-                Style::default().fg(Color::White).bg(SELECTED).bold()
+                app.theme.table_cursor(
+                    app.theme
+                        .style("views.table", Style::default())
+                        .fg(Color::White)
+                        .bg(SELECTED)
+                        .bold(),
+                )
             } else {
                 Style::default()
             })
@@ -2178,7 +3504,10 @@ fn draw_contexts(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         ContextColumn::User => "USER",
         ContextColumn::Namespace => "NAMESPACE",
     }))
-    .style(Style::default().fg(YELLOW).bold());
+    .style(
+        app.theme
+            .style("views.table.header", Style::default().fg(YELLOW).bold()),
+    );
     let constraints = columns
         .iter()
         .map(|(_, width)| Constraint::Length(*width))
@@ -2186,10 +3515,13 @@ fn draw_contexts(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     record_chooser_rows(app, area, displayed);
     frame.render_widget(
         Table::new(rows, constraints)
+            .style(app.theme.style("views.table", Style::default()))
             .column_spacing(1)
             .header(header)
             .block(notice_block(
-                popup_block(&title).title_alignment(Alignment::Center),
+                popup_block(&app.theme, &title)
+                    .style(app.theme.style("views.table", Style::default()))
+                    .title_alignment(Alignment::Center),
                 app,
             )),
         area,
@@ -2203,18 +3535,18 @@ fn draw_details(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let age = format_age(row.age_seconds(app.now_unix));
     let matcher = FilterMatcher::new(app.body_filter());
     let lines = vec![
-        detail_line("Kind", app.kind.label()),
-        detail_line("Namespace", row.namespace.as_ref()),
-        detail_line("Name", row.name.as_ref()),
-        detail_line("Status", row.status.as_ref()),
-        detail_line("Ready", row.ready.as_ref()),
-        detail_line("Details", row.details.as_ref()),
-        detail_line("Labels", row.labels.as_ref()),
-        detail_line("Age", &age),
+        detail_line(&app.theme, "Kind", app.kind.label()),
+        detail_line(&app.theme, "Namespace", row.namespace.as_ref()),
+        detail_line(&app.theme, "Name", row.name.as_ref()),
+        detail_line(&app.theme, "Status", row.status.as_ref()),
+        detail_line(&app.theme, "Ready", row.ready.as_ref()),
+        detail_line(&app.theme, "Details", row.details.as_ref()),
+        detail_line(&app.theme, "Labels", row.labels.as_ref()),
+        detail_line(&app.theme, "Age", &age),
     ]
     .into_iter()
     .filter(|line| app.body_line_matches(&line.to_string()))
-    .map(|line| highlight_line_matches(line, &matcher))
+    .map(|line| highlight_line_matches(&app.theme, line, &matcher))
     .collect::<Vec<_>>();
     let filter = if app.body_filter().is_empty() {
         String::new()
@@ -2222,7 +3554,10 @@ fn draw_details(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         format!(" /{}", app.body_filter())
     };
     let title = format!(" details({}/{}){filter} ", row.namespace, row.name);
-    let block = notice_block(popup_block(&title).title_alignment(Alignment::Center), app);
+    let block = notice_block(
+        popup_block(&app.theme, &title).title_alignment(Alignment::Center),
+        app,
+    );
     let inner_height = block.inner(area).height;
     app.set_content_scroll_extent(lines.len(), inner_height);
     frame.render_widget(
@@ -2238,6 +3573,10 @@ fn draw_content(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         draw_log_content(frame, app, area);
         return;
     }
+    if app.content_kind == Some(ContentKind::Describe) && app.content_title == "Cow" {
+        draw_cow_content(frame, app, area);
+        return;
+    }
     let body = app.active_content_body();
     let matcher = FilterMatcher::new(app.body_filter());
     let has_filter = !app.body_filter().is_empty();
@@ -2247,12 +3586,19 @@ fn draw_content(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         format!(" /{}", app.body_filter())
     };
     let title = format!(" {}{filter} ", app.content_title);
-    let block = notice_block(popup_block(&title).title_alignment(Alignment::Center), app);
+    let block = notice_block(
+        popup_block(&app.theme, &title).title_alignment(Alignment::Center),
+        app,
+    );
     let inner = block.inner(area);
     if !app.ui.wrap() {
         let start = usize::from(app.content_scroll);
         let end = start.saturating_add(usize::from(inner.height));
-        let hide_non_matches = app.content_kind != Some(ContentKind::Yaml);
+        let show_non_matches = matches!(
+            app.content_kind,
+            Some(ContentKind::Yaml | ContentKind::HelmValues)
+        );
+        let hide_non_matches = !show_non_matches;
         let mut total = 0_usize;
         let mut lines = Vec::with_capacity(usize::from(inner.height));
         for line in body.lines() {
@@ -2260,9 +3606,9 @@ fn draw_content(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 continue;
             }
             if total >= start && total < end {
-                let styled = highlight_content_line(app.content_kind, line);
+                let styled = highlight_content_line(&app.theme, app.content_kind, line);
                 lines.push(if has_filter {
-                    highlight_line_matches(styled, &matcher)
+                    highlight_line_matches(&app.theme, styled, &matcher)
                 } else {
                     styled
                 });
@@ -2279,7 +3625,10 @@ fn draw_content(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         return;
     }
 
-    let filtered = if app.content_kind == Some(ContentKind::Yaml) {
+    let filtered = if matches!(
+        app.content_kind,
+        Some(ContentKind::Yaml | ContentKind::HelmValues)
+    ) {
         body.to_owned()
     } else {
         body.lines()
@@ -2288,9 +3637,13 @@ fn draw_content(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .join("\n")
     };
     let lines = match app.content_kind {
-        Some(ContentKind::Yaml | ContentKind::SecretData) => highlight_yaml(&filtered),
-        Some(ContentKind::Describe) => highlight_describe(&filtered),
-        Some(ContentKind::Logs | ContentKind::PreviousLogs) => highlight_logs(&filtered),
+        Some(ContentKind::Yaml | ContentKind::SecretData | ContentKind::HelmValues) => {
+            highlight_yaml(&app.theme, &filtered)
+        }
+        Some(ContentKind::Describe) => highlight_describe(&app.theme, &filtered),
+        Some(ContentKind::Logs | ContentKind::PreviousLogs) => {
+            highlight_logs(&app.theme, &filtered)
+        }
         _ => filtered
             .lines()
             .map(|line| Line::raw(line.to_owned()))
@@ -2299,7 +3652,7 @@ fn draw_content(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let lines = if has_filter {
         lines
             .into_iter()
-            .map(|line| highlight_line_matches(line, &matcher))
+            .map(|line| highlight_line_matches(&app.theme, line, &matcher))
             .collect::<Vec<_>>()
     } else {
         lines
@@ -2311,6 +3664,38 @@ fn draw_content(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .block(block)
         .scroll((app.content_scroll, app.content_horizontal_scroll));
     frame.render_widget(paragraph, area);
+}
+
+fn draw_cow_content(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let block = notice_block(
+        popup_block(&app.theme, " Cow ").title_alignment(Alignment::Center),
+        app,
+    );
+    let inner = block.inner(area);
+    let cow_lines: Vec<&str> = app.content_body.lines().collect();
+    let top_pad = inner
+        .height
+        .saturating_sub(u16::try_from(cow_lines.len()).unwrap_or(0))
+        / 2;
+    let max_width = cow_lines
+        .iter()
+        .map(|l| u16::try_from(l.chars().count()).unwrap_or(0))
+        .max()
+        .unwrap_or(0);
+    let left_pad = usize::from(inner.width.saturating_sub(max_width) / 2);
+    let pad_str = " ".repeat(left_pad);
+    let mut lines = Vec::new();
+    for _ in 0..top_pad {
+        lines.push(Line::default());
+    }
+    for line in cow_lines {
+        lines.push(Line::from(Span::styled(
+            format!("{pad_str}{line}"),
+            Style::default().fg(RED).bold(),
+        )));
+    }
+    app.set_content_scroll_extent(lines.len(), inner.height);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn draw_log_content(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -2328,28 +3713,27 @@ fn draw_log_content(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         format!(" · {status}")
     };
     let title = format!(" {}{status}{filter} ", app.content_title);
-    let block = (!app.ui.fullscreen())
-        .then(|| notice_block(popup_block(&title).title_alignment(Alignment::Center), app));
+    let block = (!app.ui.fullscreen()).then(|| {
+        notice_block(
+            popup_block(&app.theme, &title).title_alignment(Alignment::Center),
+            app,
+        )
+    });
     let mut inner = block.as_ref().map_or(area, |block| block.inner(area));
     if app.ui.fullscreen() && app.notice.is_some() {
         inner.height = inner.height.saturating_sub(1);
     }
     app.log_view_width = inner.width;
-    let style_line = |line: &str| {
-        let line = highlight_log_line(line);
-        if has_filter {
-            highlight_line_matches(line, &matcher)
-        } else {
-            line
-        }
-    };
     let paragraph = if app.ui.wrap() {
         let lines = app
             .active_content_body()
             .lines()
-            .map(|line| app.log_display_line(line))
-            .filter(|line| matcher.matches_text(line))
-            .map(style_line)
+            .enumerate()
+            .map(|(index, line)| (index, app.log_display_line_at(index, line)))
+            .filter(|(_, line)| matcher.matches_text(line))
+            .map(|(index, line)| {
+                merged_logs::displayed_line(app, index, line, &matcher, has_filter)
+            })
             .collect::<Vec<_>>();
         let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
         app.set_content_scroll_extent(paragraph.line_count(inner.width), inner.height);
@@ -2358,7 +3742,8 @@ fn draw_log_content(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         let total = app
             .active_content_body()
             .lines()
-            .map(|line| app.log_display_line(line))
+            .enumerate()
+            .map(|(index, line)| app.log_display_line_at(index, line))
             .filter(|line| matcher.matches_text(line))
             .count();
         // A fresh stream batch and wrap/fullscreen transitions may request the end via
@@ -2367,24 +3752,36 @@ fn draw_log_content(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         let lines = app
             .active_content_body()
             .lines()
-            .map(|line| app.log_display_line(line))
-            .filter(|line| matcher.matches_text(line))
+            .enumerate()
+            .map(|(index, line)| (index, app.log_display_line_at(index, line)))
+            .filter(|(_, line)| matcher.matches_text(line))
             .skip(usize::from(app.content_scroll))
             .take(usize::from(inner.height))
-            .map(style_line)
+            .map(|(index, line)| {
+                merged_logs::displayed_line(app, index, line, &matcher, has_filter)
+            })
             .collect::<Vec<_>>();
         Paragraph::new(lines).scroll((0, app.content_horizontal_scroll))
     };
     if let Some(block) = block {
         frame.render_widget(block, area);
     }
-    frame.render_widget(paragraph, inner);
+    frame.render_widget(
+        paragraph.style(app.theme.style("views.logs", Style::default())),
+        inner,
+    );
     if app.ui.fullscreen()
         && let Some(notice) = &app.notice
     {
         frame.render_widget(
             Paragraph::new(notice.as_str())
-                .style(Style::default().fg(GREEN).bold())
+                .style(
+                    app.theme.foreground(
+                        "frame.status.highlightColor",
+                        app.theme
+                            .style("views.logs", Style::default().fg(GREEN).bold()),
+                    ),
+                )
                 .alignment(Alignment::Right),
             Rect::new(
                 area.x,
@@ -2396,24 +3793,34 @@ fn draw_log_content(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     }
 }
 
-fn highlight_content_line(content: Option<ContentKind>, line: &str) -> Line<'static> {
+fn highlight_content_line(skin: &Skin, content: Option<ContentKind>, line: &str) -> Line<'static> {
     match content {
-        Some(ContentKind::Yaml | ContentKind::SecretData) => highlight_yaml_line(line),
-        Some(ContentKind::Describe) => highlight_describe_line(line),
-        Some(ContentKind::Logs | ContentKind::PreviousLogs) => highlight_log_line(line),
-        None => Line::raw(line.to_owned()),
+        Some(ContentKind::Yaml | ContentKind::SecretData | ContentKind::HelmValues) => {
+            highlight_yaml_line(skin, line)
+        }
+        Some(ContentKind::Describe) => highlight_describe_line(skin, line),
+        Some(ContentKind::Logs | ContentKind::PreviousLogs) => highlight_log_line(skin, line),
+        Some(ContentKind::ScreenDump) | None => Line::raw(line.to_owned()),
     }
 }
 
-fn highlight_logs(body: &str) -> Vec<Line<'static>> {
-    body.lines().map(highlight_log_line).collect()
+fn highlight_logs(skin: &Skin, body: &str) -> Vec<Line<'static>> {
+    body.lines()
+        .map(|line| highlight_log_line(skin, line))
+        .collect()
 }
 
-fn highlight_log_line(line: &str) -> Line<'static> {
+fn highlight_log_line(skin: &Skin, line: &str) -> Line<'static> {
     if line.starts_with("────") {
-        return Line::styled(line.to_owned(), Style::default().fg(PINK).bold());
+        return Line::styled(
+            line.to_owned(),
+            skin.foreground(
+                "frame.status.highlightColor",
+                skin.style("views.logs", Style::default().fg(PINK).bold()),
+            ),
+        );
     }
-    let message_style = log_message_style(line);
+    let message_style = log_message_style(skin, line);
     let Some(separator) = line.find(char::is_whitespace) else {
         return Line::from(Span::styled(line.to_owned(), message_style));
     };
@@ -2422,7 +3829,13 @@ fn highlight_log_line(line: &str) -> Line<'static> {
         return Line::from(Span::styled(line.to_owned(), message_style));
     }
     Line::from(vec![
-        Span::styled(prefix.to_owned(), Style::default().fg(PURPLE)),
+        Span::styled(
+            prefix.to_owned(),
+            skin.foreground(
+                "views.logs.indicator.fgColor",
+                skin.style("views.logs", Style::default().fg(PURPLE)),
+            ),
+        ),
         Span::styled(message.to_owned(), message_style),
     ])
 }
@@ -2438,29 +3851,44 @@ fn looks_like_log_timestamp(value: &str) -> bool {
             && bytes[1..5].iter().all(u8::is_ascii_digit))
 }
 
-fn log_message_style(line: &str) -> Style {
+fn log_message_style(skin: &Skin, line: &str) -> Style {
     let normalized = line.to_ascii_lowercase();
     if contains_log_level(&normalized, &["fatal", "panic", "error", "err"])
         || normalized.starts_with('e')
             && looks_like_log_timestamp(line.split_whitespace().next().unwrap_or(""))
     {
-        Style::default().fg(RED).bold()
+        skin.foreground(
+            "frame.status.errorColor",
+            skin.style("views.logs", Style::default().fg(RED).bold()),
+        )
     } else if contains_log_level(&normalized, &["warning", "warn"])
         || normalized.starts_with('w')
             && looks_like_log_timestamp(line.split_whitespace().next().unwrap_or(""))
     {
-        Style::default().fg(ORANGE)
+        skin.foreground(
+            "frame.status.pendingColor",
+            skin.style("views.logs", Style::default().fg(ORANGE)),
+        )
     } else if contains_log_level(&normalized, &["debug"]) {
-        Style::default().fg(CYAN)
+        skin.foreground(
+            "views.logs.indicator.fgColor",
+            skin.style("views.logs", Style::default().fg(CYAN)),
+        )
     } else if contains_log_level(&normalized, &["trace"]) {
-        Style::default().fg(MUTED)
+        skin.foreground(
+            "views.logs.indicator.toggleOffColor",
+            skin.style("views.logs", Style::default().fg(MUTED)),
+        )
     } else if contains_log_level(&normalized, &["info"])
         || normalized.starts_with('i')
             && looks_like_log_timestamp(line.split_whitespace().next().unwrap_or(""))
     {
-        Style::default().fg(GREEN)
+        skin.foreground(
+            "views.logs.indicator.toggleOnColor",
+            skin.style("views.logs", Style::default().fg(GREEN)),
+        )
     } else {
-        Style::default().fg(Color::White)
+        skin.style("views.logs", Style::default().fg(Color::White))
     }
 }
 
@@ -2469,15 +3897,23 @@ fn contains_log_level(line: &str, levels: &[&str]) -> bool {
         .any(|word| levels.contains(&word))
 }
 
-fn highlight_yaml(body: &str) -> Vec<Line<'static>> {
-    body.lines().map(highlight_yaml_line).collect()
+fn highlight_yaml(skin: &Skin, body: &str) -> Vec<Line<'static>> {
+    body.lines()
+        .map(|line| highlight_yaml_line(skin, line))
+        .collect()
 }
 
-fn highlight_yaml_line(line: &str) -> Line<'static> {
+fn highlight_yaml_line(skin: &Skin, line: &str) -> Line<'static> {
     let owned = line.to_owned();
     let trimmed = line.trim_start();
     if trimmed.starts_with('#') || trimmed == "---" {
-        return Line::from(Span::styled(owned, Style::default().fg(MUTED).italic()));
+        return Line::from(Span::styled(
+            owned,
+            skin.foreground(
+                "views.yaml.valueColor",
+                skin.style("body", Style::default().fg(MUTED).italic()),
+            ),
+        ));
     }
     let indentation = &line[..line.len().saturating_sub(trimmed.len())];
     let (list_marker, content) = trimmed
@@ -2486,23 +3922,47 @@ fn highlight_yaml_line(line: &str) -> Line<'static> {
     let Some(colon) = content.find(':') else {
         return Line::from(vec![
             Span::raw(indentation.to_owned()),
-            Span::styled(list_marker.to_owned(), Style::default().fg(PURPLE)),
-            Span::styled(content.to_owned(), yaml_scalar_style(content)),
+            Span::styled(
+                list_marker.to_owned(),
+                skin.foreground(
+                    "views.yaml.colonColor",
+                    skin.style("body", Style::default().fg(PURPLE)),
+                ),
+            ),
+            Span::styled(content.to_owned(), yaml_scalar_style(skin, content)),
         ]);
     };
     let key = &content[..colon];
     let value = &content[colon + 1..];
     Line::from(vec![
         Span::raw(indentation.to_owned()),
-        Span::styled(list_marker.to_owned(), Style::default().fg(PURPLE)),
-        Span::styled(key.to_owned(), Style::default().fg(CYAN).bold()),
-        Span::styled(":", Style::default().fg(MUTED)),
-        Span::styled(value.to_owned(), yaml_scalar_style(value.trim())),
+        Span::styled(
+            list_marker.to_owned(),
+            skin.foreground(
+                "views.yaml.colonColor",
+                skin.style("body", Style::default().fg(PURPLE)),
+            ),
+        ),
+        Span::styled(
+            key.to_owned(),
+            skin.foreground(
+                "views.yaml.keyColor",
+                skin.style("body", Style::default().fg(CYAN).bold()),
+            ),
+        ),
+        Span::styled(
+            ":",
+            skin.foreground(
+                "views.yaml.colonColor",
+                skin.style("body", Style::default().fg(MUTED)),
+            ),
+        ),
+        Span::styled(value.to_owned(), yaml_scalar_style(skin, value.trim())),
     ])
 }
 
-fn yaml_scalar_style(value: &str) -> Style {
-    if matches!(value, "true" | "false" | "null" | "~") {
+fn yaml_scalar_style(skin: &Skin, value: &str) -> Style {
+    let base = if matches!(value, "true" | "false" | "null" | "~") {
         Style::default().fg(PURPLE)
     } else if value.parse::<f64>().is_ok() {
         Style::default().fg(ORANGE)
@@ -2510,19 +3970,25 @@ fn yaml_scalar_style(value: &str) -> Style {
         Style::default().fg(GREEN)
     } else {
         Style::default().fg(YELLOW)
-    }
+    };
+    skin.foreground("views.yaml.valueColor", skin.style("body", base))
 }
 
-fn highlight_describe(body: &str) -> Vec<Line<'static>> {
-    body.lines().map(highlight_describe_line).collect()
+fn highlight_describe(skin: &Skin, body: &str) -> Vec<Line<'static>> {
+    body.lines()
+        .map(|line| highlight_describe_line(skin, line))
+        .collect()
 }
 
-fn highlight_describe_line(line: &str) -> Line<'static> {
+fn highlight_describe_line(skin: &Skin, line: &str) -> Line<'static> {
     let trimmed = line.trim_start();
     let indentation = &line[..line.len().saturating_sub(trimmed.len())];
     let Some(colon) = trimmed.find(':') else {
         let style = if trimmed.starts_with("Warning") {
-            Style::default().fg(RED)
+            skin.foreground(
+                "frame.status.errorColor",
+                skin.style("body", Style::default().fg(RED)),
+            )
         } else {
             Style::default()
         };
@@ -2535,14 +4001,26 @@ fn highlight_describe_line(line: &str) -> Line<'static> {
     let value = &trimmed[colon + 1..];
     Line::from(vec![
         Span::raw(indentation.to_owned()),
-        Span::styled(key.to_owned(), Style::default().fg(CYAN).bold()),
-        Span::styled(":", Style::default().fg(MUTED)),
-        Span::styled(value.to_owned(), describe_value_style(value.trim())),
+        Span::styled(
+            key.to_owned(),
+            skin.foreground(
+                "views.yaml.keyColor",
+                skin.style("body", Style::default().fg(CYAN).bold()),
+            ),
+        ),
+        Span::styled(
+            ":",
+            skin.foreground(
+                "views.yaml.colonColor",
+                skin.style("body", Style::default().fg(MUTED)),
+            ),
+        ),
+        Span::styled(value.to_owned(), describe_value_style(skin, value.trim())),
     ])
 }
 
-fn describe_value_style(value: &str) -> Style {
-    if value.is_empty() || value == "<none>" {
+fn describe_value_style(skin: &Skin, value: &str) -> Style {
+    let base = if value.is_empty() || value == "<none>" {
         Style::default().fg(MUTED)
     } else if matches!(value, "Running" | "Ready" | "Active") {
         Style::default().fg(GREEN)
@@ -2550,26 +4028,62 @@ fn describe_value_style(value: &str) -> Style {
         Style::default().fg(RED)
     } else {
         Style::default().fg(YELLOW)
-    }
+    };
+    skin.foreground("views.yaml.valueColor", skin.style("body", base))
 }
 
 fn draw_port_forward_dialog(frame: &mut Frame<'_>, app: &App, dialog_area: Rect) {
     let Some(dialog) = app.port_forward_dialog.as_ref() else {
         return;
     };
+    let lines = port_forward_dialog_lines(app, dialog);
+    let height = u16::try_from(lines.len().saturating_add(2))
+        .unwrap_or(u16::MAX)
+        .min(dialog_area.height);
+    let popup = centered_rect(70, height, dialog_area);
+    preferences::clear_popup(frame, app, popup);
+    let block = notice_block(
+        popup_block(&app.theme, " <PortForward> ")
+            .style(app.theme.style("dialog", Style::default()))
+            .border_style(
+                Style::default().fg(app.theme.color("frame.border.fgColor", BODY_BORDER)),
+            ),
+        app,
+    );
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(app.theme.style("dialog", Style::default()))
+            .block(block),
+        popup,
+    );
+}
+
+fn port_forward_dialog_lines(app: &App, dialog: &PortForwardDialog) -> Vec<Line<'static>> {
     let exposed = dialog
         .ports
         .iter()
         .take(6)
         .map(|port| {
-            Line::from(Span::styled(port.display(), Style::default().fg(YELLOW))).centered()
+            Line::from(Span::styled(
+                port.display(),
+                app.theme.foreground(
+                    "dialog.labelFgColor",
+                    app.theme.style("dialog", Style::default().fg(YELLOW)),
+                ),
+            ))
+            .centered()
         })
         .collect::<Vec<_>>();
     let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
             port_forward_target_label(dialog),
-            Style::default().fg(YELLOW).bold(),
+            app.theme
+                .foreground(
+                    "dialog.labelFgColor",
+                    app.theme.style("dialog", Style::default().fg(YELLOW)),
+                )
+                .bold(),
         ))
         .centered(),
         Line::from(""),
@@ -2579,7 +4093,10 @@ fn draw_port_forward_dialog(frame: &mut Frame<'_>, app: &App, dialog_area: Rect)
             } else {
                 "Exposed Ports:"
             },
-            Style::default().fg(YELLOW),
+            app.theme.foreground(
+                "dialog.labelFgColor",
+                app.theme.style("dialog", Style::default().fg(YELLOW)),
+            ),
         ))
         .centered(),
     ];
@@ -2592,16 +4109,19 @@ fn draw_port_forward_dialog(frame: &mut Frame<'_>, app: &App, dialog_area: Rect)
     };
     lines.extend([
         port_forward_option_line(
+            &app.theme,
             remote_label,
             &dialog.remote_port,
             app.overlay_selected == PORT_FORWARD_REMOTE_FIELD,
         ),
         port_forward_option_line(
+            &app.theme,
             "Local Port:",
             &dialog.local_port,
             app.overlay_selected == PORT_FORWARD_LOCAL_FIELD,
         ),
         port_forward_option_line(
+            &app.theme,
             "Address:",
             &dialog.address,
             app.overlay_selected == PORT_FORWARD_ADDRESS_FIELD,
@@ -2610,33 +4130,27 @@ fn draw_port_forward_dialog(frame: &mut Frame<'_>, app: &App, dialog_area: Rect)
         Line::from(vec![
             Span::styled(
                 "   OK   ",
-                drain_button_style(app.overlay_selected == PORT_FORWARD_OK_FIELD),
+                drain_button_style(&app.theme, app.overlay_selected == PORT_FORWARD_OK_FIELD),
             ),
             Span::raw("        "),
             Span::styled(
                 " Cancel ",
-                drain_button_style(app.overlay_selected == PORT_FORWARD_CANCEL_FIELD),
+                drain_button_style(
+                    &app.theme,
+                    app.overlay_selected == PORT_FORWARD_CANCEL_FIELD,
+                ),
             ),
         ])
         .centered(),
         Line::from(""),
         Line::from(Span::styled(
             "Tab/↑/↓ fields · type values · Enter selects · Esc cancels",
-            Style::default().fg(MUTED),
+            app.theme.style("dialog", Style::default().fg(MUTED)),
         ))
         .centered(),
     ]);
 
-    let height = u16::try_from(lines.len().saturating_add(2))
-        .unwrap_or(u16::MAX)
-        .min(dialog_area.height);
-    let popup = centered_rect(70, height, dialog_area);
-    frame.render_widget(Clear, popup);
-    let block = notice_block(
-        popup_block(" <PortForward> ").border_style(Style::default().fg(BODY_BORDER)),
-        app,
-    );
-    frame.render_widget(Paragraph::new(lines).block(block), popup);
+    lines
 }
 
 fn port_forward_target_label(dialog: &PortForwardDialog) -> String {
@@ -2646,20 +4160,43 @@ fn port_forward_target_label(dialog: &PortForwardDialog) -> String {
     )
 }
 
-fn port_forward_option_line(label: &str, value: &str, selected: bool) -> Line<'static> {
+fn port_forward_option_line(
+    skin: &Skin,
+    label: &str,
+    value: &str,
+    selected: bool,
+) -> Line<'static> {
     let value = if value.is_empty() {
         "<enter value>"
     } else {
         value
     };
     let value_style = if selected {
-        Style::default().fg(Color::White).bg(SELECTED).bold()
+        skin.foreground(
+            "dialog.fieldFgColor",
+            skin.dialog_button(
+                true,
+                skin.style("dialog", Style::default())
+                    .fg(Color::White)
+                    .bg(SELECTED)
+                    .bold(),
+            ),
+        )
     } else {
-        Style::default().fg(CYAN)
+        skin.foreground(
+            "dialog.fieldFgColor",
+            skin.style("dialog", Style::default().fg(CYAN)),
+        )
     };
     Line::from(vec![
         Span::raw("  "),
-        Span::styled(format!("{label:<20}"), Style::default().fg(PINK).bold()),
+        Span::styled(
+            format!("{label:<20}"),
+            skin.foreground(
+                "dialog.labelFgColor",
+                skin.style("dialog", Style::default().fg(PINK).bold()),
+            ),
+        ),
         Span::styled(format!(" {value} "), value_style),
     ])
 }
@@ -2695,9 +4232,15 @@ fn draw_port_forwards(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Cell::from(forward.state.label()),
             ])
             .style(if index == app.overlay_selected {
-                Style::default().fg(Color::White).bg(SELECTED).bold()
+                app.theme.table_cursor(
+                    app.theme
+                        .style("views.table", Style::default())
+                        .fg(Color::White)
+                        .bg(SELECTED)
+                        .bold(),
+                )
             } else {
-                Style::default().fg(CYAN)
+                app.theme.style("views.table", Style::default().fg(CYAN))
             })
         });
     let table = Table::new(
@@ -2720,59 +4263,115 @@ fn draw_port_forwards(frame: &mut Frame<'_>, app: &App, area: Rect) {
             "ADDRESS",
             "STATUS",
         ])
-        .style(Style::default().fg(YELLOW).bold()),
+        .style(
+            app.theme
+                .style("views.table.header", Style::default().fg(YELLOW).bold()),
+        ),
     )
+    .style(app.theme.style("views.table", Style::default()))
     .column_spacing(1)
     .block(notice_block(
-        popup_block(&title)
+        popup_block(&app.theme, &title)
+            .style(app.theme.style("views.table", Style::default()))
             .title_alignment(Alignment::Center)
-            .border_style(Style::default().fg(BODY_BORDER)),
+            .border_style(
+                Style::default().fg(app.theme.color("frame.border.fgColor", BODY_BORDER)),
+            ),
         app,
     ));
     frame.render_widget(table, area);
 }
 
-fn draw_delete_confirmation(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    if let Some(PendingDelete::DrainNode(dialog)) = app.pending_delete.as_ref() {
-        draw_drain_confirmation(frame, app, dialog, area);
-        return;
-    }
-    let (title, prompt) = match app.pending_delete.as_ref() {
-        Some(PendingDelete::Resources(targets)) if targets.len() == 1 => {
-            let target = &targets[0];
-            (
-                " Confirm Delete ",
-                format!("Delete {} {}?", target.kind.label(), target.name),
-            )
-        }
-        Some(PendingDelete::Resources(targets)) => {
-            let resource = targets
-                .first()
-                .map_or("resources", |target| target.kind.plural_name());
-            (
-                " Confirm Delete ",
-                format!("Delete all {} selected {resource}?", targets.len()),
-            )
-        }
-        Some(PendingDelete::Restart(targets)) if targets.len() == 1 => {
-            let target = &targets[0];
-            (
-                " Confirm Restart ",
-                format!("Restart {} {}?", target.kind.kind, target.name),
-            )
-        }
-        Some(PendingDelete::Restart(targets)) => {
-            let resource = targets
-                .first()
-                .map_or("workloads", |target| target.kind.plural_name());
-            (
-                " Confirm Restart ",
-                format!("Restart all {} selected {resource}?", targets.len()),
-            )
-        }
+fn draw_scale_dialog(
+    frame: &mut Frame<'_>,
+    app: &App,
+    area: Rect,
+    targets: &[crate::app::ResourceTarget],
+    replicas: &str,
+) {
+    let popup = centered_rect(66, 11, area);
+    preferences::clear_popup(frame, app, popup);
+    let target_label = if targets.len() == 1 {
+        format!("{} {}", targets[0].kind.kind, targets[0].name)
+    } else {
+        format!("{} selected resources", targets.len())
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(""),
+            Line::from(format!("Scale {target_label}")).centered(),
+            Line::from(""),
+            drain_option_line(
+                &app.theme,
+                "Replicas",
+                &format!("{replicas} "),
+                app.overlay_selected == 0,
+            ),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(
+                    " [ Cancel ] ",
+                    drain_button_style(&app.theme, app.overlay_selected == 1),
+                ),
+                Span::styled(
+                    " [ Scale ] ",
+                    drain_button_style(&app.theme, app.overlay_selected == 2),
+                ),
+            ])
+            .centered(),
+            Line::from(""),
+            Line::from("Tab selects field · Enter activates · Esc cancels").centered(),
+        ])
+        .style(app.theme.style("dialog", Style::default()))
+        .block(notice_block(
+            popup_block(&app.theme, " Scale ").style(app.theme.style("dialog", Style::default())),
+            app,
+        )),
+        popup,
+    );
+}
+
+fn confirmation_prompt(pending: Option<&PendingDelete>) -> (&'static str, String) {
+    match pending {
+        Some(PendingDelete::Resources(targets)) => delete_resources_prompt(targets),
+        Some(PendingDelete::Restart(targets)) => restart_resources_prompt(targets),
         Some(PendingDelete::Context { name }) => {
             (" Confirm Delete ", format!("Delete context {name}?"))
         }
+        Some(PendingDelete::TriggerCronJob(targets)) => (
+            " Confirm Job Trigger ",
+            if targets.len() == 1 {
+                format!("Trigger CronJob {}?", targets[0].name)
+            } else {
+                format!("Trigger {} selected CronJobs?", targets.len())
+            },
+        ),
+        Some(PendingDelete::ToggleCronJobSuspend { target, suspend }) => match suspend {
+            Some(true) => (
+                " Confirm Suspend ",
+                format!("Suspend CronJob {}?", target.name),
+            ),
+            Some(false) => (
+                " Confirm Resume ",
+                format!("Resume CronJob {}?", target.name),
+            ),
+            None => (
+                " Confirm Suspend/Resume ",
+                format!("Toggle suspension for CronJob {}?", target.name),
+            ),
+        },
+        Some(PendingDelete::SetSuspended { targets, suspended }) => (
+            if *suspended {
+                " Confirm Suspend "
+            } else {
+                " Confirm Resume "
+            },
+            format!(
+                "{} {} selected resources?",
+                if *suspended { "Suspend" } else { "Resume" },
+                targets.len()
+            ),
+        ),
         Some(PendingDelete::NodeScheduling {
             name,
             unschedulable: true,
@@ -2781,51 +4380,191 @@ fn draw_delete_confirmation(frame: &mut Frame<'_>, app: &App, area: Rect) {
             name,
             unschedulable: false,
         }) => (" Confirm Uncordon ", format!("Uncordon Node {name}?")),
-        Some(PendingDelete::DrainNode(_)) => unreachable!("drain dialog handled above"),
+        Some(PendingDelete::HelmRollback {
+            namespace,
+            release,
+            revision,
+        }) => (
+            " Rollback ",
+            format!("Rollback release {namespace}/{release} to revision {revision}?"),
+        ),
+        Some(PendingDelete::DirDelete { path }) => {
+            (" Confirm Delete ", format!("Delete manifest {path}?"))
+        }
+        Some(
+            PendingDelete::DrainNode(_)
+            | PendingDelete::Scale { .. }
+            | PendingDelete::RenameContext { .. },
+        ) => {
+            unreachable!("editable dialogs handled above")
+        }
         None => (" Confirm Delete ", "Delete resource?".to_owned()),
-    };
+    }
+}
+
+fn delete_resources_prompt(targets: &[crate::app::ResourceTarget]) -> (&'static str, String) {
+    if targets.len() == 1 {
+        let target = &targets[0];
+        return (
+            " Confirm Delete ",
+            format!("Delete {} {}?", target.kind.label(), target.name),
+        );
+    }
+    let resource = targets.first().map_or("resources", |first| {
+        if targets.iter().all(|target| target.kind == first.kind) {
+            first.kind.plural_name()
+        } else {
+            "resources"
+        }
+    });
+    (
+        " Confirm Delete ",
+        format!("Delete all {} selected {resource}?", targets.len()),
+    )
+}
+
+fn restart_resources_prompt(targets: &[crate::app::ResourceTarget]) -> (&'static str, String) {
+    if targets.len() == 1 {
+        let target = &targets[0];
+        return (
+            " Confirm Restart ",
+            format!("Restart {} {}?", target.kind.kind, target.name),
+        );
+    }
+    let resource = targets
+        .first()
+        .map_or("workloads", |target| target.kind.plural_name());
+    (
+        " Confirm Restart ",
+        format!("Restart all {} selected {resource}?", targets.len()),
+    )
+}
+
+fn draw_rename_context_dialog(
+    frame: &mut Frame<'_>,
+    app: &App,
+    area: Rect,
+    old_name: &str,
+    new_name: &str,
+) {
+    let popup = centered_rect(66, 11, area);
+    preferences::clear_popup(frame, app, popup);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(""),
+            Line::from(format!("Rename context {old_name}")).centered(),
+            Line::from(""),
+            drain_option_line(
+                &app.theme,
+                "Context Name",
+                &format!("{new_name} "),
+                app.overlay_selected == 0,
+            ),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(
+                    " [ Cancel ] ",
+                    drain_button_style(&app.theme, app.overlay_selected == 1),
+                ),
+                Span::styled(
+                    " [ OK ] ",
+                    drain_button_style(&app.theme, app.overlay_selected == 2),
+                ),
+            ])
+            .centered(),
+            Line::from(""),
+            Line::from("Tab selects field · Enter activates · Esc cancels").centered(),
+        ])
+        .style(app.theme.style("dialog", Style::default()))
+        .block(notice_block(
+            popup_block(&app.theme, " Rename ").style(app.theme.style("dialog", Style::default())),
+            app,
+        )),
+        popup,
+    );
+}
+
+fn draw_delete_confirmation(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    if let Some(PendingDelete::DrainNode(dialog)) = app.pending_delete.as_ref() {
+        draw_drain_confirmation(frame, app, dialog, area);
+        return;
+    }
+    if let Some(PendingDelete::Scale { targets, replicas }) = app.pending_delete.as_ref() {
+        draw_scale_dialog(frame, app, area, targets, replicas);
+        return;
+    }
+    if let Some(PendingDelete::RenameContext { old_name, new_name }) = app.pending_delete.as_ref() {
+        draw_rename_context_dialog(frame, app, area, old_name, new_name);
+        return;
+    }
+    let (title, prompt) = confirmation_prompt(app.pending_delete.as_ref());
     let buttons = if app.confirm_armed {
         Line::from(vec![
-            Span::styled(" [ Cancel ] ", Style::default().fg(MUTED)),
-            Span::styled(" [ OK ] ", Style::default().fg(Color::White).bg(RED).bold()),
+            Span::styled(
+                " [ Cancel ] ",
+                app.theme
+                    .dialog_button(false, app.theme.style("dialog", Style::default().fg(MUTED))),
+            ),
+            Span::styled(
+                " [ OK ] ",
+                app.theme
+                    .dialog_button(true, Style::default().fg(Color::White).bg(RED).bold()),
+            ),
         ])
     } else {
         Line::from(vec![
             Span::styled(
                 " [ Cancel ] ",
-                Style::default().fg(Color::White).bg(SELECTED).bold(),
+                app.theme
+                    .dialog_button(true, Style::default().fg(Color::White).bg(SELECTED).bold()),
             ),
-            Span::styled(" [ OK ] ", Style::default().fg(MUTED)),
+            Span::styled(
+                " [ OK ] ",
+                app.theme
+                    .dialog_button(false, app.theme.style("dialog", Style::default().fg(MUTED))),
+            ),
         ])
     };
     let popup = centered_rect(60, 9, area);
-    frame.render_widget(Clear, popup);
+    preferences::clear_popup(frame, app, popup);
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(""),
-            Line::from(Span::styled(prompt, Style::default().fg(RED).bold())).centered(),
+            Line::from(Span::styled(
+                prompt,
+                app.theme.foreground(
+                    "frame.status.errorColor",
+                    app.theme.style("dialog", Style::default().fg(RED).bold()),
+                ),
+            ))
+            .centered(),
             Line::from(""),
             buttons.centered(),
             Line::from(""),
             Line::from(Span::styled(
                 "Tab selects OK · Enter confirms · Esc cancels",
-                Style::default().fg(MUTED),
+                app.theme.style("dialog", Style::default().fg(MUTED)),
             ))
             .centered(),
         ])
-        .block(popup_block(title).border_style(Style::default().fg(RED))),
+        .style(app.theme.style("dialog", Style::default()))
+        .block(
+            popup_block(&app.theme, title)
+                .style(app.theme.style("dialog", Style::default()))
+                .border_style(Style::default().fg(app.theme.color("frame.status.errorColor", RED))),
+        ),
         popup,
     );
 }
 
 fn draw_drain_confirmation(frame: &mut Frame<'_>, app: &App, dialog: &DrainDialog, area: Rect) {
     let option = |field, label: &str, value: &str| {
-        drain_option_line(label, value, app.overlay_selected == field)
+        drain_option_line(&app.theme, label, value, app.overlay_selected == field)
     };
-    let cancel_style = drain_button_style(app.overlay_selected == DRAIN_CANCEL_FIELD);
-    let ok_style = drain_button_style(app.overlay_selected == DRAIN_OK_FIELD);
+    let cancel_style = drain_button_style(&app.theme, app.overlay_selected == DRAIN_CANCEL_FIELD);
+    let ok_style = drain_button_style(&app.theme, app.overlay_selected == DRAIN_OK_FIELD);
     let popup = centered_rect(76, 18, area);
-    frame.render_widget(Clear, popup);
+    preferences::clear_popup(frame, app, popup);
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(""),
@@ -2883,24 +4622,49 @@ fn draw_drain_confirmation(frame: &mut Frame<'_>, app: &App, dialog: &DrainDialo
             Line::from(""),
             Line::from(Span::styled(
                 "↑/↓ fields · type values · Space toggles · Enter selects · Esc cancels",
-                Style::default().fg(MUTED),
+                app.theme.style("dialog", Style::default().fg(MUTED)),
             ))
             .centered(),
         ])
-        .block(popup_block(" <Drain> ").border_style(Style::default().fg(BODY_BORDER))),
+        .style(app.theme.style("dialog", Style::default()))
+        .block(
+            popup_block(&app.theme, " <Drain> ")
+                .style(app.theme.style("dialog", Style::default()))
+                .border_style(
+                    Style::default().fg(app.theme.color("frame.border.fgColor", BODY_BORDER)),
+                ),
+        ),
         popup,
     );
 }
 
-fn drain_option_line(label: &str, value: &str, selected: bool) -> Line<'static> {
+fn drain_option_line(skin: &Skin, label: &str, value: &str, selected: bool) -> Line<'static> {
     let value_style = if selected {
-        Style::default().fg(Color::White).bg(SELECTED).bold()
+        skin.foreground(
+            "dialog.fieldFgColor",
+            skin.dialog_button(
+                true,
+                skin.style("dialog", Style::default())
+                    .fg(Color::White)
+                    .bg(SELECTED)
+                    .bold(),
+            ),
+        )
     } else {
-        Style::default().fg(CYAN)
+        skin.foreground(
+            "dialog.fieldFgColor",
+            skin.style("dialog", Style::default().fg(CYAN)),
+        )
     };
     Line::from(vec![
         Span::raw("  "),
-        Span::styled(format!("{label:<24}"), Style::default().fg(PINK).bold()),
+        Span::styled(
+            format!("{label:<24}"),
+            skin.foreground(
+                "dialog.labelFgColor",
+                skin.style("dialog", Style::default().fg(PINK).bold()),
+            ),
+        ),
         Span::styled(format!(" {value} "), value_style),
     ])
 }
@@ -2909,27 +4673,38 @@ fn drain_checkbox(enabled: bool) -> &'static str {
     if enabled { "[x]" } else { "[ ]" }
 }
 
-fn drain_button_style(selected: bool) -> Style {
-    if selected {
+fn drain_button_style(skin: &Skin, selected: bool) -> Style {
+    let base = if selected {
         Style::default().fg(Color::White).bg(SELECTED).bold()
     } else {
         Style::default().fg(MUTED)
-    }
+    };
+    skin.dialog_button(selected, skin.style("dialog", Style::default()).patch(base))
 }
 
-fn detail_line(label: &str, value: &str) -> Line<'static> {
+fn detail_line(skin: &Skin, label: &str, value: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("  {label:<12}"), Style::default().fg(MUTED)),
+        Span::styled(
+            format!("  {label:<12}"),
+            skin.foreground(
+                "info.sectionColor",
+                skin.style("body", Style::default().fg(MUTED)),
+            ),
+        ),
         Span::raw(value.to_owned()),
     ])
 }
 
-fn popup_block(title: &str) -> Block<'_> {
+fn popup_block<'a>(skin: &Skin, title: &'a str) -> Block<'a> {
     Block::default()
+        .style(skin.style("body", Style::default()))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(CYAN))
-        .title(Span::styled(title, Style::default().fg(YELLOW).bold()))
+        .border_style(Style::default().fg(skin.color("frame.border.fgColor", CYAN)))
+        .title(Span::styled(
+            title,
+            skin.style("frame.title", Style::default().fg(YELLOW).bold()),
+        ))
 }
 
 fn notice_block<'a>(block: Block<'a>, app: &App) -> Block<'a> {
@@ -2937,7 +4712,10 @@ fn notice_block<'a>(block: Block<'a>, app: &App) -> Block<'a> {
         block.title_bottom(
             Line::from(Span::styled(
                 format!(" {notice} "),
-                Style::default().fg(GREEN).bold(),
+                app.theme.foreground(
+                    "frame.status.highlightColor",
+                    app.theme.style("body", Style::default().fg(GREEN).bold()),
+                ),
             ))
             .right_aligned(),
         )
@@ -2946,34 +4724,53 @@ fn notice_block<'a>(block: Block<'a>, app: &App) -> Block<'a> {
     }
 }
 
-fn status_style(status: &str) -> Style {
+fn status_style(skin: &Skin, status: &str) -> Style {
     let normalized = status.trim().to_ascii_lowercase();
     let color = if normalized == "terminating" {
         MUTED
-    } else if normalized == "false"
+    } else if normalized == "sev-1"
+        || normalized == "false"
         || normalized.starts_with("false ")
         || normalized.contains("failed")
         || normalized.contains("error")
         || normalized.contains("crashloop")
         || normalized.contains("notready")
+        || normalized == "noready"
     {
         RED
-    } else if matches!(
-        normalized.as_str(),
-        "pending" | "progressing" | "unknown" | "scheduled" | "unschedulable"
-    ) || normalized.contains("unschedulable")
+    } else if normalized == "sev-2" {
+        ORANGE
+    } else if normalized == "sev-3"
+        || matches!(
+            normalized.as_str(),
+            "pending" | "progressing" | "unknown" | "scheduled" | "unschedulable"
+        )
+        || normalized.contains("unschedulable")
     {
         YELLOW
+    } else if matches!(normalized.as_str(), "sev-4" | "sev-5") {
+        CYAN
     } else if matches!(
         normalized.as_str(),
-        "running" | "ready" | "succeeded" | "true" | "active" | "available" | "bound"
+        "running" | "ready" | "succeeded" | "completed" | "true" | "active" | "available" | "bound"
     ) || normalized.ends_with("ready")
     {
         GREEN
     } else {
-        return Style::default();
+        return skin.style("views.table", Style::default());
     };
-    Style::default().fg(color)
+    let key = if normalized == "terminating" {
+        "frame.status.killColor"
+    } else if matches!(normalized.as_str(), "succeeded" | "completed") {
+        "frame.status.completedColor"
+    } else if color == RED {
+        "frame.status.errorColor"
+    } else if color == YELLOW {
+        "frame.status.pendingColor"
+    } else {
+        "frame.status.addColor"
+    };
+    skin.foreground(key, skin.style("views.table", Style::default().fg(color)))
 }
 
 fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
@@ -3009,7 +4806,7 @@ mod tests {
         },
     };
 
-    fn rendered_lines(terminal: &Terminal<TestBackend>, width: u16) -> Vec<String> {
+    pub(super) fn rendered_lines(terminal: &Terminal<TestBackend>, width: u16) -> Vec<String> {
         terminal
             .backend()
             .buffer()
@@ -3054,6 +4851,151 @@ mod tests {
         app
     }
 
+    fn reference_test_app() -> App {
+        let mut app = app_with_rendered_pod();
+        app.apply_snapshot(ResourceSnapshot {
+            generation: app.generation,
+            kind: app.kind.clone(),
+            rows: Arc::new(vec![
+                Arc::new(ResourceRow::new("beta", "same", "", "", "batch/v1/jobs", 0)),
+                Arc::new(ResourceRow::new(
+                    "alpha",
+                    "same",
+                    "",
+                    "",
+                    "apps/v1/deployments",
+                    0,
+                )),
+            ]),
+            table_columns: Arc::from([TableColumn {
+                name: Arc::from("WRONG-SERVER-COLUMN"),
+                format: Arc::from(""),
+                priority: 0,
+            }]),
+            state: SourceState::Ready,
+            revision: 2,
+            emitted_at: Instant::now(),
+        });
+        app.list_mode = ListMode::References {
+            title: "UsedBy(configmaps/default/settings)".to_owned(),
+        };
+        app
+    }
+
+    #[test]
+    fn references_keep_exact_identity_columns_without_marks_or_server_columns() {
+        let mut app = reference_test_app();
+        app.marks.insert(app.snapshot.rows[0].key.clone());
+        for width in [48, 80, 140] {
+            for include_hidden in [false, true] {
+                let columns = columns_for_view_options(&app, width, include_hidden);
+                assert_eq!(
+                    columns
+                        .iter()
+                        .map(|column| column.label.as_str())
+                        .collect::<Vec<_>>(),
+                    ["NAMESPACE", "NAME", "GVR"]
+                );
+                assert_eq!(columns[0].field, Some(SortField::Namespace));
+                assert_eq!(columns[1].field, Some(SortField::Name));
+                assert_eq!(columns[2].field, Some(SortField::Details));
+            }
+        }
+        let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_resources(frame, &mut app, area);
+            })
+            .unwrap();
+        let lines = rendered_lines(&terminal, 100);
+        let text = lines.join("\n");
+        assert!(text.contains("UsedBy(configmaps/default/settings)[2]"));
+        assert!(text.contains("apps/v1/deployments"));
+        assert!(text.contains("batch/v1/jobs"));
+        assert!(!text.contains("WRONG-SERVER-COLUMN"));
+        assert!(!text.contains('●'));
+        let header = lines
+            .iter()
+            .find(|line| line.contains("NAMESPACE"))
+            .unwrap();
+        assert!(header.find("NAMESPACE").unwrap() < header.rfind("NAME").unwrap());
+        assert!(header.rfind("NAME").unwrap() < header.find("GVR").unwrap());
+    }
+
+    #[test]
+    fn references_reuse_mouse_sorting_and_filter_count() {
+        let mut app = reference_test_app();
+        let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_resources(frame, &mut app, area);
+            })
+            .unwrap();
+        let lines = rendered_lines(&terminal, 100);
+        let (row, header) = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.contains("GVR"))
+            .unwrap();
+        let column = header
+            .chars()
+            .position(|character| character == 'G')
+            .unwrap();
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: u16::try_from(column).unwrap(),
+            row: u16::try_from(row).unwrap(),
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(app.handle_mouse(click));
+        assert_eq!(app.sort_field, SortField::Details);
+        assert_eq!(
+            app.snapshot.rows[app.filtered[0]].details.as_ref(),
+            "apps/v1/deployments"
+        );
+        assert!(app.handle_mouse(click));
+        assert_eq!(
+            app.snapshot.rows[app.filtered[0]].details.as_ref(),
+            "batch/v1/jobs"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for character in "apps/v1".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            resource_view_title(&app, &app.query),
+            " UsedBy(configmaps/default/settings)[1] /apps/v1 "
+        );
+    }
+
+    #[test]
+    fn references_hints_show_goto_refresh_and_gvr_sort_without_resource_actions() {
+        let app = reference_test_app();
+        let hints = action_hints(&app);
+        for (key, label) in [
+            ("enter", "Goto"),
+            ("ctrl-r", "Refresh"),
+            ("shift-n", "Sort Name"),
+            ("shift-p", "Sort Namespace"),
+            ("shift-v", "Sort GVR"),
+            ("c", "Copy Name"),
+            ("esc", "Back"),
+        ] {
+            assert!(
+                hints
+                    .iter()
+                    .any(|hint| hint.key == key && hint.label == label)
+            );
+        }
+        for blocked in ["ctrl-d", "ctrl-k", "ctrl-s", "e", "y", "d", "space"] {
+            assert!(!hints.iter().any(|hint| hint.key == blocked));
+        }
+        assert!(namespace_hints(&app).is_empty());
+    }
+
     fn header_test_app() -> App {
         let context = "gke_sncloud-test_us-west1-long-context";
         let mut app = App::new(
@@ -3082,6 +5024,58 @@ mod tests {
         ];
         app.set_server_version("v1.34.8-gke.1278000");
         app
+    }
+
+    #[test]
+    fn batch_navigation_hints_do_not_require_compact_child_metadata() {
+        for read_only in [false, true] {
+            for (kind, plural, label) in [("CronJob", "cronjobs", "Jobs"), ("Job", "jobs", "Pods")]
+            {
+                let mut app = header_test_app();
+                app.read_only = read_only;
+                app.kind = ResourceDescriptor::new(
+                    "batch",
+                    "v1",
+                    "batch/v1",
+                    kind,
+                    plural,
+                    true,
+                    crate::model::ResourceOperations::all(),
+                );
+                assert!(app.selected_row().is_none());
+                assert!(
+                    resource_action_hints(&app)
+                        .iter()
+                        .any(|hint| { hint.key == "enter" && hint.label == label })
+                );
+                let mut terminal = Terminal::new(TestBackend::new(200, 36)).unwrap();
+                terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+                let lines = rendered_lines(&terminal, 200);
+                assert!(lines.iter().any(|line| {
+                    line.split_whitespace()
+                        .collect::<Vec<_>>()
+                        .windows(2)
+                        .any(|words| words == ["<enter>", label])
+                }));
+                assert_eq!(
+                    resource_action_hints(&app)
+                        .iter()
+                        .any(|hint| { hint.key == "t" && hint.label == "Trigger" }),
+                    kind == "CronJob" && !read_only
+                );
+            }
+        }
+        let mut app = header_test_app();
+        app.kind = ResourceDescriptor::new(
+            "example.test",
+            "v1",
+            "example.test/v1",
+            "Job",
+            "jobs",
+            true,
+            crate::model::ResourceOperations::all(),
+        );
+        assert_eq!(resource_enter_label(&app), "Details");
     }
 
     #[test]
@@ -3179,6 +5173,72 @@ mod tests {
 
         assert!(header_without_spaces.contains(app.context.as_str()));
         assert!(body_row >= usize::from(layout.height));
+    }
+
+    #[test]
+    fn end_navigation_keeps_last_resource_visible_and_clickable_after_resize() {
+        let mut app = App::new(
+            "demo",
+            None,
+            ResourceKind::Pods,
+            false,
+            vec!["demo".to_owned()],
+        );
+        app.apply_snapshot(ResourceSnapshot {
+            generation: app.generation,
+            kind: ResourceKind::Pods.into(),
+            rows: Arc::new(
+                (0..100)
+                    .map(|index| {
+                        Arc::new(ResourceRow::new(
+                            "default",
+                            format!("pod-{index:03}"),
+                            "Running",
+                            "1/1",
+                            "0",
+                            0,
+                        ))
+                    })
+                    .collect(),
+            ),
+            table_columns: Arc::from([]),
+            state: SourceState::Ready,
+            revision: 1,
+            emitted_at: Instant::now(),
+        });
+        for height in [15, 10] {
+            let mut terminal = Terminal::new(TestBackend::new(100, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    draw_resources(frame, &mut app, area);
+                })
+                .unwrap();
+            app.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT));
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    draw_resources(frame, &mut app, area);
+                })
+                .unwrap();
+            assert_eq!(app.viewport_height, usize::from(height - 4));
+            let lines = rendered_lines(&terminal, 100);
+            let last = u16::try_from(
+                lines
+                    .iter()
+                    .position(|line| line.contains("pod-099"))
+                    .expect("last resource remains visible"),
+            )
+            .unwrap();
+            assert_eq!(last, height - 2);
+            assert!(app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 2,
+                row: last,
+                modifiers: KeyModifiers::NONE,
+            }));
+            assert_eq!(app.selected, 99);
+        }
     }
 
     #[test]
@@ -3745,10 +5805,18 @@ mod tests {
         let lines = rendered_lines(&terminal, 100);
         let title = lines
             .iter()
-            .find(|line| line.contains("resources[6]"))
+            .find(|line| line.contains("resources[14]"))
             .expect("resource chooser body title");
         assert!(title.starts_with('╭'));
         assert!(lines.iter().any(|line| line.contains("RESOURCE")));
+        assert!(lines.iter().any(|line| line.contains("workloads")));
+        assert!(lines.iter().any(|line| line.contains("users")));
+        assert!(lines.iter().any(|line| line.contains("groups")));
+        assert!(lines.iter().any(|line| line.contains("helm")));
+        assert!(lines.iter().any(|line| line.contains("benchmarks")));
+        assert!(lines.iter().any(|line| line.contains("pulses")));
+        assert!(lines.iter().any(|line| line.contains("xray")));
+        assert!(lines.iter().any(|line| line.contains("skins")));
         assert!(!lines.iter().any(|line| line.contains("pods(default)")));
     }
 
@@ -4214,7 +6282,15 @@ mod tests {
         app.apply_snapshot(snapshot);
         app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
         let id = app.log_view.as_ref().expect("active log stream").request.id;
-        app.append_log_batch(id, lines, false, None);
+        app.append_log_batch(
+            id,
+            lines
+                .into_iter()
+                .map(|text| crate::source::LogLine { source: None, text })
+                .collect(),
+            false,
+            None,
+        );
         app
     }
 
@@ -4244,6 +6320,208 @@ mod tests {
             let hints = log_action_hints(&app, false);
             assert!(hints.iter().any(|hint| hint.key == "0" && hint.active));
             assert!(hints.iter().any(|hint| hint.key == "s" && hint.active));
+        }
+    }
+
+    fn append_source_log(app: &mut App, pod: &str, container: &str, message: &str) {
+        let id = app.log_view.as_ref().unwrap().request.id;
+        app.append_log_batch(
+            id,
+            vec![crate::source::LogLine {
+                source: Some(crate::source::LogSource {
+                    namespace: "default".to_owned(),
+                    pod: pod.to_owned(),
+                    container: container.to_owned(),
+                    single_container: false,
+                }),
+                text: format!("2026-10-13T06:00:00Z {message}"),
+            }],
+            false,
+            None,
+        );
+    }
+
+    fn app_with_merged_logs() -> App {
+        let mut app = app_with_streamed_logs(Vec::new());
+        let request = app.log_view.as_ref().unwrap().request.clone();
+        app.log_view = Some(crate::log_view::LogView::with_settings(
+            request.clone(),
+            &crate::config::LoggerSettings {
+                buffer: 3,
+                ..crate::config::LoggerSettings::default()
+            },
+        ));
+        app.show_log_resolution(
+            request.id,
+            crate::source::LogSessionMeta {
+                default_container: Some("app".to_owned()),
+                selected_container: None,
+                all_containers: true,
+                multi_pods: true,
+                single_container: false,
+                source_count: 2,
+            },
+        );
+        app
+    }
+
+    #[test]
+    fn merged_log_identity_color_survives_filter_and_timestamp_toggle() {
+        let mut app = app_with_merged_logs();
+        append_source_log(&mut app, "pod-a", "app", "INFO first");
+        append_source_log(&mut app, "pod-b", "sidecar", "WARN second");
+        for character in "/pod-b".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        let mut terminal = Terminal::new(TestBackend::new(90, 12)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let lines = rendered_lines(&terminal, 90);
+        assert!(lines[0].starts_with("pod-b sidecar WARN second"));
+        assert_eq!(app.log_export_text(), "pod-b sidecar WARN second");
+        // Matching text receives the search color; the adjacent container retains Pod color.
+        assert_eq!(
+            terminal.backend().buffer()[(6, 0)].fg,
+            Color::Rgb(255, 0, 255)
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let lines = rendered_lines(&terminal, 90);
+        assert!(lines[0].starts_with("2026-10-13T06:00:00Z"));
+        assert!(lines[0].contains("pod-b sidecar WARN second"));
+        assert_eq!(terminal.backend().buffer()[(0, 0)].fg, Color::Gray);
+        assert_eq!(
+            terminal.backend().buffer()[(37, 0)].fg,
+            Color::Rgb(255, 0, 255)
+        );
+        assert_eq!(app.log_export_text(), lines[0].trim_end());
+    }
+
+    #[test]
+    fn merged_log_identity_survives_trim_pause_and_local_marker() {
+        let mut app = app_with_merged_logs();
+        for (pod, message) in [
+            ("old", "INFO discarded"),
+            ("pod-a", "INFO one"),
+            ("pod-b", "INFO two"),
+            ("pod-a", "INFO three"),
+        ] {
+            append_source_log(&mut app, pod, "app", message);
+        }
+        assert!(!app.content_body.contains("discarded"));
+        let mut terminal = Terminal::new(TestBackend::new(90, 12)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        append_source_log(&mut app, "pod-b", "sidecar", "WARN after pause");
+        assert!(!app.content_body.contains("after pause"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let lines = rendered_lines(&terminal, 90);
+        assert!(lines[0].starts_with("pod-a app INFO three"));
+        assert!(lines[1].starts_with("────"));
+        assert!(lines[2].starts_with("pod-b sidecar WARN after pause"));
+        assert_eq!(
+            terminal.backend().buffer()[(0, 0)].fg,
+            Color::Rgb(128, 0, 128)
+        );
+        assert_eq!(terminal.backend().buffer()[(0, 1)].fg, PINK);
+        assert_eq!(
+            terminal.backend().buffer()[(0, 2)].fg,
+            Color::Rgb(255, 0, 255)
+        );
+    }
+
+    #[test]
+    fn all_container_log_hint_uses_resolved_default_and_explicit_container_state() {
+        for width in [50, 80, 180] {
+            let mut app = app_with_merged_logs();
+            append_source_log(&mut app, "pod-a", "app", "INFO ready");
+            let mut terminal = Terminal::new(TestBackend::new(width, 32)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            assert!(rendered_lines(&terminal, width).join("\n").contains("<a>"));
+            assert!(
+                log_action_hints(&app, false)
+                    .iter()
+                    .any(|hint| hint.key == "a" && hint.active)
+            );
+            assert!(header_columns_width(&header_layout(&app, width).columns) <= width);
+            app.log_view
+                .as_mut()
+                .unwrap()
+                .metadata
+                .as_mut()
+                .unwrap()
+                .single_container = true;
+            assert!(
+                log_action_hints(&app, false)
+                    .iter()
+                    .any(|hint| hint.key == "a")
+            );
+            app.log_view.as_mut().unwrap().request.target.container = Some("app".to_owned());
+            assert!(
+                !log_action_hints(&app, false)
+                    .iter()
+                    .any(|hint| hint.key == "a")
+            );
+            app.log_view.as_mut().unwrap().request.target.container = None;
+            app.log_view
+                .as_mut()
+                .unwrap()
+                .metadata
+                .as_mut()
+                .unwrap()
+                .default_container = None;
+            assert!(
+                !log_action_hints(&app, false)
+                    .iter()
+                    .any(|hint| hint.key == "a")
+            );
+        }
+    }
+
+    #[test]
+    fn workload_log_hints_match_supported_gvrs_in_readonly_mode() {
+        let mut app = header_test_app();
+        app.read_only = true;
+        for kind in [
+            ResourceKind::Pods,
+            ResourceKind::Deployments,
+            ResourceKind::StatefulSets,
+            ResourceKind::DaemonSets,
+            ResourceKind::Services,
+        ] {
+            app.kind = kind.into();
+            let hints = resource_action_hints(&app);
+            assert!(
+                hints
+                    .iter()
+                    .any(|hint| hint.key == "l" && hint.label == "Logs")
+            );
+            assert!(
+                hints
+                    .iter()
+                    .any(|hint| hint.key == "p" && hint.label == "Logs Previous")
+            );
+        }
+        for group in ["batch", "example.test"] {
+            app.kind = ResourceDescriptor::new(
+                group,
+                "v1",
+                format!("{group}/v1"),
+                "Job",
+                "jobs",
+                true,
+                crate::model::ResourceOperations::all(),
+            );
+            assert_eq!(
+                resource_action_hints(&app)
+                    .iter()
+                    .any(|hint| hint.key == "l"),
+                group == "batch"
+            );
         }
     }
 
@@ -4303,7 +6581,15 @@ mod tests {
         );
 
         let id = app.log_view.as_ref().expect("active logs").request.id;
-        app.append_log_batch(id, vec!["WARN newest-message".to_owned()], false, None);
+        app.append_log_batch(
+            id,
+            vec![crate::source::LogLine {
+                source: None,
+                text: "WARN newest-message".to_owned(),
+            }],
+            false,
+            None,
+        );
         terminal
             .draw(|frame| draw(frame, &mut app))
             .expect("draw wrapped arrival");
@@ -4347,7 +6633,7 @@ mod tests {
             .expect("command border");
         assert!(command_border.starts_with('╭'));
         assert!(!lines.iter().any(|line| line.contains("Completions")));
-        assert_eq!(command_completion_hint(&app), Some("context".to_owned()));
+        assert_eq!(command_completion_hint(&app), Some("alias".to_owned()));
         let prompt_row = lines
             .iter()
             .position(|line| line.contains(":▏"))
@@ -4527,7 +6813,7 @@ mod tests {
 
     #[test]
     fn filter_hint_is_muted_and_command_completion_is_inline() {
-        let command = prompt_line(":", "po", None, Some("ds"));
+        let command = prompt_line(&Skin::default(), ":", "po", None, Some("ds"));
         assert_eq!(
             command.spans.last().and_then(|span| span.style.fg),
             Some(MUTED)
@@ -4537,7 +6823,7 @@ mod tests {
             Some("ds")
         );
 
-        let filter = prompt_line("/", "", None, Some("/previous"));
+        let filter = prompt_line(&Skin::default(), "/", "", None, Some("/previous"));
         assert_eq!(
             filter.spans.last().and_then(|span| span.style.fg),
             Some(MUTED)
@@ -4549,6 +6835,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn pod_and_node_views_use_k9s_columns() {
         let mut pods = App::new(
             "demo",
@@ -4568,6 +6855,7 @@ mod tests {
                 memory_bytes: Some(64 * 1_048_576),
                 memory_request_bytes: 128 * 1_048_576,
                 memory_limit_bytes: 256 * 1_048_576,
+                ..PodData::default()
             });
         pods.apply_snapshot(ResourceSnapshot {
             generation: 1,
@@ -4578,15 +6866,15 @@ mod tests {
             revision: 1,
             emitted_at: Instant::now(),
         });
-        let backend = TestBackend::new(200, 30);
+        let backend = TestBackend::new(220, 30);
         let mut terminal = Terminal::new(backend).expect("pod terminal");
         terminal
             .draw(|frame| draw(frame, &mut pods))
             .expect("draw pod columns");
-        let rendered = rendered_lines(&terminal, 200).join("\n");
+        let rendered = rendered_lines(&terminal, 220).join("\n");
         for header in [
-            "NAME", "READY", "STATUS", "RESTARTS", "CPU", "%CPU/R", "%CPU/L", "MEM", "%MEM/R",
-            "%MEM/L", "NODE", "AGE",
+            "NAME", "READY", "STATUS", "RESTARTS", "CPU", "MEM", "%CPU/R", "%CPU/L", "%MEM/R",
+            "%MEM/L", "IP", "NODE", "AGE",
         ] {
             assert!(rendered.contains(header), "missing pod column {header}");
         }
@@ -4600,7 +6888,7 @@ mod tests {
         );
         let node = ResourceRow::new(
             "-",
-            "worker-0",
+            "gke-api-us-central1-pool-node-abcdef01-xyz9",
             "NotReady,Unschedulable",
             "worker",
             "v1.32.0",
@@ -4616,6 +6904,7 @@ mod tests {
             cpu_allocatable_millis: 4_000,
             memory_bytes: Some(4_096 * 1_048_576),
             memory_allocatable_bytes: 16_384 * 1_048_576,
+            ..NodeData::default()
         });
         assert_eq!(column_value(&node, SortField::Taints, 0), "2");
         nodes.apply_snapshot(ResourceSnapshot {
@@ -4630,27 +6919,103 @@ mod tests {
         terminal
             .draw(|frame| draw(frame, &mut nodes))
             .expect("draw node columns");
-        let rendered = rendered_lines(&terminal, 200).join("\n");
+        let rendered = rendered_lines(&terminal, 220).join("\n");
         for header in [
-            "NAME", "STATUS", "TAINTS", "VERSION", "PODS", "CPU", "CPU/A", "%CPU", "MEM", "MEM/A",
-            "%MEM", "AGE",
+            "NAME", "STATUS", "ROLE", "ARCH", "TAINTS", "VERSION", "PODS", "CPU", "MEM", "%CPU",
+            "%MEM", "CPU/A", "MEM/A", "AGE",
         ] {
             assert!(rendered.contains(header), "missing node column {header}");
         }
+        assert!(rendered.contains("gke-api-us-central1-pool-node-abcdef01-xyz9"));
         assert!(rendered.contains("NotReady,Unschedulable"));
         let header = rendered
             .lines()
             .find(|line| line.contains("STATUS") && line.contains("TAINTS"))
             .expect("node table header");
         let status_start = header.find("STATUS").expect("status column");
+        let role_start = header.find("ROLE").expect("role column");
         let taints_start = header.find("TAINTS").expect("taints column");
         let version_start = header.find("VERSION").expect("version column");
         assert_eq!(
-            taints_start - status_start,
+            role_start - status_start,
             "NotReady,Unschedulable".chars().count() + 1
         );
         assert_eq!(version_start - taints_start, 9);
         assert!(!rendered.contains("NAMESPACE"));
+
+        // Verify Services, Deployments, StatefulSets, DaemonSets, and ReplicaSets match k9s default and wide columns
+        let svc_cols =
+            crate::source::kubernetes::typed_table_columns(&ResourceKind::Services.into());
+        let svc_names: Vec<&str> = svc_cols.iter().map(|c| c.name.as_ref()).collect();
+        assert_eq!(
+            svc_names,
+            vec![
+                "NAME",
+                "TYPE",
+                "CLUSTER-IP",
+                "EXTERNAL-IP",
+                "SELECTOR",
+                "PORTS",
+                "LABELS",
+                "VALID",
+                "AGE"
+            ]
+        );
+        let dp_cols =
+            crate::source::kubernetes::typed_table_columns(&ResourceKind::Deployments.into());
+        let dp_names: Vec<&str> = dp_cols.iter().map(|c| c.name.as_ref()).collect();
+        assert_eq!(
+            dp_names,
+            vec![
+                "NAME",
+                "READY",
+                "UP-TO-DATE",
+                "AVAILABLE",
+                "CONTAINERS",
+                "IMAGES",
+                "SELECTOR",
+                "LABELS",
+                "VALID",
+                "AGE"
+            ]
+        );
+        let sts_cols =
+            crate::source::kubernetes::typed_table_columns(&ResourceKind::StatefulSets.into());
+        let sts_names: Vec<&str> = sts_cols.iter().map(|c| c.name.as_ref()).collect();
+        assert_eq!(
+            sts_names,
+            vec![
+                "NAME",
+                "READY",
+                "SELECTOR",
+                "CONTAINERS",
+                "IMAGES",
+                "LABELS",
+                "VALID",
+                "AGE"
+            ]
+        );
+        let daemonset_cols =
+            crate::source::kubernetes::typed_table_columns(&ResourceKind::DaemonSets.into());
+        let daemonset_names: Vec<&str> = daemonset_cols.iter().map(|c| c.name.as_ref()).collect();
+        assert_eq!(
+            daemonset_names,
+            vec![
+                "NAME",
+                "DESIRED",
+                "CURRENT",
+                "READY",
+                "UP-TO-DATE",
+                "AVAILABLE",
+                "NODE SELECTOR",
+                "CONTAINERS",
+                "IMAGES",
+                "SELECTOR",
+                "LABELS",
+                "VALID",
+                "AGE"
+            ]
+        );
     }
 
     #[test]
@@ -5286,7 +7651,8 @@ mod tests {
             Span::styled("prod-", Style::default().fg(PURPLE)),
             Span::styled("api-api", Style::default().fg(CYAN)),
         ]);
-        let highlighted = highlight_line_matches(line, &FilterMatcher::new("api"));
+        let highlighted =
+            highlight_line_matches(&Skin::default(), line, &FilterMatcher::new("api"));
         assert_eq!(highlighted.to_string(), "prod-api-api");
         let matched = highlighted
             .spans
@@ -5336,15 +7702,16 @@ mod tests {
                         image: Arc::from("example/api:v1"),
                         kind: Arc::from("container"),
                         restarts: 0,
+                        ..crate::model::ContainerData::default()
                     }),
             )],
         );
-        let backend = TestBackend::new(120, 24);
+        let backend = TestBackend::new(220, 24);
         let mut terminal = Terminal::new(backend).expect("container terminal");
         terminal
             .draw(|frame| draw(frame, &mut app))
             .expect("draw containers");
-        let rendered = rendered_lines(&terminal, 120).join("\n");
+        let rendered = rendered_lines(&terminal, 220).join("\n");
         assert!(rendered.contains("containers(default/api-0)[1]"));
         assert!(rendered.contains("IMAGE"));
         assert!(!rendered.contains("NAMESPACE"));
@@ -5376,10 +7743,13 @@ mod tests {
 
     #[test]
     fn resource_rows_use_subtle_banding_without_overriding_selection() {
-        assert_eq!(resource_row_style(0, false).bg, None);
-        assert_eq!(resource_row_style(1, false).bg, Some(ROW_ALT));
+        assert_eq!(resource_row_style(&Skin::default(), 0, false).bg, None);
         assert_eq!(
-            resource_row_style(1, true).bg,
+            resource_row_style(&Skin::default(), 1, false).bg,
+            Some(ROW_ALT)
+        );
+        assert_eq!(
+            resource_row_style(&Skin::default(), 1, true).bg,
             Some(SELECTED),
             "selection remains the strongest row treatment"
         );
@@ -5387,14 +7757,23 @@ mod tests {
 
     #[test]
     fn body_colors_express_resource_semantics() {
-        assert_eq!(readiness_style("3/3").fg, Some(GREEN));
-        assert_eq!(readiness_style("2/3").fg, Some(ORANGE));
-        assert_eq!(readiness_style("-").fg, Some(MUTED));
-        assert_eq!(status_style("KubernetesReady").fg, Some(GREEN));
-        assert_eq!(status_style("NotReady").fg, Some(RED));
-        assert_eq!(status_style("NotReady,Unschedulable").fg, Some(RED));
-        assert_eq!(status_style("Ready,Unschedulable").fg, Some(YELLOW));
-        assert_eq!(status_style("Scheduled").fg, Some(YELLOW));
+        assert_eq!(readiness_style(&Skin::default(), "3/3").fg, Some(GREEN));
+        assert_eq!(readiness_style(&Skin::default(), "2/3").fg, Some(ORANGE));
+        assert_eq!(readiness_style(&Skin::default(), "-").fg, Some(MUTED));
+        assert_eq!(
+            status_style(&Skin::default(), "KubernetesReady").fg,
+            Some(GREEN)
+        );
+        assert_eq!(status_style(&Skin::default(), "NotReady").fg, Some(RED));
+        assert_eq!(
+            status_style(&Skin::default(), "NotReady,Unschedulable").fg,
+            Some(RED)
+        );
+        assert_eq!(
+            status_style(&Skin::default(), "Ready,Unschedulable").fg,
+            Some(YELLOW)
+        );
+        assert_eq!(status_style(&Skin::default(), "Scheduled").fg, Some(YELLOW));
         assert_eq!(age_color(30 * 60), GREEN);
         assert_eq!(age_color(12 * 60 * 60), CYAN);
         assert_eq!(age_color(2 * 24 * 60 * 60), PURPLE);
@@ -5403,8 +7782,27 @@ mod tests {
     }
 
     #[test]
+    fn computed_pod_statuses_use_completed_and_error_skin_colors() {
+        assert_eq!(status_style(&Skin::default(), "Completed").fg, Some(GREEN));
+        assert_eq!(status_style(&Skin::default(), "NoReady").fg, Some(RED));
+        let skin = Skin::from_yaml(
+            "k9s:\n  frame:\n    status:\n      completedColor: '#010203'\n      errorColor: '#090807'\n",
+        )
+        .unwrap();
+        for status in ["Completed", " completed ", "Succeeded"] {
+            assert_eq!(status_style(&skin, status).fg, Some(Color::Rgb(1, 2, 3)));
+        }
+        for status in ["NoReady", " noready ", "NotReady"] {
+            assert_eq!(status_style(&skin, status).fg, Some(Color::Rgb(9, 8, 7)));
+        }
+    }
+
+    #[test]
     fn yaml_highlighter_styles_keys_scalars_and_comments() {
-        let lines = highlight_yaml("# object\nkind: Pod\nenabled: true\nreplicas: 3");
+        let lines = highlight_yaml(
+            &Skin::default(),
+            "# object\nkind: Pod\nenabled: true\nreplicas: 3",
+        );
         assert_eq!(lines[0].spans[0].style.fg, Some(MUTED));
         assert_eq!(lines[1].spans[2].style.fg, Some(CYAN));
         assert_eq!(lines[2].spans[4].style.fg, Some(PURPLE));
@@ -5413,7 +7811,10 @@ mod tests {
 
     #[test]
     fn describe_highlighter_preserves_nested_indentation() {
-        let lines = highlight_describe("Name: api-0\nContainers:\n  api:\n    Ready: true");
+        let lines = highlight_describe(
+            &Skin::default(),
+            "Name: api-0\nContainers:\n  api:\n    Ready: true",
+        );
         assert_eq!(lines[0].spans[1].style.fg, Some(CYAN));
         assert_eq!(lines[2].spans[0].content.as_ref(), "  ");
         assert_eq!(lines[3].spans[0].content.as_ref(), "    ");
@@ -5422,6 +7823,7 @@ mod tests {
     #[test]
     fn log_highlighter_colors_timestamps_and_severity() {
         let lines = highlight_logs(
+            &Skin::default(),
             "2026-08-05T10:00:00Z INFO started\n\
              2026-08-05T10:00:01Z WARN retrying\n\
              2026-08-05T10:00:02Z ERROR failed\n\
@@ -5433,5 +7835,274 @@ mod tests {
         assert_eq!(lines[1].spans[1].style.fg, Some(ORANGE));
         assert_eq!(lines[2].spans[1].style.fg, Some(RED));
         assert_eq!(lines[3].spans[0].style.fg, Some(CYAN));
+    }
+
+    fn component_test_skin() -> Skin {
+        Skin::from_yaml(r"
+k9s:
+  body: {fgColor: '#111111', bgColor: '#121212', logoColor: '#242424'}
+  info: {sectionColor: '#222222', fgColor: '#232323'}
+  frame:
+    border: {fgColor: '#313131'}
+    title: {fgColor: '#323232'}
+    menu: {keyColor: '#333333', numKeyColor: '#343434', fgColor: '#353535'}
+    status: {errorColor: '#a1a1a1', highlightColor: '#a2a2a2', pendingColor: '#a3a3a3', addColor: '#a4a4a4'}
+  prompt:
+    fgColor: '#616161'
+    bgColor: '#626262'
+    suggestColor: '#636363'
+    border: {command: '#646464'}
+  help: {fgColor: '#515151', bgColor: '#525252', sectionColor: '#535353', keyColor: '#545454'}
+  dialog:
+    fgColor: '#717171'
+    bgColor: '#727272'
+    buttonFgColor: '#737373'
+    buttonBgColor: '#747474'
+    buttonFocusFgColor: '#757575'
+    buttonFocusBgColor: '#767676'
+    labelFgColor: '#777777'
+    fieldFgColor: '#787878'
+  views:
+    table:
+      fgColor: '#414141'
+      bgColor: '#424242'
+      cursorFgColor: '#434343'
+      cursorBgColor: '#444444'
+      header: {fgColor: '#454545', selectedSortColumnColor: '#464646', sorterColor: '#474747'}
+    yaml: {keyColor: '#818181', colonColor: '#828282', valueColor: '#838383'}
+    logs:
+      fgColor: '#919191'
+      bgColor: '#929292'
+      indicator: {fgColor: '#939393', toggleOnColor: '#949494', toggleOffColor: '#959595'}
+").unwrap()
+    }
+
+    fn cell_at_text<'a>(
+        terminal: &'a Terminal<TestBackend>,
+        text: &str,
+    ) -> &'a ratatui::buffer::Cell {
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width;
+        for (y, line) in rendered_lines(terminal, width).iter().enumerate() {
+            if let Some(offset) = line.find(text) {
+                let x = line[..offset].chars().count();
+                return &buffer[(u16::try_from(x).unwrap(), u16::try_from(y).unwrap())];
+            }
+        }
+        panic!(
+            "text {text:?} missing from frame: {:?}",
+            rendered_lines(terminal, width)
+        );
+    }
+
+    const fn gray(value: u8) -> Color {
+        Color::Rgb(value, value, value)
+    }
+
+    #[test]
+    fn skin_colors_reach_header_table_and_cursor_without_crossing_scopes() {
+        let mut app = app_with_rendered_pod();
+        app.theme = component_test_skin();
+        let mut terminal = Terminal::new(TestBackend::new(180, 32)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(cell_at_text(&terminal, "Context:").fg, gray(0x22));
+        assert_eq!(cell_at_text(&terminal, "demo").fg, gray(0x23));
+        assert_eq!(cell_at_text(&terminal, "<:>").fg, gray(0x33));
+        assert_eq!(cell_at_text(&terminal, "<0>").fg, gray(0x34));
+        assert_eq!(cell_at_text(&terminal, "READY").fg, gray(0x45));
+        assert_eq!(cell_at_text(&terminal, "api-0").fg, gray(0x43));
+        assert_eq!(cell_at_text(&terminal, "api-0").bg, gray(0x44));
+        assert_eq!(cell_at_text(&terminal, "pods(default)").fg, gray(0x32));
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| cell.bg == gray(0x42))
+        );
+    }
+
+    #[test]
+    fn partial_skin_keeps_default_selection_visible() {
+        let mut app = app_with_rendered_pod();
+        app.theme = Skin::from_yaml(
+            "k9s: {body: {fgColor: '#111111', bgColor: '#121212'}, views: {table: {fgColor: '#414141', bgColor: '#424242'}}}",
+        )
+        .unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(180, 32)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(cell_at_text(&terminal, "api-0").fg, Color::White);
+        assert_eq!(cell_at_text(&terminal, "api-0").bg, SELECTED);
+    }
+
+    #[test]
+    fn skin_colors_reach_help_prompt_and_confirmation() {
+        let mut app = app_with_rendered_pod();
+        app.theme = component_test_skin();
+        let mut terminal = Terminal::new(TestBackend::new(180, 36)).unwrap();
+        app.overlay = Overlay::Help;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(cell_at_text(&terminal, "NAVIGATION").fg, gray(0x53));
+        assert_eq!(cell_at_text(&terminal, "<j>").fg, gray(0x54));
+        assert_eq!(cell_at_text(&terminal, "Go to top").fg, gray(0x51));
+        assert_eq!(cell_at_text(&terminal, "Go to top").bg, gray(0x52));
+
+        app.overlay = Overlay::None;
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(cell_at_text(&terminal, "p▏").fg, gray(0x61));
+        assert_eq!(cell_at_text(&terminal, "p▏").bg, gray(0x62));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(cell_at_text(&terminal, "[ Cancel ]").fg, gray(0x75));
+        assert_eq!(cell_at_text(&terminal, "[ Cancel ]").bg, gray(0x76));
+        assert_eq!(cell_at_text(&terminal, "[ OK ]").fg, gray(0x73));
+        assert_eq!(cell_at_text(&terminal, "[ OK ]").bg, gray(0x74));
+    }
+
+    #[test]
+    fn skin_colors_reach_yaml_logs_and_log_indicators() {
+        let mut app = app_with_rendered_pod();
+        app.theme = component_test_skin();
+        app.show_content("YAML", "kind: Pod", None, None, None, ContentKind::Yaml);
+        let mut terminal = Terminal::new(TestBackend::new(180, 32)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(cell_at_text(&terminal, "kind:").fg, gray(0x81));
+        assert_eq!(cell_at_text(&terminal, "Pod").fg, gray(0x83));
+
+        let mut app =
+            app_with_streamed_logs(vec!["plain message".to_owned(), "ERROR failure".to_owned()]);
+        app.theme = component_test_skin();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(cell_at_text(&terminal, "plain message").fg, gray(0x91));
+        assert_eq!(cell_at_text(&terminal, "plain message").bg, gray(0x92));
+        assert_eq!(cell_at_text(&terminal, "ERROR failure").fg, gray(0xa1));
+        assert_eq!(cell_at_text(&terminal, "tail").fg, gray(0x94));
+        assert_eq!(cell_at_text(&terminal, "head").fg, gray(0x95));
+    }
+
+    #[test]
+    fn plugin_columns_include_hidden_fields_without_changing_view() {
+        let mut app = app_with_rendered_pod();
+        app.snapshot.table_columns = Arc::from([
+            TableColumn {
+                name: Arc::from("Name"),
+                format: Arc::from("string"),
+                priority: 0,
+            },
+            TableColumn {
+                name: Arc::from("%CPU/L"),
+                format: Arc::from("number"),
+                priority: 1,
+            },
+        ]);
+        let row =
+            ResourceRow::new("default", "api-0", "Running", "1/1", "", 0).with_table_cells(vec![
+                TableCell {
+                    text: Arc::from("api-0"),
+                    timestamp_unix: None,
+                },
+                TableCell {
+                    text: Arc::from("75"),
+                    timestamp_unix: None,
+                },
+            ]);
+        let columns = plugin_column_values(&app, &row);
+        assert!(columns.contains(&("%CPU/L".to_owned(), "75".to_owned())));
+        assert!(columns.contains(&("NAMESPACE".to_owned(), "default".to_owned())));
+        assert!(!app.ui.wide());
+    }
+
+    #[test]
+    fn custom_views_render_jsonpath_columns_and_honor_wide_and_hidden_flags() {
+        let mut app = app_with_rendered_pod();
+        let row = ResourceRow::new("default", "api-0", "Running", "1/1", "0", app.now_unix - 60)
+            .with_raw_object(serde_json::json!({
+                "metadata": {
+                    "name": "api-0",
+                    "namespace": "default",
+                    "uid": "secret-uid-123"
+                },
+                "spec": {
+                    "containers": [
+                        {"image": "nginx:1.27"},
+                        {"image": "envoy:1.31"}
+                    ]
+                },
+                "status": {
+                    "podIP": "10.244.0.9"
+                }
+            }));
+        app.snapshot.rows = Arc::new(vec![Arc::new(row.clone())]);
+        app.filtered = vec![0];
+        let mut config = crate::config::UserConfig::default();
+        config.views.insert(
+            "v1/pods".to_owned(),
+            crate::config::CustomViewSpec {
+                sort_column: Some(("NAME".to_owned(), true)),
+                columns: vec![
+                    crate::config::CustomColumnSpec::parse("NAME").unwrap(),
+                    crate::config::CustomColumnSpec::parse("IMAGES:.spec.containers[*].image")
+                        .unwrap(),
+                    crate::config::CustomColumnSpec::parse("IP:.status.podIP|W").unwrap(),
+                    crate::config::CustomColumnSpec::parse("UID:.metadata.uid|H").unwrap(),
+                ],
+            },
+        );
+        app.apply_user_config(config);
+
+        let normal_cols = columns_for_view(&app, 180);
+        let normal_labels: Vec<_> = normal_cols
+            .iter()
+            .filter(|c| !c.label.is_empty())
+            .map(|c| c.label.as_str())
+            .collect();
+        assert_eq!(normal_labels, vec!["NAME", "IMAGES"]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        let wide_cols = columns_for_view(&app, 180);
+        let wide_labels: Vec<_> = wide_cols
+            .iter()
+            .filter(|c| !c.label.is_empty())
+            .map(|c| c.label.as_str())
+            .collect();
+        assert_eq!(wide_labels, vec!["NAMESPACE", "NAME", "IMAGES", "IP"]);
+
+        let plugin_cols = plugin_column_values(&app, &row);
+        assert!(plugin_cols.contains(&("IMAGES".to_owned(), "nginx:1.27,envoy:1.31".to_owned())));
+        assert!(plugin_cols.contains(&("IP".to_owned(), "10.244.0.9".to_owned())));
+        assert!(plugin_cols.contains(&("UID".to_owned(), "secret-uid-123".to_owned())));
+    }
+
+    #[test]
+    fn image_scans_render_vs_column_and_scans_table() {
+        let mut app = app_with_rendered_pod();
+        let row = ResourceRow::new("default", "api-0", "Running", "1/1", "0", app.now_unix - 30)
+            .with_raw_object(serde_json::json!({
+                "spec": {
+                    "containers": [
+                        { "name": "api", "image": "nginx:1.25" }
+                    ]
+                }
+            }));
+        app.snapshot.rows = Arc::new(vec![Arc::new(row)]);
+        app.filtered = vec![0];
+        let mut config = crate::config::UserConfig::default();
+        config.settings.image_scans.enable = true;
+        app.apply_user_config(config);
+
+        let cols = columns_for_view(&app, 180);
+        assert!(cols.iter().any(|c| c.label == "VS"));
+        let backend = TestBackend::new(160, 20);
+        let mut terminal = Terminal::new(backend).expect("scans terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw pod with VS column");
+        let rendered = rendered_lines(&terminal, 160).join("\n");
+        assert!(rendered.contains("VS"));
+        assert!(rendered.contains("Show Vulnerabilities"));
     }
 }
