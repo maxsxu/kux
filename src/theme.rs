@@ -157,7 +157,7 @@ impl Skin {
         directories.extend(
             std::env::split_paths(&system_dirs)
                 .filter(|directory| directory.is_absolute())
-                .map(|directory| directory.join("kux/skins")),
+                .flat_map(|directory| [directory.join("kux/skins"), directory.join("k9s/skins")]),
         );
         let mut candidates = Vec::new();
         for directory in directories {

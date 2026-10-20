@@ -670,7 +670,7 @@ impl PluginWatcher {
         let directories = self
             .data_dirs
             .iter()
-            .map(|dir| dir.join("kux/plugins"))
+            .flat_map(|dir| [dir.join("kux/plugins"), dir.join("k9s/plugins")])
             .chain([
                 self.paths.data_dir.join("plugins"),
                 self.paths.config_dir.join("plugins"),

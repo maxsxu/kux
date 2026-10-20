@@ -30,32 +30,51 @@ impl ConfigPaths {
         }
     }
 
-    /// Resolve Kux overrides, then XDG paths, then home-directory defaults.
+    /// Resolve Kux/K9s overrides, then XDG paths, then home-directory defaults.
     ///
     /// # Errors
     /// Returns an error if a selected path is relative or no home directory is
     /// available for a required default.
     pub fn from_env() -> Result<Self, String> {
-        Self::from_lookup(|key| std::env::var_os(key).map(PathBuf::from))
+        Self::from_lookup(|key| std::env::var_os(key).map(PathBuf::from), Path::exists)
     }
 
-    fn from_lookup(lookup: impl Fn(&str) -> Option<PathBuf>) -> Result<Self, String> {
-        let directory = |override_name, xdg_name, fallback: &str| {
-            let (name, path) =
-                if let Some(path) = lookup(override_name).filter(|p| !p.as_os_str().is_empty()) {
-                    (override_name, path)
-                } else if let Some(path) = lookup(xdg_name).filter(|p| !p.as_os_str().is_empty()) {
-                    (xdg_name, path.join("kux"))
+    fn from_lookup(
+        lookup: impl Fn(&str) -> Option<PathBuf>,
+        exists: impl Fn(&Path) -> bool,
+    ) -> Result<Self, String> {
+        let directory = |override_name, k9s_override, xdg_name, fallback: &str| {
+            let (name, path) = if let Some(path) =
+                lookup(override_name).filter(|p| !p.as_os_str().is_empty())
+            {
+                (override_name, path)
+            } else if let Some(path) = lookup(k9s_override).filter(|p| !p.as_os_str().is_empty()) {
+                (k9s_override, path)
+            } else if let Some(path) = lookup(xdg_name).filter(|p| !p.as_os_str().is_empty()) {
+                let kux_path = path.join("kux");
+                let k9s_path = path.join("k9s");
+                if !exists(&kux_path) && exists(&k9s_path) {
+                    (xdg_name, k9s_path)
                 } else {
-                    let home = lookup("HOME")
+                    (xdg_name, kux_path)
+                }
+            } else {
+                let home = lookup("HOME")
                     .filter(|p| !p.as_os_str().is_empty())
                     .ok_or_else(|| {
                         format!(
                             "Set {override_name}, {xdg_name}, or HOME to locate Kux configuration"
                         )
                     })?;
-                    ("HOME", home.join(fallback).join("kux"))
-                };
+                let base = home.join(fallback);
+                let kux_path = base.join("kux");
+                let k9s_path = base.join("k9s");
+                if !exists(&kux_path) && exists(&k9s_path) {
+                    ("HOME", k9s_path)
+                } else {
+                    ("HOME", kux_path)
+                }
+            };
             if !path.is_absolute() {
                 return Err(format!(
                     "{name} must be an absolute path: {}",
@@ -65,8 +84,18 @@ impl ConfigPaths {
             Ok(path)
         };
         Ok(Self::new(
-            directory("KUX_CONFIG_DIR", "XDG_CONFIG_HOME", ".config")?,
-            directory("KUX_DATA_DIR", "XDG_DATA_HOME", ".local/share")?,
+            directory(
+                "KUX_CONFIG_DIR",
+                "K9S_CONFIG_DIR",
+                "XDG_CONFIG_HOME",
+                ".config",
+            )?,
+            directory(
+                "KUX_DATA_DIR",
+                "K9S_DATA_DIR",
+                "XDG_DATA_HOME",
+                ".local/share",
+            )?,
         ))
     }
 
@@ -1556,26 +1585,42 @@ mod tests {
     #[test]
     fn paths_use_kux_overrides_then_xdg_then_home() {
         let mut environment = BTreeMap::from([("HOME", PathBuf::from("/home/user"))]);
-        let paths = ConfigPaths::from_lookup(|key| environment.get(key).cloned()).unwrap();
+        let paths =
+            ConfigPaths::from_lookup(|key| environment.get(key).cloned(), |_| false).unwrap();
         assert_eq!(paths.config_dir, PathBuf::from("/home/user/.config/kux"));
         assert_eq!(paths.data_dir, PathBuf::from("/home/user/.local/share/kux"));
+        let k9s_fallback = ConfigPaths::from_lookup(
+            |key| environment.get(key).cloned(),
+            |path| path.ends_with("k9s"),
+        )
+        .unwrap();
+        assert_eq!(
+            k9s_fallback.config_dir,
+            PathBuf::from("/home/user/.config/k9s")
+        );
+        assert_eq!(
+            k9s_fallback.data_dir,
+            PathBuf::from("/home/user/.local/share/k9s")
+        );
         environment.insert("XDG_CONFIG_HOME", PathBuf::from("/xdg/config"));
         environment.insert("XDG_DATA_HOME", PathBuf::from("/xdg/data"));
-        let paths = ConfigPaths::from_lookup(|key| environment.get(key).cloned()).unwrap();
+        let paths =
+            ConfigPaths::from_lookup(|key| environment.get(key).cloned(), |_| false).unwrap();
         assert_eq!(paths.config_dir, PathBuf::from("/xdg/config/kux"));
         assert_eq!(paths.data_dir, PathBuf::from("/xdg/data/kux"));
         environment.insert("KUX_CONFIG_DIR", PathBuf::from("/custom/config"));
         environment.insert("KUX_DATA_DIR", PathBuf::from("/custom/data"));
-        let paths = ConfigPaths::from_lookup(|key| environment.get(key).cloned()).unwrap();
+        let paths =
+            ConfigPaths::from_lookup(|key| environment.get(key).cloned(), |_| false).unwrap();
         assert_eq!(paths.config_dir, PathBuf::from("/custom/config"));
         assert_eq!(paths.data_dir, PathBuf::from("/custom/data"));
         environment.insert("KUX_CONFIG_DIR", PathBuf::from("relative"));
         assert!(
-            ConfigPaths::from_lookup(|key| environment.get(key).cloned())
+            ConfigPaths::from_lookup(|key| environment.get(key).cloned(), |_| false)
                 .unwrap_err()
                 .contains("absolute")
         );
-        assert!(ConfigPaths::from_lookup(|_| None).is_err());
+        assert!(ConfigPaths::from_lookup(|_| None, |_| false).is_err());
     }
 
     #[test]
