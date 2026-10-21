@@ -1534,6 +1534,29 @@ fn resource_table_width(app: &App, columns: &[ViewColumn], viewport_width: u16) 
         .max(viewport_width)
 }
 
+fn resource_column_offsets(app: &App, columns: &[ViewColumn]) -> Vec<u16> {
+    if !is_scrollable_resource_list(app) {
+        return Vec::new();
+    }
+    let mut offsets = Vec::with_capacity(columns.len());
+    let mut x = 0_u16;
+    let mut seen_first_named = false;
+    for column in columns {
+        let Constraint::Length(length) = column.width else {
+            continue;
+        };
+        if !column.label.is_empty() {
+            if seen_first_named {
+                offsets.push(x);
+            } else {
+                seen_first_named = true;
+            }
+        }
+        x = x.saturating_add(length).saturating_add(1);
+    }
+    offsets
+}
+
 #[allow(clippy::too_many_lines)]
 fn server_table_columns(
     app: &App,
@@ -1982,7 +2005,8 @@ fn draw_resources(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     app.set_viewport_height(viewport_height);
     let columns = columns_for_view(app, area.width);
     let table_width = resource_table_width(app, &columns, area.width.saturating_sub(2));
-    app.set_list_scroll_extent(table_width, area.width.saturating_sub(2));
+    let column_offsets = resource_column_offsets(app, &columns);
+    app.set_list_scroll_extent(table_width, area.width.saturating_sub(2), column_offsets);
     let filter = if app.input_mode == InputMode::Filter && !app.input.is_empty() {
         &app.input
     } else {
@@ -2954,7 +2978,7 @@ const HELP_CATEGORIES: &[HelpCategory] = &[
             ("k", "Up"),
             ("h", "Back / scroll left in text"),
             ("l", "Open / scroll right in text"),
-            ("← / →", "Horizontal text scroll only"),
+            ("← / →", "Scroll table by column / text scroll"),
             ("g / Home", "Go to top"),
             ("Shift-G / End", "Go to bottom"),
             ("Ctrl-B / PgUp", "Page up"),
@@ -4389,13 +4413,27 @@ fn confirmation_prompt(pending: Option<&PendingDelete>) -> (&'static str, String
             ),
         ),
         Some(PendingDelete::NodeScheduling {
-            name,
+            names,
             unschedulable: true,
-        }) => (" Confirm Cordon ", format!("Cordon Node {name}?")),
+        }) => (
+            " Confirm Cordon ",
+            if let [name] = names.as_slice() {
+                format!("Cordon Node {name}?")
+            } else {
+                format!("Cordon all {} selected nodes?", names.len())
+            },
+        ),
         Some(PendingDelete::NodeScheduling {
-            name,
+            names,
             unschedulable: false,
-        }) => (" Confirm Uncordon ", format!("Uncordon Node {name}?")),
+        }) => (
+            " Confirm Uncordon ",
+            if let [name] = names.as_slice() {
+                format!("Uncordon Node {name}?")
+            } else {
+                format!("Uncordon all {} selected nodes?", names.len())
+            },
+        ),
         Some(PendingDelete::HelmRollback {
             namespace,
             release,
@@ -4581,11 +4619,16 @@ fn draw_drain_confirmation(frame: &mut Frame<'_>, app: &App, dialog: &DrainDialo
     let ok_style = drain_button_style(&app.theme, app.overlay_selected == DRAIN_OK_FIELD);
     let popup = centered_rect(76, 18, area);
     preferences::clear_popup(frame, app, popup);
+    let drain_prompt = if let [name] = dialog.names.as_slice() {
+        format!("Drain {name}?")
+    } else {
+        format!("Drain all {} selected nodes?", dialog.names.len())
+    };
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(""),
             Line::from(Span::styled(
-                format!("Drain {}?", dialog.name),
+                drain_prompt,
                 Style::default().fg(Color::White).bold(),
             ))
             .centered(),
@@ -5475,15 +5518,13 @@ mod tests {
         let initial = rendered_lines(&terminal, 60);
         assert!(initial[3].contains("pod-aaaa"));
 
-        // Scroll far enough to see the end of the name and the adjacent columns.
-        for _ in 0..130 {
-            app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
-        }
+        // Pressing Right once jumps past the first column (`NAME`) to the next column (`READY` / `STATUS`).
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         terminal
             .draw(|frame| draw_resources(frame, &mut app, frame.area()))
             .unwrap();
         let scrolled = rendered_lines(&terminal, 60);
-        assert!(scrolled[3].contains("-last"));
+        assert!(scrolled[1].contains("READY"));
         assert!(scrolled[3].contains("Running"));
         assert_eq!(scrolled[0], initial[0], "title stays fixed");
         assert_eq!(scrolled[7], initial[7], "border stays fixed");
@@ -5496,7 +5537,7 @@ mod tests {
         }));
         assert_eq!(app.sort_field, SortField::Status);
 
-        for _ in 0..1000 {
+        for _ in 0..20 {
             app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         }
         terminal
@@ -5508,7 +5549,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert_eq!(app.list_horizontal_scroll, max_scroll);
         app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
-        assert_eq!(app.list_horizontal_scroll, max_scroll - 1);
+        assert!(app.list_horizontal_scroll < max_scroll);
         assert_eq!(app.selected, 0, "scrolling does not change selection");
 
         let mut wider = Terminal::new(TestBackend::new(600, 8)).unwrap();
@@ -5959,13 +6000,35 @@ mod tests {
 
     #[test]
     fn node_scheduling_confirmation_names_the_requested_operation() {
-        for (unschedulable, title, prompt) in [
-            (true, "Confirm Cordon", "Cordon Node worker-0?"),
-            (false, "Confirm Uncordon", "Uncordon Node worker-0?"),
+        for (names, unschedulable, title, prompt) in [
+            (
+                vec!["worker-0".to_owned()],
+                true,
+                "Confirm Cordon",
+                "Cordon Node worker-0?",
+            ),
+            (
+                vec!["worker-0".to_owned()],
+                false,
+                "Confirm Uncordon",
+                "Uncordon Node worker-0?",
+            ),
+            (
+                vec!["worker-0".to_owned(), "worker-1".to_owned()],
+                true,
+                "Confirm Cordon",
+                "Cordon all 2 selected nodes?",
+            ),
+            (
+                vec!["worker-0".to_owned(), "worker-1".to_owned()],
+                false,
+                "Confirm Uncordon",
+                "Uncordon all 2 selected nodes?",
+            ),
         ] {
             let mut app = app_with_rendered_pod();
             app.pending_delete = Some(PendingDelete::NodeScheduling {
-                name: "worker-0".to_owned(),
+                names,
                 unschedulable,
             });
             app.overlay = Overlay::ConfirmDelete;
@@ -5984,9 +6047,9 @@ mod tests {
     #[test]
     fn node_drain_confirmation_explains_the_mutation() {
         let mut app = app_with_rendered_pod();
-        app.pending_delete = Some(PendingDelete::DrainNode(DrainDialog::new(
+        app.pending_delete = Some(PendingDelete::DrainNode(DrainDialog::new(vec![
             "worker-0".to_owned(),
-        )));
+        ])));
         app.overlay = Overlay::ConfirmDelete;
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).expect("node drain terminal");

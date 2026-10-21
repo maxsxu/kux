@@ -671,10 +671,10 @@ async fn execute_action_intent(
             workload_actions::set_suspended(client, targets, suspended).await
         }
         ActionIntent::SetNodeUnschedulable {
-            name,
+            names,
             unschedulable,
-        } => set_node_unschedulable(client, &name, unschedulable).await,
-        ActionIntent::DrainNode { name, options } => drain_node(client, &name, options).await,
+        } => set_nodes_unschedulable(client, names, unschedulable).await,
+        ActionIntent::DrainNode { names, options } => drain_nodes(client, names, options).await,
         ActionIntent::HelmRollback {
             namespace,
             release,
@@ -1141,6 +1141,55 @@ enum PodDrainDisposition {
     Block(String),
 }
 
+async fn drain_nodes(
+    client: Client,
+    names: Vec<String>,
+    options: NodeDrainOptions,
+) -> Result<ActionResult, String> {
+    let Some(first) = names.first() else {
+        return Err("No nodes selected for drain".to_owned());
+    };
+    if names.len() == 1 {
+        return drain_node(client, first, options).await;
+    }
+    let total = names.len();
+    let tasks = names.into_iter().map(|node_name| {
+        let client = client.clone();
+        let options = options.clone();
+        async move {
+            let result = drain_node(client, &node_name, options).await;
+            (node_name, result)
+        }
+    });
+    let results = futures::stream::iter(tasks)
+        .buffer_unordered(8)
+        .collect::<Vec<_>>()
+        .await;
+    let mut failures = results
+        .into_iter()
+        .filter_map(|(name, result)| result.err().map(|error| (name, error)))
+        .collect::<Vec<_>>();
+    failures.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    if failures.is_empty() {
+        return Ok(ActionResult::Notice(format!(
+            "Drained all {total} selected nodes"
+        )));
+    }
+    let succeeded = total.saturating_sub(failures.len());
+    let mut details = failures
+        .iter()
+        .take(3)
+        .map(|(name, error)| format!("{name}: {error}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    if failures.len() > 3 {
+        let _ = write!(details, "; and {} more", failures.len() - 3);
+    }
+    Err(format!(
+        "Drained {succeeded} of {total} nodes; failed: {details}"
+    ))
+}
+
 async fn drain_node(
     client: Client,
     node_name: &str,
@@ -1208,6 +1257,59 @@ async fn drain_node_with_options(
     }
     wait_for_drain_targets(&client, node_name, &evictable).await?;
     drain_result(node_name, total, ignored, &[])
+}
+
+async fn set_nodes_unschedulable(
+    client: Client,
+    names: Vec<String>,
+    unschedulable: bool,
+) -> Result<ActionResult, String> {
+    let Some(first) = names.first() else {
+        return Err("No nodes selected".to_owned());
+    };
+    if names.len() == 1 {
+        return set_node_unschedulable(client, first, unschedulable).await;
+    }
+    let total = names.len();
+    let tasks = names.into_iter().map(|node_name| {
+        let client = client.clone();
+        async move {
+            let result = patch_node_unschedulable(client, &node_name, unschedulable).await;
+            (node_name, result)
+        }
+    });
+    let results = futures::stream::iter(tasks)
+        .buffer_unordered(16)
+        .collect::<Vec<_>>()
+        .await;
+    let mut failures = results
+        .into_iter()
+        .filter_map(|(name, result)| result.err().map(|error| (name, error)))
+        .collect::<Vec<_>>();
+    failures.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    let action = if unschedulable {
+        "Cordoned"
+    } else {
+        "Uncordoned"
+    };
+    if failures.is_empty() {
+        return Ok(ActionResult::Notice(format!(
+            "{action} all {total} selected nodes"
+        )));
+    }
+    let succeeded = total.saturating_sub(failures.len());
+    let mut details = failures
+        .iter()
+        .take(3)
+        .map(|(name, error)| format!("{name}: {error}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    if failures.len() > 3 {
+        let _ = write!(details, "; and {} more", failures.len() - 3);
+    }
+    Err(format!(
+        "{action} {succeeded} of {total} nodes; failed: {details}"
+    ))
 }
 
 async fn set_node_unschedulable(

@@ -547,11 +547,11 @@ pub enum ActionIntent {
         suspended: bool,
     },
     SetNodeUnschedulable {
-        name: String,
+        names: Vec<String>,
         unschedulable: bool,
     },
     DrainNode {
-        name: String,
+        names: Vec<String>,
         options: NodeDrainOptions,
     },
     HelmRollback {
@@ -647,7 +647,7 @@ impl std::ops::BitOr for NodeDrainFlags {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrainDialog {
-    pub name: String,
+    pub names: Vec<String>,
     pub grace_period: String,
     pub timeout: String,
     pub flags: NodeDrainFlags,
@@ -664,9 +664,9 @@ pub const DRAIN_OK_FIELD: usize = 7;
 const DRAIN_FIELD_COUNT: usize = 8;
 
 impl DrainDialog {
-    pub(crate) fn new(name: String) -> Self {
+    pub(crate) fn new(names: Vec<String>) -> Self {
         Self {
-            name,
+            names,
             grace_period: "-1".to_owned(),
             timeout: "5s".to_owned(),
             flags: NodeDrainFlags::NONE,
@@ -771,7 +771,7 @@ pub enum PendingDelete {
         new_name: String,
     },
     NodeScheduling {
-        name: String,
+        names: Vec<String>,
         unschedulable: bool,
     },
     DrainNode(DrainDialog),
@@ -1015,6 +1015,7 @@ pub struct App {
     pub offset: usize,
     pub list_horizontal_scroll: u16,
     list_max_horizontal_scroll: u16,
+    list_column_offsets: Vec<u16>,
     pub viewport_height: usize,
     pub filtered: Vec<usize>,
     pub started_loading_at: Instant,
@@ -1126,6 +1127,7 @@ impl App {
             offset: 0,
             list_horizontal_scroll: 0,
             list_max_horizontal_scroll: 0,
+            list_column_offsets: Vec::new(),
             viewport_height: 1,
             filtered: Vec::new(),
             started_loading_at: Instant::now(),
@@ -1672,11 +1674,44 @@ impl App {
         self.chooser_hitbox = ChooserHitbox::default();
     }
 
-    pub(crate) fn set_list_scroll_extent(&mut self, width: u16, viewport_width: u16) {
+    pub(crate) fn set_list_scroll_extent(
+        &mut self,
+        width: u16,
+        viewport_width: u16,
+        column_offsets: Vec<u16>,
+    ) {
         self.list_max_horizontal_scroll = width.saturating_sub(viewport_width);
         self.list_horizontal_scroll = self
             .list_horizontal_scroll
             .min(self.list_max_horizontal_scroll);
+        self.list_column_offsets = column_offsets;
+    }
+
+    fn scroll_list_left(&mut self) {
+        if self.list_horizontal_scroll == 0 {
+            return;
+        }
+        let target = self
+            .list_column_offsets
+            .iter()
+            .copied()
+            .rfind(|offset| *offset < self.list_horizontal_scroll)
+            .unwrap_or(0);
+        self.list_horizontal_scroll = target;
+    }
+
+    fn scroll_list_right(&mut self) {
+        if self.list_horizontal_scroll >= self.list_max_horizontal_scroll {
+            return;
+        }
+        let target = self
+            .list_column_offsets
+            .iter()
+            .copied()
+            .find(|offset| *offset > self.list_horizontal_scroll)
+            .unwrap_or(self.list_max_horizontal_scroll)
+            .min(self.list_max_horizontal_scroll);
+        self.list_horizontal_scroll = target;
     }
 
     fn handle_browse_key(&mut self, key: KeyEvent) -> AppCommand {
@@ -1693,14 +1728,11 @@ impl App {
             KeyCode::Esc | KeyCode::Char('h') => self.escape_view(),
             KeyCode::Enter => self.open_selected(),
             KeyCode::Left => {
-                self.list_horizontal_scroll = self.list_horizontal_scroll.saturating_sub(1);
+                self.scroll_list_left();
                 AppCommand::None
             }
             KeyCode::Right => {
-                self.list_horizontal_scroll = self
-                    .list_horizontal_scroll
-                    .saturating_add(1)
-                    .min(self.list_max_horizontal_scroll);
+                self.scroll_list_right();
                 AppCommand::None
             }
             KeyCode::Down | KeyCode::Char('j') => {
@@ -2907,12 +2939,14 @@ impl App {
                 AppCommand::Action(ActionIntent::DeleteContext { name })
             }
             PendingDelete::NodeScheduling {
-                name,
+                names,
                 unschedulable,
             } => {
                 self.overlay = Overlay::None;
+                self.marks.clear();
+                self.mark_anchor = None;
                 AppCommand::Action(ActionIntent::SetNodeUnschedulable {
-                    name,
+                    names,
                     unschedulable,
                 })
             }
@@ -3217,12 +3251,14 @@ impl App {
                 return AppCommand::None;
             }
         };
-        let name = dialog.name.clone();
+        let names = dialog.names.clone();
         self.pending_delete = None;
         self.confirm_armed = false;
         self.notice = None;
         self.overlay = Overlay::None;
-        AppCommand::Action(ActionIntent::DrainNode { name, options })
+        self.marks.clear();
+        self.mark_anchor = None;
+        AppCommand::Action(ActionIntent::DrainNode { names, options })
     }
 
     #[must_use]
@@ -6054,10 +6090,15 @@ impl App {
         if self.read_only {
             return self.unsupported("Drain is disabled in read-only mode");
         }
-        let Some(name) = self.selected_row().map(|row| row.name.to_string()) else {
+        let names = self
+            .selected_or_marked_targets()
+            .into_iter()
+            .map(|target| target.name)
+            .collect::<Vec<_>>();
+        if names.is_empty() {
             return AppCommand::None;
-        };
-        self.pending_delete = Some(PendingDelete::DrainNode(DrainDialog::new(name)));
+        }
+        self.pending_delete = Some(PendingDelete::DrainNode(DrainDialog::new(names)));
         self.confirm_armed = false;
         self.overlay_selected = DRAIN_GRACE_PERIOD_FIELD;
         self.drain_value_edit_state = DrainValueEditState::Pristine;
@@ -6070,16 +6111,19 @@ impl App {
         if self.read_only {
             return self.unsupported("Cordon/uncordon is disabled in read-only mode");
         }
-        let Some((name, currently_unschedulable)) = self.selected_row().map(|row| {
-            (
-                row.name.to_string(),
-                row.node_data().is_some_and(|data| data.unschedulable),
-            )
-        }) else {
+        let names = self
+            .selected_or_marked_targets()
+            .into_iter()
+            .map(|target| target.name)
+            .collect::<Vec<_>>();
+        if names.is_empty() {
             return AppCommand::None;
-        };
+        }
+        let currently_unschedulable = self
+            .selected_row()
+            .is_some_and(|row| row.node_data().is_some_and(|data| data.unschedulable));
         self.pending_delete = Some(PendingDelete::NodeScheduling {
-            name,
+            names,
             unschedulable: !currently_unschedulable,
         });
         self.confirm_armed = false;
@@ -6092,11 +6136,16 @@ impl App {
         if self.read_only {
             return self.unsupported("Cordon/uncordon is disabled in read-only mode");
         }
-        let Some(name) = self.selected_row().map(|row| row.name.to_string()) else {
+        let names = self
+            .selected_or_marked_targets()
+            .into_iter()
+            .map(|target| target.name)
+            .collect::<Vec<_>>();
+        if names.is_empty() {
             return AppCommand::None;
-        };
+        }
         self.pending_delete = Some(PendingDelete::NodeScheduling {
-            name,
+            names,
             unschedulable,
         });
         self.confirm_armed = false;
@@ -6112,11 +6161,15 @@ impl App {
         if self.read_only {
             return self.unsupported("Kill is disabled in read-only mode");
         }
-        self.selected_target().map_or(AppCommand::None, |target| {
-            AppCommand::Action(ActionIntent::Delete {
-                targets: vec![target],
-                immediate: true,
-            })
+        let targets = self.selected_or_marked_targets();
+        if targets.is_empty() {
+            return AppCommand::None;
+        }
+        self.marks.clear();
+        self.mark_anchor = None;
+        AppCommand::Action(ActionIntent::Delete {
+            targets,
+            immediate: true,
         })
     }
 
@@ -6940,13 +6993,13 @@ mod tests {
         let mut list = app_with_rows();
         list.query = "api".to_owned();
         list.rebuild_filter(None);
-        list.set_list_scroll_extent(200, 100);
+        list.set_list_scroll_extent(200, 100, vec![24, 60]);
         assert_eq!(
             list.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
             AppCommand::None
         );
         assert_eq!(list.overlay, Overlay::None);
-        assert_eq!(list.list_horizontal_scroll, 1);
+        assert_eq!(list.list_horizontal_scroll, 24);
         assert_eq!(
             list.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
             AppCommand::None
@@ -7750,7 +7803,7 @@ mod tests {
             assert_eq!(
                 app.pending_delete,
                 Some(PendingDelete::NodeScheduling {
-                    name: "worker-0".to_owned(),
+                    names: vec!["worker-0".to_owned()],
                     unschedulable: requested_unschedulable,
                 })
             );
@@ -7758,7 +7811,7 @@ mod tests {
             assert_eq!(
                 app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
                 AppCommand::Action(ActionIntent::SetNodeUnschedulable {
-                    name: "worker-0".to_owned(),
+                    names: vec!["worker-0".to_owned()],
                     unschedulable: requested_unschedulable,
                 })
             );
@@ -7796,9 +7849,9 @@ mod tests {
         assert_eq!(app.overlay, Overlay::ConfirmDelete);
         assert_eq!(
             app.pending_delete,
-            Some(PendingDelete::DrainNode(DrainDialog::new(
+            Some(PendingDelete::DrainNode(DrainDialog::new(vec![
                 "worker-0".to_owned()
-            )))
+            ])))
         );
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
@@ -7809,7 +7862,7 @@ mod tests {
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             AppCommand::Action(ActionIntent::DrainNode {
-                name: "worker-0".to_owned(),
+                names: vec!["worker-0".to_owned()],
                 options: NodeDrainOptions {
                     grace_period_seconds: None,
                     timeout: Duration::from_secs(5),
@@ -7840,7 +7893,7 @@ mod tests {
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             AppCommand::Action(ActionIntent::DrainNode {
-                name: "worker-0".to_owned(),
+                names: vec!["worker-0".to_owned()],
                 options: NodeDrainOptions {
                     grace_period_seconds: Some(0),
                     timeout: Duration::from_secs(30),
@@ -10776,18 +10829,50 @@ mod tests {
         assert_eq!(app.port_forwards[0].address, "127.0.0.1");
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
-        // Node `c` explicit Cordon
+        // Node `c` explicit Cordon (single and multi-node batch)
         let node_row = ResourceRow::new("-", "node-1", "Ready", "worker", "v1.32.0", 0)
             .with_node_data(crate::model::NodeData::default());
-        let mut node_app = app_with_descriptor(ResourceKind::Nodes.into(), None, node_row);
+        let node_row2 = ResourceRow::new("-", "node-2", "Ready", "worker", "v1.32.0", 0)
+            .with_node_data(crate::model::NodeData::default());
+        let mut node_app = app_with_descriptor(ResourceKind::Nodes.into(), None, node_row.clone());
+        node_app.apply_snapshot(ResourceSnapshot {
+            generation: node_app.generation,
+            kind: ResourceKind::Nodes.into(),
+            rows: Arc::new(vec![Arc::new(node_row), Arc::new(node_row2)]),
+            table_columns: Arc::from([]),
+            state: SourceState::Ready,
+            revision: 1,
+            emitted_at: Instant::now(),
+        });
         node_app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
         assert_eq!(
             node_app.pending_delete,
             Some(PendingDelete::NodeScheduling {
-                name: "node-1".to_owned(),
+                names: vec!["node-1".to_owned()],
                 unschedulable: true,
             })
         );
+        node_app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        node_app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        node_app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        node_app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        node_app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert_eq!(
+            node_app.pending_delete,
+            Some(PendingDelete::NodeScheduling {
+                names: vec!["node-1".to_owned(), "node-2".to_owned()],
+                unschedulable: true,
+            })
+        );
+        node_app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(
+            node_app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            AppCommand::Action(ActionIntent::SetNodeUnschedulable {
+                names: vec!["node-1".to_owned(), "node-2".to_owned()],
+                unschedulable: true,
+            })
+        );
+        assert!(node_app.marks.is_empty());
 
         // `:skin` / `:skins` command and interactive skin selection
         let cmd = app.run_command("skin");

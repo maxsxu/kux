@@ -283,13 +283,11 @@ fn demo_action(action: ActionIntent) -> ActionResult {
         ActionIntent::RenameContext { old_name, new_name } => ActionResult::Error(format!(
             "Context rename is unavailable in demo mode: {old_name} -> {new_name}"
         )),
-        ActionIntent::DrainNode { name, .. } => {
-            ActionResult::Notice(format!("Drained demo node {name}"))
-        }
         ActionIntent::SetNodeUnschedulable {
-            name,
+            names,
             unschedulable,
-        } => demo_set_node_unschedulable(&name, unschedulable),
+        } => demo_set_nodes_unschedulable(&names, unschedulable),
+        ActionIntent::DrainNode { names, .. } => demo_drain_nodes(&names),
         ActionIntent::Restart { targets } => demo_restart(&targets),
         ActionIntent::Scale { targets, replicas } => demo_scale(&targets, replicas),
         ActionIntent::TriggerCronJob { targets } => demo_trigger_cronjobs(&targets),
@@ -664,13 +662,25 @@ fn demo_restart(targets: &[ResourceTarget]) -> ActionResult {
     })
 }
 
-fn demo_set_node_unschedulable(name: &str, unschedulable: bool) -> ActionResult {
+fn demo_set_nodes_unschedulable(names: &[String], unschedulable: bool) -> ActionResult {
     let action = if unschedulable {
         "Cordoned"
     } else {
         "Uncordoned"
     };
-    ActionResult::Notice(format!("{action} demo node {name}"))
+    ActionResult::Notice(if let [name] = names {
+        format!("{action} demo node {name}")
+    } else {
+        format!("{action} {} demo nodes", names.len())
+    })
+}
+
+fn demo_drain_nodes(names: &[String]) -> ActionResult {
+    ActionResult::Notice(if let [name] = names {
+        format!("Drained demo node {name}")
+    } else {
+        format!("Drained {} demo nodes", names.len())
+    })
 }
 
 fn demo_delete(targets: &[ResourceTarget], immediate: bool) -> ActionResult {
@@ -1746,13 +1756,26 @@ mod tests {
 
     #[test]
     fn demo_node_scheduling_actions_report_the_requested_operation() {
-        for (unschedulable, expected) in [
-            (true, "Cordoned demo node worker-0"),
-            (false, "Uncordoned demo node worker-0"),
+        for (names, unschedulable, expected) in [
+            (
+                vec!["worker-0".to_owned()],
+                true,
+                "Cordoned demo node worker-0",
+            ),
+            (
+                vec!["worker-0".to_owned()],
+                false,
+                "Uncordoned demo node worker-0",
+            ),
+            (
+                vec!["worker-0".to_owned(), "worker-1".to_owned()],
+                true,
+                "Cordoned 2 demo nodes",
+            ),
         ] {
             assert_eq!(
                 demo_action(ActionIntent::SetNodeUnschedulable {
-                    name: "worker-0".to_owned(),
+                    names,
                     unschedulable,
                 }),
                 ActionResult::Notice(expected.to_owned())

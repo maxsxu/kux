@@ -23,7 +23,7 @@ const SPARKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█
 pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     app.set_column_hitboxes(Vec::new());
     app.set_resource_rows_hitbox(0, 0, 0, 0, 0);
-    app.set_list_scroll_extent(0, area.width);
+    app.set_list_scroll_extent(0, area.width, Vec::new());
     app.set_viewport_height(app.filtered.len().max(1));
 
     let filter = if app.input_mode == InputMode::Filter && !app.input.is_empty() {

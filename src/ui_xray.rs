@@ -22,7 +22,7 @@ use super::{
 pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let viewport_height = usize::from(area.height.saturating_sub(2)).max(1);
     app.set_viewport_height(viewport_height);
-    app.set_list_scroll_extent(0, area.width.saturating_sub(2));
+    app.set_list_scroll_extent(0, area.width.saturating_sub(2), Vec::new());
     app.set_column_hitboxes(Vec::new());
 
     let filter = if app.input_mode == InputMode::Filter && !app.input.is_empty() {
