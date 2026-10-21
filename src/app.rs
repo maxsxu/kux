@@ -4815,6 +4815,20 @@ impl App {
     fn rebuild_filter(&mut self, selected_key: Option<&str>) {
         let matcher = FilterMatcher::new(&self.query);
         let faults_only = self.ui.faults() && !self.is_reference_view();
+        let custom_paths: Vec<String> = self
+            .is_resource_view()
+            .then(|| {
+                self.user_config
+                    .custom_view_for(&self.kind, self.namespace.as_deref())
+            })
+            .flatten()
+            .map(|view| {
+                view.columns
+                    .iter()
+                    .filter_map(|col| col.json_path.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
         self.filter_error = matcher.error().map(str::to_owned);
         self.filtered.clear();
         self.filtered.extend(
@@ -4822,7 +4836,7 @@ impl App {
                 .rows
                 .iter()
                 .enumerate()
-                .filter(|(_, row)| matcher.matches(row))
+                .filter(|(_, row)| matcher.matches_with_paths(row, &custom_paths))
                 .filter(|(_, row)| !faults_only || row_is_fault(&self.kind, row))
                 .map(|(index, _)| index),
         );
@@ -6339,12 +6353,25 @@ impl FilterMatcher {
         }
     }
 
-    fn matches(&self, row: &ResourceRow) -> bool {
+    fn matches_with_paths(&self, row: &ResourceRow, custom_paths: &[String]) -> bool {
+        let search_text = if custom_paths.is_empty() {
+            std::borrow::Cow::Borrowed(row.search.as_ref())
+        } else {
+            let mut combined = row.search.to_string();
+            for path in custom_paths {
+                let val = row.json_path_value(path);
+                if val != "<none>" && !val.is_empty() {
+                    combined.push('\n');
+                    combined.push_str(&val.to_lowercase());
+                }
+            }
+            std::borrow::Cow::Owned(combined)
+        };
         match self {
             Self::All => true,
-            Self::Regex(regex) => regex.is_match(&row.search),
-            Self::Inverse(regex) => !regex.is_match(&row.search),
-            Self::Fuzzy(needle) => fuzzy_match(&row.search, needle),
+            Self::Regex(regex) => regex.is_match(&search_text),
+            Self::Inverse(regex) => !regex.is_match(&search_text),
+            Self::Fuzzy(needle) => fuzzy_match(&search_text, needle),
             Self::Labels(selectors) => {
                 let labels = row.labels.to_lowercase();
                 selectors

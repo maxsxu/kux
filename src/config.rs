@@ -550,27 +550,16 @@ impl UserConfig {
         descriptor: &crate::model::ResourceDescriptor,
         namespace: Option<&str>,
     ) -> Option<&CustomViewSpec> {
-        let gvr = format!("{}/{}", descriptor.api_version, descriptor.plural);
-        let mut keys = vec![
-            gvr,
-            descriptor.qualified_name(),
-            descriptor.plural.to_string(),
-            descriptor.kind.to_ascii_lowercase(),
-        ];
-        for alias in descriptor.command_aliases() {
-            if !keys.contains(&alias) {
-                keys.push(alias);
+        for (cfg_key, spec) in &self.views {
+            if let Some((res_part, ns_part)) = cfg_key.split_once('@')
+                && Some(ns_part) == namespace.filter(|ns| !ns.is_empty())
+                && custom_resource_key_matches(descriptor, res_part)
+            {
+                return Some(spec);
             }
         }
-        if let Some(ns) = namespace.filter(|ns| !ns.is_empty()) {
-            for key in &keys {
-                if let Some(spec) = self.views.get(&format!("{key}@{ns}")) {
-                    return Some(spec);
-                }
-            }
-        }
-        for key in &keys {
-            if let Some(spec) = self.views.get(key) {
+        for (cfg_key, spec) in &self.views {
+            if !cfg_key.contains('@') && custom_resource_key_matches(descriptor, cfg_key) {
                 return Some(spec);
             }
         }
@@ -582,20 +571,8 @@ impl UserConfig {
         &self,
         descriptor: &crate::model::ResourceDescriptor,
     ) -> Option<&CustomJumpSpec> {
-        let gvr = format!("{}/{}", descriptor.api_version, descriptor.plural);
-        let mut keys = vec![
-            gvr,
-            descriptor.qualified_name(),
-            descriptor.plural.to_string(),
-            descriptor.kind.to_ascii_lowercase(),
-        ];
-        for alias in descriptor.command_aliases() {
-            if !keys.contains(&alias) {
-                keys.push(alias);
-            }
-        }
-        for key in &keys {
-            if let Some(spec) = self.jumps.get(key) {
+        for (cfg_key, spec) in &self.jumps {
+            if custom_resource_key_matches(descriptor, cfg_key) {
                 return Some(spec);
             }
         }
@@ -678,6 +655,37 @@ impl UserConfig {
         let binding = KeyShortcut::normalized(key.code, key.modifiers);
         self.hotkeys.iter().find(|hotkey| hotkey.binding == binding)
     }
+}
+
+fn custom_resource_key_matches(
+    descriptor: &crate::model::ResourceDescriptor,
+    cfg_key: &str,
+) -> bool {
+    let gvr = format!("{}/{}", descriptor.api_version, descriptor.plural);
+    let mut keys = vec![
+        gvr,
+        descriptor.qualified_name(),
+        descriptor.plural.to_string(),
+        descriptor.kind.to_ascii_lowercase(),
+    ];
+    for alias in descriptor.command_aliases() {
+        if !keys.contains(&alias) {
+            keys.push(alias);
+        }
+    }
+    if keys.iter().any(|k| k.eq_ignore_ascii_case(cfg_key)) {
+        return true;
+    }
+    if !descriptor.group.is_empty()
+        && let Some((group_ver, plural)) = cfg_key.rsplit_once('/')
+        && let Some((group, _version)) = group_ver.split_once('/')
+        && group.eq_ignore_ascii_case(&descriptor.group)
+        && (plural.eq_ignore_ascii_case(&descriptor.plural)
+            || plural.eq_ignore_ascii_case(&descriptor.kind))
+    {
+        return true;
+    }
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

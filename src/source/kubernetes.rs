@@ -2301,7 +2301,7 @@ fn spawn_fast_initial_list(
             &client,
             field_selector.as_deref(),
             label_selector.as_deref(),
-            TABLE_INCLUDE_OBJECT,
+            "Metadata",
             |columns, rows, complete| {
                 if sent_first && !complete {
                     return;
@@ -4065,7 +4065,7 @@ const TABLE_ACCEPT: &str = "application/json;as=Table;v=v1;g=meta.k8s.io,\
                            application/json";
 const TABLE_INITIAL_PAGE_SIZE: u32 = 250;
 const TABLE_MAX_PAGE_SIZE: u32 = 5_000;
-const TABLE_INCLUDE_OBJECT: &str = "Metadata";
+const TABLE_INCLUDE_OBJECT: &str = "Object";
 const TABLE_FAST_INCLUDE_OBJECT: &str = "None";
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -8129,7 +8129,7 @@ mod tests {
     }
 
     #[test]
-    fn requests_kubectl_table_pages_with_metadata_only() {
+    fn requests_kubectl_table_pages_with_full_object_for_custom_columns() {
         let request = Request::new("/apis/example.io/v1/widgets")
             .list(&ListParams::default().limit(TABLE_INITIAL_PAGE_SIZE))
             .expect("list request");
@@ -8141,8 +8141,7 @@ mod tests {
         );
         let query = request.uri().query().expect("query");
         assert!(query.contains("limit=250"));
-        assert!(query.contains("includeObject=Metadata"));
-        assert!(!query.contains("includeObject=Object"));
+        assert!(query.contains("includeObject=Object"));
     }
 
     #[test]

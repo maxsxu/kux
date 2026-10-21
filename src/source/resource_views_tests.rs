@@ -203,7 +203,7 @@ async fn instance_table_get_preserves_crd_columns_and_metadata_identity() {
         ResourceOperations::new(false, true, false),
     );
     let (client, mut paths, server) = fixture(|path, raw| {
-        assert_eq!(path, "/apis/example.io/v1/namespaces/target/widgets/selected?includeObject=Metadata");
+        assert_eq!(path, "/apis/example.io/v1/namespaces/target/widgets/selected?includeObject=Object");
         assert!(raw.contains("as=Table"));
         Reply::Json(200, json!({"apiVersion":"meta.k8s.io/v1","kind":"Table",
             "columnDefinitions":[{"name":"Name"},{"name":"Custom Phase","priority":1}],
@@ -303,7 +303,7 @@ async fn cluster_instance_get_and_raw_crd_fallback_keep_their_exact_scopes() {
         if path == "/api/v1/nodes/selected" {
             Reply::Json(200, json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"selected"},"status":{}}))
         } else {
-            assert_eq!(path, "/apis/example.io/v1/namespaces/target/widgets/selected?includeObject=Metadata");
+            assert_eq!(path, "/apis/example.io/v1/namespaces/target/widgets/selected?includeObject=Object");
             Reply::Json(200, json!({"apiVersion":"example.io/v1","kind":"Widget","metadata":{"name":"selected","namespace":"target"}}))
         }
     }).await;
@@ -371,7 +371,7 @@ async fn workload_aggregate_reads_six_real_tables_and_keeps_same_named_resources
     let (client, mut paths, server) = fixture(|path, raw| {
         assert!(raw.contains("as=Table"));
         assert!(path.contains("labelSelector=app%3Dfixture"));
-        assert!(path.contains("includeObject=Metadata"));
+        assert!(path.contains("includeObject=Object"));
         assert!(path.contains("/namespaces/target/"));
         Reply::Json(200, table(&kind_for_path(path), "same"))
     })

@@ -1454,6 +1454,17 @@ fn apply_custom_view_columns(
             .find(|col| col.label.eq_ignore_ascii_case(&spec.name))
         {
             out.push(existing.clone());
+        } else if spec.name.eq_ignore_ascii_case("age") {
+            out.push(view_column("AGE", SortField::Age, Constraint::Length(8), 0));
+        } else if spec.name.eq_ignore_ascii_case("name") {
+            out.push(view_column("NAME", SortField::Name, Constraint::Fill(5), 0));
+        } else if spec.name.eq_ignore_ascii_case("namespace") {
+            out.push(view_column(
+                "NAMESPACE",
+                SortField::Namespace,
+                Constraint::Fill(2),
+                0,
+            ));
         } else if spec.name.eq_ignore_ascii_case("labels") {
             let content_width = app
                 .snapshot
@@ -1487,6 +1498,11 @@ fn is_pod_list(app: &App) -> bool {
 fn is_scrollable_resource_list(app: &App) -> bool {
     is_pod_list(app)
         || (app.is_resource_view() && app.kind.is_workloads())
+        || (app.is_resource_view()
+            && app
+                .user_config
+                .custom_view_for(&app.kind, app.namespace.as_deref())
+                .is_some())
         || (app.is_resource_view()
             && matches!(
                 app.kind.known_kind(),
@@ -8075,6 +8091,36 @@ k9s:
         assert!(plugin_cols.contains(&("IMAGES".to_owned(), "nginx:1.27,envoy:1.31".to_owned())));
         assert!(plugin_cols.contains(&("IP".to_owned(), "10.244.0.9".to_owned())));
         assert!(plugin_cols.contains(&("UID".to_owned(), "secret-uid-123".to_owned())));
+
+        let pulsar_desc = crate::model::ResourceDescriptor::new(
+            "cloud.streamnative.io",
+            "v1alpha1",
+            "cloud.streamnative.io/v1alpha1",
+            "PulsarCluster",
+            "pulsarclusters",
+            true,
+            crate::model::ResourceOperations::all(),
+        );
+        let mut config = crate::config::UserConfig::default();
+        config.views.insert(
+            "cloud.streamnative.io/v1alhpa1/pulsarclusters".to_owned(),
+            crate::config::CustomViewSpec {
+                sort_column: None,
+                columns: vec![
+                    crate::config::CustomColumnSpec::parse("NAME:.metadata.name").unwrap(),
+                    crate::config::CustomColumnSpec::parse("POOL-MEMBER:.spec.poolMemberRef.name")
+                        .unwrap(),
+                    crate::config::CustomColumnSpec::parse("POOL-NS:.spec.poolMemberRef.namespace")
+                        .unwrap(),
+                    crate::config::CustomColumnSpec::parse("AGE").unwrap(),
+                ],
+            },
+        );
+        assert!(
+            config
+                .custom_view_for(&pulsar_desc, Some("sn-system"))
+                .is_some()
+        );
     }
 
     #[test]
