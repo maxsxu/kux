@@ -2245,32 +2245,34 @@ fn resource_cell(
             skin.style("views.table", Style::default().fg(YELLOW)),
         ));
     }
-    let Some(field) = column.field else {
-        return cell;
-    };
     if selected {
-        cell
-    } else if is_policy_verb(field) {
-        cell.style(if policy_verb_allowed(row, field) {
-            skin.foreground(
-                "frame.status.addColor",
-                skin.style("views.table", Style::default().fg(GREEN)),
-            )
+        return cell;
+    }
+    if let Some(field) = column.field {
+        if is_policy_verb(field) {
+            cell.style(if policy_verb_allowed(row, field) {
+                skin.foreground(
+                    "frame.status.addColor",
+                    skin.style("views.table", Style::default().fg(GREEN)),
+                )
+            } else {
+                skin.foreground(
+                    "frame.status.pendingColor",
+                    skin.style("views.table", Style::default().fg(ORANGE)),
+                )
+            })
         } else {
-            skin.foreground(
-                "frame.status.pendingColor",
-                skin.style("views.table", Style::default().fg(ORANGE)),
-            )
-        })
+            cell.style(resource_value_style(
+                skin,
+                field,
+                row,
+                &value,
+                now_unix,
+                &settings.thresholds,
+            ))
+        }
     } else {
-        cell.style(resource_value_style(
-            skin,
-            field,
-            row,
-            &value,
-            now_unix,
-            &settings.thresholds,
-        ))
+        cell.style(non_field_column_style(skin, column, row, &value, now_unix))
     }
 }
 
@@ -2357,19 +2359,34 @@ fn resource_value_style(
     now_unix: i64,
     thresholds: &crate::config::ThresholdSettings,
 ) -> Style {
-    let base = match field {
-        SortField::Kind | SortField::Namespace | SortField::Node => Style::default().fg(PURPLE),
-        SortField::Name => Style::default().fg(CYAN),
-        SortField::Status => return status_style(skin, value).bold(),
-        SortField::Ready | SortField::Binding => return readiness_style(skin, value),
-        SortField::Age => Style::default().fg(age_color(row.age_seconds(now_unix))),
-        SortField::Validity | SortField::Version | SortField::Details => Style::default().fg(MUTED),
-        SortField::VulnScore => Style::default().fg(YELLOW),
+    if matches!(value.trim(), "<none>" | "<unknown>" | "n/a" | "-") {
+        return skin.style("views.table", Style::default()).fg(MUTED);
+    }
+    match field {
+        SortField::Kind | SortField::Namespace | SortField::Node => {
+            skin.style("views.table", Style::default()).fg(PURPLE)
+        }
+        SortField::Name => skin.style("views.table", Style::default()).fg(CYAN),
+        SortField::Status => status_style(skin, value).bold(),
+        SortField::Ready | SortField::Binding => readiness_style(skin, value),
+        SortField::Age => skin
+            .style("views.table", Style::default())
+            .fg(age_color(row.age_seconds(now_unix))),
+        SortField::Validity | SortField::Version | SortField::Details => {
+            skin.style("views.table", Style::default()).fg(MUTED)
+        }
+        SortField::VulnScore | SortField::Restarts | SortField::Taints | SortField::Pods => {
+            skin.style("views.table", Style::default()).fg(YELLOW)
+        }
+        SortField::Cpu
+        | SortField::Memory
+        | SortField::CpuAllocatable
+        | SortField::MemoryAllocatable => skin.style("views.table", Style::default()).fg(ORANGE),
         SortField::CpuRequestPercent | SortField::CpuLimitPercent | SortField::CpuPercent => {
             if let Some(pct) = value.strip_suffix('%').and_then(|s| s.parse::<u8>().ok()) {
                 return threshold_style(skin, pct, &thresholds.cpu);
             }
-            Style::default()
+            skin.style("views.table", Style::default())
         }
         SortField::MemoryRequestPercent
         | SortField::MemoryLimitPercent
@@ -2377,11 +2394,48 @@ fn resource_value_style(
             if let Some(pct) = value.strip_suffix('%').and_then(|s| s.parse::<u8>().ok()) {
                 return threshold_style(skin, pct, &thresholds.memory);
             }
-            Style::default()
+            skin.style("views.table", Style::default())
         }
-        _ => Style::default(),
+        _ => skin.style("views.table", Style::default()),
+    }
+}
+
+fn non_field_column_style(
+    skin: &Skin,
+    column: &ViewColumn,
+    row: &crate::model::ResourceRow,
+    value: &str,
+    now_unix: i64,
+) -> Style {
+    let trimmed = value.trim();
+    if matches!(trimmed, "<none>" | "<unknown>" | "n/a" | "-") {
+        return skin.style("views.table", Style::default()).fg(MUTED);
+    }
+    if column.kubectl_age || column.table_age || column.label.eq_ignore_ascii_case("AGE") {
+        return skin
+            .style("views.table", Style::default())
+            .fg(age_color(row.age_seconds(now_unix)));
+    }
+    let label_upper = column.label.to_ascii_uppercase();
+    if matches!(
+        label_upper.as_str(),
+        "STATUS" | "STATE" | "PHASE" | "HEALTH" | "AVAILABLE"
+    ) {
+        return status_style(skin, trimmed).bold();
+    }
+    if matches!(label_upper.as_str(), "READY" | "READINESS GATES" | "VALID") {
+        return readiness_style(skin, trimmed);
+    }
+    let palette = [GREEN, YELLOW, ORANGE, PURPLE, PINK, CYAN];
+    let index = if let Some(table_idx) = column.table_index {
+        table_idx
+    } else {
+        column.label.bytes().fold(0_usize, |acc, b| {
+            acc.wrapping_mul(31).wrapping_add(usize::from(b))
+        })
     };
-    skin.style("views.table", base)
+    let color = palette[index % palette.len()];
+    skin.style("views.table", Style::default()).fg(color)
 }
 
 fn threshold_style(skin: &Skin, pct: u8, threshold: &crate::config::SeverityThreshold) -> Style {
@@ -3375,8 +3429,10 @@ fn draw_aliases(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 }
             }
             Row::new([
-                highlighted_cell(&app.theme, resource.qualified_name(), &matcher),
-                highlighted_cell(&app.theme, aliases.join(" "), &matcher),
+                highlighted_cell(&app.theme, resource.qualified_name(), &matcher)
+                    .style(Style::default().fg(CYAN)),
+                highlighted_cell(&app.theme, aliases.join(" "), &matcher)
+                    .style(Style::default().fg(GREEN)),
             ])
             .style(if index == app.overlay_selected {
                 app.theme.table_cursor(
@@ -3448,10 +3504,17 @@ fn draw_namespaces(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             } else {
                 namespace.name.clone()
             };
+            let age_style = namespace.age_seconds(app.now_unix).map_or_else(
+                || Style::default().fg(MUTED),
+                |secs| Style::default().fg(age_color(secs)),
+            );
+            let status_cell_style = status_style(&app.theme, &namespace.status);
             Row::new([
-                highlighted_cell(&app.theme, display_name, &matcher),
-                highlighted_cell(&app.theme, namespace.status.clone(), &matcher),
-                highlighted_cell(&app.theme, age, &matcher),
+                highlighted_cell(&app.theme, display_name, &matcher)
+                    .style(Style::default().fg(CYAN)),
+                highlighted_cell(&app.theme, namespace.status.clone(), &matcher)
+                    .style(status_cell_style),
+                highlighted_cell(&app.theme, age, &matcher).style(age_style),
             ])
             .style(if index == app.overlay_selected {
                 app.theme.table_cursor(
@@ -3548,6 +3611,7 @@ fn context_columns(app: &App, area_width: u16) -> Vec<(ContextColumn, u16)> {
     columns
 }
 
+#[allow(clippy::too_many_lines)]
 fn draw_contexts(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let visible = app.visible_context_indices();
     let matcher = FilterMatcher::new(app.body_filter());
@@ -3577,21 +3641,26 @@ fn draw_contexts(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         "*"
                     } else {
                         " "
-                    }),
+                    })
+                    .style(Style::default().fg(GREEN).bold()),
                     ContextColumn::Name => {
                         highlighted_cell(&app.theme, context.name.clone(), &matcher)
+                            .style(Style::default().fg(CYAN))
                     }
                     ContextColumn::Cluster => {
                         highlighted_cell(&app.theme, context.cluster_display().to_owned(), &matcher)
+                            .style(Style::default().fg(GREEN))
                     }
                     ContextColumn::User => {
                         highlighted_cell(&app.theme, context.user_display().to_owned(), &matcher)
+                            .style(Style::default().fg(YELLOW))
                     }
                     ContextColumn::Namespace => highlighted_cell(
                         &app.theme,
                         context.namespace_display().to_owned(),
                         &matcher,
-                    ),
+                    )
+                    .style(Style::default().fg(PURPLE)),
                 })
                 .collect::<Vec<_>>();
             Row::new(cells).style(if index == app.overlay_selected {
