@@ -190,16 +190,24 @@ pub struct ViewState {
     pub label_selector: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ColumnSortKey {
+    Field(SortField),
+    TableIndex(usize),
+    JsonPath(String),
+    Computed(&'static str),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ColumnHitbox {
     pub(crate) x: u16,
     pub(crate) y: u16,
     pub(crate) width: u16,
-    pub(crate) field: SortField,
+    pub(crate) key: ColumnSortKey,
 }
 
 impl ColumnHitbox {
-    const fn contains(self, column: u16, row: u16) -> bool {
+    const fn contains(&self, column: u16, row: u16) -> bool {
         row == self.y && column >= self.x && column < self.x.saturating_add(self.width)
     }
 }
@@ -836,6 +844,7 @@ struct SavedResourceList {
     query: String,
     sort_field: SortField,
     sort_descending: bool,
+    column_sort_override: Option<ColumnSortKey>,
     selected_key: Option<Arc<str>>,
 }
 
@@ -1011,6 +1020,7 @@ pub struct App {
     pub sort_field: SortField,
     pub sort_descending: bool,
     pub selected_column: usize,
+    pub(crate) column_sort_override: Option<ColumnSortKey>,
     pub selected: usize,
     pub offset: usize,
     pub list_horizontal_scroll: u16,
@@ -1123,6 +1133,7 @@ impl App {
             sort_field: SortField::Name,
             sort_descending: false,
             selected_column: 1,
+            column_sort_override: None,
             selected: 0,
             offset: 0,
             list_horizontal_scroll: 0,
@@ -1289,6 +1300,7 @@ impl App {
             .into_iter()
             .find(|field| field.label().eq_ignore_ascii_case(col))
         {
+            self.column_sort_override = None;
             self.sort_field = field;
             self.sort_descending = !*asc;
         }
@@ -1617,9 +1629,6 @@ impl App {
             self.overlay_selected = index;
             return true;
         }
-        if self.overlay != Overlay::None {
-            return false;
-        }
         if let Some(selected) = self.resource_rows_hitbox.index_at(event.column, event.row) {
             self.select(selected);
             return true;
@@ -1627,16 +1636,26 @@ impl App {
         let Some(hitbox) = self
             .column_hitboxes
             .iter()
-            .copied()
             .find(|hitbox| hitbox.contains(event.column, event.row))
+            .cloned()
         else {
             return false;
         };
-        self.selected_column = SortField::ALL
-            .iter()
-            .position(|field| *field == hitbox.field)
-            .unwrap_or(self.selected_column);
-        self.set_sort(hitbox.field);
+        if matches!(
+            self.overlay,
+            Overlay::Aliases
+                | Overlay::Namespaces
+                | Overlay::Contexts
+                | Overlay::PortForwards
+                | Overlay::ScreenDumps
+        ) {
+            self.sort_overlay_by_column(&hitbox.key);
+            return true;
+        }
+        if self.overlay != Overlay::None {
+            return false;
+        }
+        self.set_column_sort(hitbox.key);
         true
     }
 
@@ -4360,6 +4379,9 @@ impl App {
         self.kind = view.kind.clone();
         self.instance.clone_from(&view.instance);
         self.namespace.clone_from(&view.namespace);
+        if resource_kind_changed {
+            self.column_sort_override = None;
+        }
         if resource_kind_changed && self.kind.is_workloads() {
             self.sort_field = SortField::Kind;
             self.sort_descending = false;
@@ -4838,7 +4860,7 @@ impl App {
 
     fn set_sort(&mut self, field: SortField) {
         self.select_workload_sort_column(field);
-        if self.sort_field == field {
+        if self.column_sort_override.take().is_none() && self.sort_field == field {
             self.sort_descending = !self.sort_descending;
         } else {
             self.sort_field = field;
@@ -4846,6 +4868,231 @@ impl App {
         }
         let selected = self.selected_row().map(|row| Arc::clone(&row.key));
         self.rebuild_filter(selected.as_deref());
+    }
+
+    fn set_column_sort(&mut self, key: ColumnSortKey) {
+        match key {
+            ColumnSortKey::Field(field) => {
+                self.selected_column = SortField::ALL
+                    .iter()
+                    .position(|candidate| *candidate == field)
+                    .unwrap_or(self.selected_column);
+                self.set_sort(field);
+            }
+            other => {
+                if self.column_sort_override.as_ref() == Some(&other) {
+                    self.sort_descending = !self.sort_descending;
+                } else {
+                    self.column_sort_override = Some(other);
+                    self.sort_descending = false;
+                }
+                let selected = self.selected_row().map(|row| Arc::clone(&row.key));
+                self.rebuild_filter(selected.as_deref());
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn sort_overlay_by_column(&mut self, key: &ColumnSortKey) {
+        if self.column_sort_override.as_ref() == Some(key) {
+            self.sort_descending = !self.sort_descending;
+        } else {
+            self.column_sort_override = Some(key.clone());
+            self.sort_descending = false;
+        }
+        let desc = self.sort_descending;
+        let ColumnSortKey::Computed(col) = key else {
+            return;
+        };
+        match (self.overlay, *col) {
+            (Overlay::Aliases, "RESOURCE") => {
+                self.resource_options.sort_by(|a, b| {
+                    let ord = a.qualified_name().cmp(&b.qualified_name());
+                    if desc { ord.reverse() } else { ord }
+                });
+                self.select_first_visible_chooser_item();
+            }
+            (Overlay::Aliases, "ALIASES") => {
+                let aliases = &self.user_config.aliases;
+                let alias_str = |res: &ResourceDescriptor| {
+                    let mut list = res.command_aliases();
+                    for (custom_alias, target) in aliases {
+                        if target == &res.gvr() || target == &res.qualified_name() {
+                            list.push(custom_alias.clone());
+                        }
+                    }
+                    list.join(" ")
+                };
+                self.resource_options.sort_by(|a, b| {
+                    let ord = alias_str(a)
+                        .cmp(&alias_str(b))
+                        .then_with(|| a.qualified_name().cmp(&b.qualified_name()));
+                    if desc { ord.reverse() } else { ord }
+                });
+                self.select_first_visible_chooser_item();
+            }
+            (Overlay::Namespaces, "NAME") => {
+                self.namespace_options.sort_by(|a, b| {
+                    let ord = a.name.cmp(&b.name);
+                    if desc { ord.reverse() } else { ord }
+                });
+                self.select_first_visible_chooser_item();
+            }
+            (Overlay::Namespaces, "STATUS") => {
+                self.namespace_options.sort_by(|a, b| {
+                    let ord = a.status.cmp(&b.status).then_with(|| a.name.cmp(&b.name));
+                    if desc { ord.reverse() } else { ord }
+                });
+                self.select_first_visible_chooser_item();
+            }
+            (Overlay::Namespaces, "AGE") => {
+                let now = self.now_unix;
+                self.namespace_options.sort_by(|a, b| {
+                    let ord = a
+                        .age_seconds(now)
+                        .cmp(&b.age_seconds(now))
+                        .then_with(|| a.name.cmp(&b.name));
+                    if desc { ord.reverse() } else { ord }
+                });
+                self.select_first_visible_chooser_item();
+            }
+            (Overlay::Contexts, "ACTIVE") => {
+                let active = &self.context;
+                self.context_options.sort_by(|a, b| {
+                    let ord = (b.name == *active)
+                        .cmp(&(a.name == *active))
+                        .then_with(|| a.name.cmp(&b.name));
+                    if desc { ord.reverse() } else { ord }
+                });
+                self.select_first_visible_chooser_item();
+            }
+            (Overlay::Contexts, "NAME") => {
+                self.context_options.sort_by(|a, b| {
+                    let ord = a.name.cmp(&b.name);
+                    if desc { ord.reverse() } else { ord }
+                });
+                self.select_first_visible_chooser_item();
+            }
+            (Overlay::Contexts, "CLUSTER") => {
+                self.context_options.sort_by(|a, b| {
+                    let ord = a
+                        .cluster_display()
+                        .cmp(b.cluster_display())
+                        .then_with(|| a.name.cmp(&b.name));
+                    if desc { ord.reverse() } else { ord }
+                });
+                self.select_first_visible_chooser_item();
+            }
+            (Overlay::Contexts, "USER") => {
+                self.context_options.sort_by(|a, b| {
+                    let ord = a
+                        .user_display()
+                        .cmp(b.user_display())
+                        .then_with(|| a.name.cmp(&b.name));
+                    if desc { ord.reverse() } else { ord }
+                });
+                self.select_first_visible_chooser_item();
+            }
+            (Overlay::Contexts, "NAMESPACE") => {
+                self.context_options.sort_by(|a, b| {
+                    let ord = a
+                        .namespace_display()
+                        .cmp(b.namespace_display())
+                        .then_with(|| a.name.cmp(&b.name));
+                    if desc { ord.reverse() } else { ord }
+                });
+                self.select_first_visible_chooser_item();
+            }
+            (Overlay::PortForwards, "NAMESPACE") => {
+                self.port_forwards.sort_by(|a, b| {
+                    let ord = a
+                        .target
+                        .namespace
+                        .as_deref()
+                        .unwrap_or("-")
+                        .cmp(b.target.namespace.as_deref().unwrap_or("-"))
+                        .then_with(|| a.target.name.cmp(&b.target.name));
+                    if desc { ord.reverse() } else { ord }
+                });
+            }
+            (Overlay::PortForwards, "KIND") => {
+                self.port_forwards.sort_by(|a, b| {
+                    let ord = a
+                        .target
+                        .kind
+                        .kind
+                        .cmp(&b.target.kind.kind)
+                        .then_with(|| a.target.name.cmp(&b.target.name));
+                    if desc { ord.reverse() } else { ord }
+                });
+            }
+            (Overlay::PortForwards, "NAME") => {
+                self.port_forwards.sort_by(|a, b| {
+                    let ord = a.target.name.cmp(&b.target.name);
+                    if desc { ord.reverse() } else { ord }
+                });
+            }
+            (Overlay::PortForwards, "LOCAL->REMOTE") => {
+                self.port_forwards.sort_by(|a, b| {
+                    let ord = (a.local_port, a.remote_port).cmp(&(b.local_port, b.remote_port));
+                    if desc { ord.reverse() } else { ord }
+                });
+            }
+            (Overlay::PortForwards, "ADDRESS") => {
+                self.port_forwards.sort_by(|a, b| {
+                    let ord = (&a.address, a.local_port).cmp(&(&b.address, b.local_port));
+                    if desc { ord.reverse() } else { ord }
+                });
+            }
+            (Overlay::PortForwards, "STATUS") => {
+                self.port_forwards.sort_by(|a, b| {
+                    let ord = a
+                        .state
+                        .label()
+                        .cmp(b.state.label())
+                        .then_with(|| a.target.name.cmp(&b.target.name));
+                    if desc { ord.reverse() } else { ord }
+                });
+            }
+            (Overlay::ScreenDumps, "NAME") => {
+                self.dumps.entries.sort_by(|a, b| {
+                    let ord = a.name.cmp(&b.name);
+                    if desc { ord.reverse() } else { ord }
+                });
+                self.select_first_visible_chooser_item();
+            }
+            (Overlay::ScreenDumps, "DIR") => {
+                self.dumps.entries.sort_by(|a, b| {
+                    let ord = a
+                        .dir_display()
+                        .cmp(&b.dir_display())
+                        .then_with(|| a.name.cmp(&b.name));
+                    if desc { ord.reverse() } else { ord }
+                });
+                self.select_first_visible_chooser_item();
+            }
+            (Overlay::ScreenDumps, "SIZE") => {
+                self.dumps.entries.sort_by(|a, b| {
+                    let ord = a
+                        .size_bytes
+                        .cmp(&b.size_bytes)
+                        .then_with(|| a.name.cmp(&b.name));
+                    if desc { ord.reverse() } else { ord }
+                });
+                self.select_first_visible_chooser_item();
+            }
+            (Overlay::ScreenDumps, "AGE") => {
+                self.dumps.entries.sort_by(|a, b| {
+                    let ord = b
+                        .modified_unix
+                        .cmp(&a.modified_unix)
+                        .then_with(|| a.name.cmp(&b.name));
+                    if desc { ord.reverse() } else { ord }
+                });
+                self.select_first_visible_chooser_item();
+            }
+            _ => {}
+        }
     }
 
     fn rebuild_filter(&mut self, selected_key: Option<&str>) {
@@ -4898,9 +5145,12 @@ impl App {
             });
         }
         let now = self.now_unix;
+        let sort_override = self.column_sort_override.as_ref();
         if !pulses && !xray {
             self.filtered.sort_unstable_by(|left, right| {
-                let ordering = if workloads {
+                let ordering = if let Some(override_key) = sort_override {
+                    compare_rows_by_override(&rows[*left], &rows[*right], override_key)
+                } else if workloads {
                     navigation::compare_workload_rows(&rows[*left], &rows[*right], sort_field, now)
                 } else if scans && sort_field == SortField::Status {
                     crate::scans::sev_rank(&rows[*left].status)
@@ -5884,11 +6134,13 @@ impl App {
             query: std::mem::take(&mut self.query),
             sort_field: self.sort_field,
             sort_descending: self.sort_descending,
+            column_sort_override: self.column_sort_override.take(),
             selected_key,
         });
         self.list_mode = mode;
         self.sort_field = SortField::Name;
         self.sort_descending = false;
+        self.column_sort_override = None;
         self.selected = 0;
         self.offset = 0;
         self.marks.clear();
@@ -5905,6 +6157,7 @@ impl App {
         self.query = saved.query;
         self.sort_field = saved.sort_field;
         self.sort_descending = saved.sort_descending;
+        self.column_sort_override = saved.column_sort_override;
         self.list_mode = ListMode::Resources;
         self.selected = 0;
         self.offset = 0;
@@ -6610,6 +6863,67 @@ pub(crate) fn row_vuln_score(
         return "n/a".to_owned();
     }
     crate::scans::score_images(images)
+}
+
+fn compare_rows_by_override(
+    left: &ResourceRow,
+    right: &ResourceRow,
+    key: &ColumnSortKey,
+) -> Ordering {
+    let primary = match key {
+        ColumnSortKey::Field(field) => return compare_rows(left, right, *field),
+        ColumnSortKey::TableIndex(index) => {
+            let l_cell = left.table_cells.get(*index);
+            let r_cell = right.table_cells.get(*index);
+            if let (Some(l_ts), Some(r_ts)) = (
+                l_cell.and_then(|c| c.timestamp_unix),
+                r_cell.and_then(|c| c.timestamp_unix),
+            ) {
+                l_ts.cmp(&r_ts)
+            } else {
+                let l_str = l_cell.map_or("", |c| c.text.as_ref());
+                let r_str = r_cell.map_or("", |c| c.text.as_ref());
+                navigation::natural_compare(l_str, r_str)
+            }
+        }
+        ColumnSortKey::JsonPath(path) => {
+            let l_str = left.json_path_value(path);
+            let r_str = right.json_path_value(path);
+            navigation::natural_compare(&l_str, &r_str)
+        }
+        ColumnSortKey::Computed(label) => match *label {
+            "CPU/R:L" => {
+                let vals = |r: &ResourceRow| {
+                    r.pod_data().map_or_else(
+                        || {
+                            r.container_data()
+                                .map_or((0, 0), |d| (d.cpu_request_millis, d.cpu_limit_millis))
+                        },
+                        |d| (d.cpu_request_millis, d.cpu_limit_millis),
+                    )
+                };
+                vals(left).cmp(&vals(right))
+            }
+            "MEM/R:L" => {
+                let vals = |r: &ResourceRow| {
+                    r.pod_data().map_or_else(
+                        || {
+                            r.container_data()
+                                .map_or((0, 0), |d| (d.memory_request_bytes, d.memory_limit_bytes))
+                        },
+                        |d| (d.memory_request_bytes, d.memory_limit_bytes),
+                    )
+                };
+                vals(left).cmp(&vals(right))
+            }
+            _ => {
+                let l_str = crate::ui::computed_column_value(left, label);
+                let r_str = crate::ui::computed_column_value(right, label);
+                navigation::natural_compare(&l_str, &r_str)
+            }
+        },
+    };
+    primary.then(left.key.cmp(&right.key))
 }
 
 fn compare_rows(left: &ResourceRow, right: &ResourceRow, field: SortField) -> Ordering {
@@ -8313,12 +8627,20 @@ mod tests {
     #[test]
     fn clicking_a_column_header_sorts_and_reverses_direction() {
         let mut app = app_with_rows();
-        app.set_column_hitboxes(vec![ColumnHitbox {
-            x: 40,
-            y: 7,
-            width: 10,
-            field: SortField::Age,
-        }]);
+        app.set_column_hitboxes(vec![
+            ColumnHitbox {
+                x: 40,
+                y: 7,
+                width: 10,
+                key: ColumnSortKey::Field(SortField::Age),
+            },
+            ColumnHitbox {
+                x: 55,
+                y: 7,
+                width: 10,
+                key: ColumnSortKey::Computed("IP"),
+            },
+        ]);
         let click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 44,
@@ -8328,6 +8650,7 @@ mod tests {
 
         assert!(app.handle_mouse(click));
         assert_eq!(app.sort_field, SortField::Age);
+        assert_eq!(app.column_sort_override, None);
         assert!(!app.sort_descending);
         assert_eq!(
             SortField::ALL[app.selected_column],
@@ -8338,6 +8661,20 @@ mod tests {
         assert!(app.handle_mouse(click));
         assert!(app.sort_descending);
         assert!(!app.handle_mouse(MouseEvent { row: 8, ..click }));
+
+        // Clicking a computed column (like IP / ARCH / KERNEL / JSONPath / TableIndex) sorts and toggles direction
+        let click_ip = MouseEvent {
+            column: 58,
+            ..click
+        };
+        assert!(app.handle_mouse(click_ip));
+        assert_eq!(
+            app.column_sort_override,
+            Some(ColumnSortKey::Computed("IP"))
+        );
+        assert!(!app.sort_descending);
+        assert!(app.handle_mouse(click_ip));
+        assert!(app.sort_descending);
     }
 
     #[test]

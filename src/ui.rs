@@ -9,12 +9,13 @@ use ratatui::{
 
 use crate::{
     app::{
-        App, ColumnHitbox, ContentKind, DRAIN_CANCEL_FIELD, DRAIN_DELETE_EMPTYDIR_DATA_FIELD,
-        DRAIN_DISABLE_EVICTION_FIELD, DRAIN_FORCE_FIELD, DRAIN_GRACE_PERIOD_FIELD,
-        DRAIN_IGNORE_DAEMON_SETS_FIELD, DRAIN_OK_FIELD, DRAIN_TIMEOUT_FIELD, DrainDialog,
-        FilterMatcher, InputMode, ListMode, Overlay, PORT_FORWARD_ADDRESS_FIELD,
-        PORT_FORWARD_CANCEL_FIELD, PORT_FORWARD_LOCAL_FIELD, PORT_FORWARD_OK_FIELD,
-        PORT_FORWARD_REMOTE_FIELD, PendingDelete, PortForwardDialog, SortField,
+        App, ColumnHitbox, ColumnSortKey, ContentKind, DRAIN_CANCEL_FIELD,
+        DRAIN_DELETE_EMPTYDIR_DATA_FIELD, DRAIN_DISABLE_EVICTION_FIELD, DRAIN_FORCE_FIELD,
+        DRAIN_GRACE_PERIOD_FIELD, DRAIN_IGNORE_DAEMON_SETS_FIELD, DRAIN_OK_FIELD,
+        DRAIN_TIMEOUT_FIELD, DrainDialog, FilterMatcher, InputMode, ListMode, Overlay,
+        PORT_FORWARD_ADDRESS_FIELD, PORT_FORWARD_CANCEL_FIELD, PORT_FORWARD_LOCAL_FIELD,
+        PORT_FORWARD_OK_FIELD, PORT_FORWARD_REMOTE_FIELD, PendingDelete, PortForwardDialog,
+        SortField,
     },
     model::{ResourceKind, SourceState, format_age, format_kubectl_age},
     source::LogRange,
@@ -102,6 +103,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 
 fn draw_inner(frame: &mut Frame<'_>, app: &mut App) {
     app.clear_chooser_hitbox();
+    app.set_column_hitboxes(Vec::new());
     let area = frame.area();
     frame.render_widget(Block::default().style(preferences::body_style(app)), area);
     let fullscreen_content = app.overlay == Overlay::Content && app.ui.fullscreen();
@@ -1229,12 +1231,27 @@ fn header_hint_cell(skin: &Skin, hint: &HeaderHint, key_width: usize) -> Cell<'s
 struct ViewColumn {
     label: String,
     field: Option<SortField>,
+    computed_key: Option<&'static str>,
     table_index: Option<usize>,
     json_path: Option<String>,
     table_age: bool,
     kubectl_age: bool,
     width: Constraint,
     visible_from: u16,
+}
+
+impl ViewColumn {
+    fn sort_key(&self) -> Option<ColumnSortKey> {
+        if let Some(field) = self.field {
+            Some(ColumnSortKey::Field(field))
+        } else if let Some(path) = &self.json_path {
+            Some(ColumnSortKey::JsonPath(path.clone()))
+        } else if let Some(index) = self.table_index {
+            Some(ColumnSortKey::TableIndex(index))
+        } else {
+            self.computed_key.map(ColumnSortKey::Computed)
+        }
+    }
 }
 
 fn view_column(
@@ -1246,6 +1263,7 @@ fn view_column(
     ViewColumn {
         label: label.to_owned(),
         field: Some(field),
+        computed_key: None,
         table_index: None,
         json_path: None,
         table_age: false,
@@ -1272,6 +1290,7 @@ fn columns_for_view_options(app: &App, width: u16, include_hidden: bool) -> Vec<
     let mut columns = vec![ViewColumn {
         label: String::new(),
         field: None,
+        computed_key: None,
         table_index: None,
         json_path: None,
         table_age: false,
@@ -1442,6 +1461,7 @@ fn apply_custom_view_columns(
             out.push(ViewColumn {
                 label,
                 field: None,
+                computed_key: None,
                 table_index: None,
                 json_path: Some(path.clone()),
                 table_age: false,
@@ -1479,6 +1499,7 @@ fn apply_custom_view_columns(
             out.push(ViewColumn {
                 label: "LABELS".to_owned(),
                 field: None,
+                computed_key: None,
                 table_index: None,
                 json_path: Some(".metadata.labels".to_owned()),
                 table_age: false,
@@ -1657,6 +1678,7 @@ fn server_table_columns(
             ViewColumn {
                 label,
                 field,
+                computed_key: None,
                 table_index: Some(index),
                 json_path: None,
                 table_age,
@@ -1769,6 +1791,7 @@ fn plain_view_column(label: &'static str, width: Constraint, visible_from: u16) 
     ViewColumn {
         label: label.to_owned(),
         field: None,
+        computed_key: Some(label),
         table_index: None,
         json_path: None,
         table_age: false,
@@ -2062,14 +2085,14 @@ fn draw_resources(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .column_spacing(1);
     if show_header {
         let header_cells = columns.iter().map(|column| {
-            column.field.map_or_else(
+            column.sort_key().map_or_else(
                 || {
                     Cell::from(column.label.clone()).style(
                         app.theme
                             .style("views.table.header", Style::default().fg(CYAN).bold()),
                     )
                 },
-                |field| column_header(app, &column.label, field),
+                |key| column_header(app, &column.label, &key),
             )
         });
         table = table.header(Row::new(header_cells).bottom_margin(1));
@@ -2460,13 +2483,13 @@ fn update_column_hitboxes(
                 .right()
                 .saturating_sub(app.list_horizontal_scroll)
                 .min(area.width.saturating_sub(2));
-            spec.field
+            spec.sort_key()
                 .filter(|_| end > start)
-                .map(|field| ColumnHitbox {
+                .map(|key| ColumnHitbox {
                     x: area.x.saturating_add(1).saturating_add(start),
                     y: column.y,
                     width: end - start,
-                    field,
+                    key,
                 })
         })
         .collect();
@@ -2856,20 +2879,27 @@ fn format_percent(value: Option<u64>, total: u64) -> String {
     )
 }
 
-fn column_header(app: &App, label: &str, field: SortField) -> Cell<'static> {
+pub(super) fn column_header(app: &App, label: &str, key: &ColumnSortKey) -> Cell<'static> {
     let selected_field = SortField::ALL[app.selected_column];
-    let suffix = if app.sort_field == field {
+    let is_selected = app.column_sort_override.is_none()
+        && matches!(key, ColumnSortKey::Field(field) if *field == selected_field);
+    let is_sorted = match (&app.column_sort_override, key) {
+        (Some(override_key), _) => override_key == key,
+        (None, ColumnSortKey::Field(field)) => app.sort_field == *field,
+        _ => false,
+    };
+    let suffix = if is_sorted {
         if app.sort_descending { " ↓" } else { " ↑" }
     } else {
         ""
     };
-    let style = if selected_field == field {
+    let style = if is_selected {
         app.theme.foreground(
             "views.table.header.selectedSortColumnColor",
             app.theme
                 .style("views.table.header", Style::default().fg(YELLOW).bold()),
         )
-    } else if app.sort_field == field {
+    } else if is_sorted {
         app.theme.foreground(
             "views.table.header.sorterColor",
             app.theme
@@ -3281,6 +3311,42 @@ fn record_chooser_rows(app: &mut App, area: Rect, indices: Vec<usize>) {
     );
 }
 
+pub(super) fn update_overlay_column_hitboxes(
+    app: &mut App,
+    area: Rect,
+    widths: &[Constraint],
+    keys: &[Option<ColumnSortKey>],
+) {
+    if area.width <= 2 || area.height <= 2 {
+        app.set_column_hitboxes(Vec::new());
+        return;
+    }
+    let header_area = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        1,
+    );
+    let columns = Layout::horizontal(widths.to_vec())
+        .spacing(1)
+        .split(header_area);
+    let hitboxes = columns
+        .iter()
+        .zip(keys)
+        .filter_map(|(col, key)| {
+            key.clone()
+                .filter(|_| col.width > 0)
+                .map(|key| ColumnHitbox {
+                    x: col.x,
+                    y: col.y,
+                    width: col.width,
+                    key,
+                })
+        })
+        .collect();
+    app.set_column_hitboxes(hitboxes);
+}
+
 fn draw_aliases(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let visible = app.visible_resource_indices();
     let matcher = FilterMatcher::new(app.body_filter());
@@ -3326,23 +3392,24 @@ fn draw_aliases(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         })
         .collect::<Vec<_>>();
     record_chooser_rows(app, area, displayed);
+    let widths = [Constraint::Percentage(35), Constraint::Percentage(65)];
+    let sort_keys = [
+        Some(ColumnSortKey::Computed("RESOURCE")),
+        Some(ColumnSortKey::Computed("ALIASES")),
+    ];
+    update_overlay_column_hitboxes(app, area, &widths, &sort_keys);
     frame.render_widget(
-        Table::new(
-            rows,
-            [Constraint::Percentage(35), Constraint::Percentage(65)],
-        )
-        .header(
-            Row::new(["RESOURCE", "ALIASES"]).style(
-                app.theme
-                    .style("views.table.header", Style::default().fg(YELLOW).bold()),
-            ),
-        )
-        .block(notice_block(
-            popup_block(&app.theme, &title)
-                .style(app.theme.style("views.table", Style::default()))
-                .title_alignment(Alignment::Center),
-            app,
-        )),
+        Table::new(rows, widths)
+            .header(Row::new([
+                column_header(app, "RESOURCE", &ColumnSortKey::Computed("RESOURCE")),
+                column_header(app, "ALIASES", &ColumnSortKey::Computed("ALIASES")),
+            ]))
+            .block(notice_block(
+                popup_block(&app.theme, &title)
+                    .style(app.theme.style("views.table", Style::default()))
+                    .title_alignment(Alignment::Center),
+                app,
+            )),
         area,
     );
 }
@@ -3400,27 +3467,30 @@ fn draw_namespaces(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         })
         .collect::<Vec<_>>();
     record_chooser_rows(app, area, displayed);
+    let widths = [
+        Constraint::Min(20),
+        Constraint::Length(14),
+        Constraint::Length(10),
+    ];
+    let sort_keys = [
+        Some(ColumnSortKey::Computed("NAME")),
+        Some(ColumnSortKey::Computed("STATUS")),
+        Some(ColumnSortKey::Computed("AGE")),
+    ];
+    update_overlay_column_hitboxes(app, area, &widths, &sort_keys);
     frame.render_widget(
-        Table::new(
-            rows,
-            [
-                Constraint::Min(20),
-                Constraint::Length(14),
-                Constraint::Length(10),
-            ],
-        )
-        .header(
-            Row::new(["NAME", "STATUS", "AGE"]).style(
-                app.theme
-                    .style("views.table.header", Style::default().fg(YELLOW).bold()),
-            ),
-        )
-        .block(notice_block(
-            popup_block(&app.theme, &title)
-                .style(app.theme.style("views.table", Style::default()))
-                .title_alignment(Alignment::Center),
-            app,
-        )),
+        Table::new(rows, widths)
+            .header(Row::new([
+                column_header(app, "NAME", &ColumnSortKey::Computed("NAME")),
+                column_header(app, "STATUS", &ColumnSortKey::Computed("STATUS")),
+                column_header(app, "AGE", &ColumnSortKey::Computed("AGE")),
+            ]))
+            .block(notice_block(
+                popup_block(&app.theme, &title)
+                    .style(app.theme.style("views.table", Style::default()))
+                    .title_alignment(Alignment::Center),
+                app,
+            )),
         area,
     );
 }
@@ -3538,20 +3608,31 @@ fn draw_contexts(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         })
         .collect::<Vec<_>>();
     let header = Row::new(columns.iter().map(|(column, _)| match column {
-        ContextColumn::Active => "",
-        ContextColumn::Name => "NAME",
-        ContextColumn::Cluster => "CLUSTER",
-        ContextColumn::User => "USER",
-        ContextColumn::Namespace => "NAMESPACE",
-    }))
-    .style(
-        app.theme
-            .style("views.table.header", Style::default().fg(YELLOW).bold()),
-    );
+        ContextColumn::Active => column_header(app, "", &ColumnSortKey::Computed("ACTIVE")),
+        ContextColumn::Name => column_header(app, "NAME", &ColumnSortKey::Computed("NAME")),
+        ContextColumn::Cluster => {
+            column_header(app, "CLUSTER", &ColumnSortKey::Computed("CLUSTER"))
+        }
+        ContextColumn::User => column_header(app, "USER", &ColumnSortKey::Computed("USER")),
+        ContextColumn::Namespace => {
+            column_header(app, "NAMESPACE", &ColumnSortKey::Computed("NAMESPACE"))
+        }
+    }));
     let constraints = columns
         .iter()
         .map(|(_, width)| Constraint::Length(*width))
         .collect::<Vec<_>>();
+    let sort_keys = columns
+        .iter()
+        .map(|(column, _)| match column {
+            ContextColumn::Active => Some(ColumnSortKey::Computed("ACTIVE")),
+            ContextColumn::Name => Some(ColumnSortKey::Computed("NAME")),
+            ContextColumn::Cluster => Some(ColumnSortKey::Computed("CLUSTER")),
+            ContextColumn::User => Some(ColumnSortKey::Computed("USER")),
+            ContextColumn::Namespace => Some(ColumnSortKey::Computed("NAMESPACE")),
+        })
+        .collect::<Vec<_>>();
+    update_overlay_column_hitboxes(app, area, &constraints, &sort_keys);
     record_chooser_rows(app, area, displayed);
     frame.render_widget(
         Table::new(rows, constraints)
@@ -4241,7 +4322,7 @@ fn port_forward_option_line(
     ])
 }
 
-fn draw_port_forwards(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_port_forwards(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let title = format!(" portforwards(all)[{}] ", app.port_forwards.len());
     let capacity = usize::from(area.height.saturating_sub(3)).max(1);
     let start = app
@@ -4282,43 +4363,49 @@ fn draw_port_forwards(frame: &mut Frame<'_>, app: &App, area: Rect) {
             } else {
                 app.theme.style("views.table", Style::default().fg(CYAN))
             })
-        });
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Percentage(18),
-            Constraint::Length(9),
-            Constraint::Percentage(30),
-            Constraint::Length(15),
-            Constraint::Percentage(20),
-            Constraint::Length(10),
-        ],
-    )
-    .header(
-        Row::new([
-            "NAMESPACE",
-            "KIND",
-            "NAME",
-            "LOCAL->REMOTE",
-            "ADDRESS",
-            "STATUS",
-        ])
-        .style(
-            app.theme
-                .style("views.table.header", Style::default().fg(YELLOW).bold()),
-        ),
-    )
-    .style(app.theme.style("views.table", Style::default()))
-    .column_spacing(1)
-    .block(notice_block(
-        popup_block(&app.theme, &title)
-            .style(app.theme.style("views.table", Style::default()))
-            .title_alignment(Alignment::Center)
-            .border_style(
-                Style::default().fg(app.theme.color("frame.border.fgColor", BODY_BORDER)),
+        })
+        .collect::<Vec<_>>();
+    let widths = [
+        Constraint::Percentage(18),
+        Constraint::Length(9),
+        Constraint::Percentage(30),
+        Constraint::Length(15),
+        Constraint::Percentage(20),
+        Constraint::Length(10),
+    ];
+    let sort_keys = [
+        Some(ColumnSortKey::Computed("NAMESPACE")),
+        Some(ColumnSortKey::Computed("KIND")),
+        Some(ColumnSortKey::Computed("NAME")),
+        Some(ColumnSortKey::Computed("LOCAL->REMOTE")),
+        Some(ColumnSortKey::Computed("ADDRESS")),
+        Some(ColumnSortKey::Computed("STATUS")),
+    ];
+    update_overlay_column_hitboxes(app, area, &widths, &sort_keys);
+    let table = Table::new(rows, widths)
+        .header(Row::new([
+            column_header(app, "NAMESPACE", &ColumnSortKey::Computed("NAMESPACE")),
+            column_header(app, "KIND", &ColumnSortKey::Computed("KIND")),
+            column_header(app, "NAME", &ColumnSortKey::Computed("NAME")),
+            column_header(
+                app,
+                "LOCAL->REMOTE",
+                &ColumnSortKey::Computed("LOCAL->REMOTE"),
             ),
-        app,
-    ));
+            column_header(app, "ADDRESS", &ColumnSortKey::Computed("ADDRESS")),
+            column_header(app, "STATUS", &ColumnSortKey::Computed("STATUS")),
+        ]))
+        .style(app.theme.style("views.table", Style::default()))
+        .column_spacing(1)
+        .block(notice_block(
+            popup_block(&app.theme, &title)
+                .style(app.theme.style("views.table", Style::default()))
+                .title_alignment(Alignment::Center)
+                .border_style(
+                    Style::default().fg(app.theme.color("frame.border.fgColor", BODY_BORDER)),
+                ),
+            app,
+        ));
     frame.render_widget(table, area);
 }
 

@@ -23,6 +23,7 @@ pub(super) fn action_hints(app: &App) -> Vec<super::HeaderHint> {
     hints
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let visible = app.visible_dump_indices();
     let delete_hint = if app.read_only {
@@ -54,6 +55,19 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         })
         .collect::<Vec<_>>();
     app.set_chooser_hitbox(inner.x, inner.y.saturating_add(2), inner.width, window);
+    let widths = [
+        Constraint::Fill(1),
+        Constraint::Fill(1),
+        Constraint::Length(13),
+        Constraint::Length(10),
+    ];
+    let sort_keys = [
+        Some(super::ColumnSortKey::Computed("NAME")),
+        Some(super::ColumnSortKey::Computed("DIR")),
+        Some(super::ColumnSortKey::Computed("SIZE")),
+        Some(super::ColumnSortKey::Computed("AGE")),
+    ];
+    super::update_overlay_column_hitboxes(app, area, &widths, &sort_keys);
     let mut state = TableState::default();
     state.select(
         visible
@@ -61,28 +75,25 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .position(|index| *index == app.overlay_selected)
             .map(|index| index.saturating_sub(start)),
     );
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Fill(1),
-            Constraint::Fill(1),
-            Constraint::Length(13),
-            Constraint::Length(10),
-        ],
-    )
-    .header(
-        Row::new(["NAME", "DIR", "SIZE", "AGE"])
+    let table = Table::new(rows, widths)
+        .header(
+            Row::new([
+                super::column_header(app, "NAME", &super::ColumnSortKey::Computed("NAME")),
+                super::column_header(app, "DIR", &super::ColumnSortKey::Computed("DIR")),
+                super::column_header(app, "SIZE", &super::ColumnSortKey::Computed("SIZE")),
+                super::column_header(app, "AGE", &super::ColumnSortKey::Computed("AGE")),
+            ])
             .style(
                 app.theme
                     .style("views.table.header", Style::default().fg(CYAN).bold()),
             )
             .bottom_margin(1),
-    )
-    .row_highlight_style(
-        app.theme
-            .table_cursor(Style::default().fg(Color::White).bg(super::SELECTED).bold()),
-    )
-    .block(block);
+        )
+        .row_highlight_style(
+            app.theme
+                .table_cursor(Style::default().fg(Color::White).bg(super::SELECTED).bold()),
+        )
+        .block(block);
     frame.render_stateful_widget(table, area, &mut state);
     if visible.is_empty() {
         frame.render_widget(

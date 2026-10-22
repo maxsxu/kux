@@ -489,7 +489,7 @@ pub(super) fn compare_workload_rows(
     primary.then_with(|| natural_compare(&left.key, &right.key))
 }
 
-fn natural_compare(left: &str, right: &str) -> Ordering {
+pub(crate) fn natural_compare(left: &str, right: &str) -> Ordering {
     let (mut left, mut right) = (left.as_bytes(), right.as_bytes());
     while let (Some(&a), Some(&b)) = (left.first(), right.first()) {
         let order = match (a.is_ascii_digit(), b.is_ascii_digit()) {
