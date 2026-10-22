@@ -2777,7 +2777,7 @@ fn metrics_resource(kind: &str, plural: &str) -> ApiResource {
 
 async fn node_pod_count_loop(
     client: Client,
-    streaming_lists: bool,
+    mut streaming_lists: bool,
     updates: mpsc::Sender<EnrichmentUpdate>,
 ) {
     let config = if streaming_lists {
@@ -2785,8 +2785,9 @@ async fn node_pod_count_loop(
     } else {
         watcher::Config::default().page_size(500)
     };
-    let stream = watcher::watcher(Api::<Pod>::all(client), config).default_backoff();
-    tokio::pin!(stream);
+    let mut stream = watcher::watcher(Api::<Pod>::all(client.clone()), config)
+        .default_backoff()
+        .boxed();
     let mut assignments: FxHashMap<Arc<str>, Arc<str>> = FxHashMap::default();
     let mut initializing: Option<FxHashMap<Arc<str>, Arc<str>>> = None;
     let mut dirty = false;
@@ -2819,7 +2820,17 @@ async fn node_pod_count_loop(
                     assignments.remove(&pod_key(&pod));
                     dirty = true;
                 }
-                Some(Err(_)) => {}
+                Some(Err(error)) => {
+                    if streaming_lists && is_streaming_list_unsupported(&error) {
+                        streaming_lists = false;
+                        stream = watcher::watcher(
+                            Api::<Pod>::all(client.clone()),
+                            watcher::Config::default().page_size(500),
+                        )
+                        .default_backoff()
+                        .boxed();
+                    }
+                }
                 None => return,
             },
             _ = ticker.tick(), if dirty && initializing.is_none() => {
@@ -3935,6 +3946,9 @@ impl TypedWatchState {
         if let Some(initializing) = &mut self.initializing {
             enrichment.apply_all(initializing);
         }
+        if let Some(fast) = &mut self.fast_initial_rows {
+            enrichment.apply_all(fast);
+        }
         self.dirty = true;
     }
 
@@ -3943,21 +3957,36 @@ impl TypedWatchState {
         snapshots: &watch::Sender<ResourceSnapshot>,
         request: &WatchRequest,
     ) {
-        self.revision = self.revision.wrapping_add(1);
         if let Some(initializing) = &self.initializing {
-            let mut visible = self.fast_initial_rows.clone().unwrap_or_default();
+            let mut visible = self
+                .fast_initial_rows
+                .clone()
+                .unwrap_or_else(|| self.rows.clone());
             overlay_typed_rows(&mut visible, initializing);
+            let state = if self.initial_load_complete {
+                SourceState::Ready
+            } else if visible.is_empty() {
+                self.dirty = false;
+                return;
+            } else {
+                let loaded = if initializing.is_empty() {
+                    visible.len()
+                } else {
+                    initializing.len()
+                };
+                SourceState::Loading { loaded }
+            };
+            self.revision = self.revision.wrapping_add(1);
             publish_table(
                 snapshots,
                 request,
                 &visible,
                 Arc::clone(&self.table_columns),
-                SourceState::Loading {
-                    loaded: initializing.len(),
-                },
+                state,
                 self.revision,
             );
         } else {
+            self.revision = self.revision.wrapping_add(1);
             publish_table(
                 snapshots,
                 request,
@@ -3982,7 +4011,7 @@ impl TypedWatchState {
         } else {
             self.fast_initial_rows
                 .as_ref()
-                .or(self.initializing.as_ref())
+                .or_else(|| self.initializing.as_ref().filter(|rows| !rows.is_empty()))
                 .unwrap_or(&self.rows)
         };
         publish_table(
@@ -4029,9 +4058,11 @@ async fn watch_api<K, F>(
     );
     let _enrichment_sender = enrichment_sender;
     let mut enrichment = EnrichmentState::default();
-    let watcher_config = resource_watcher_config(&settings, &request);
-    let stream = watcher::watcher(api, watcher_config).default_backoff();
-    tokio::pin!(stream);
+    let mut streaming_lists = settings.streaming_lists;
+    let watcher_config = resource_watcher_config(streaming_lists, &request);
+    let mut stream = watcher::watcher(api.clone(), watcher_config)
+        .default_backoff()
+        .boxed();
 
     let mut ticker = tokio::time::interval(settings.publish_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -4047,11 +4078,22 @@ async fn watch_api<K, F>(
                         &snapshots,
                         &request,
                     ),
-                    Some(Err(error)) => state.publish_error(
-                        &snapshots,
-                        &request,
-                        Arc::from(error.to_string()),
-                    ),
+                    Some(Err(error)) => {
+                        if streaming_lists && is_streaming_list_unsupported(&error) {
+                            streaming_lists = false;
+                            let watcher_config =
+                                resource_watcher_config(streaming_lists, &request);
+                            stream = watcher::watcher(api.clone(), watcher_config)
+                                .default_backoff()
+                                .boxed();
+                            continue;
+                        }
+                        state.publish_error(
+                            &snapshots,
+                            &request,
+                            Arc::from(error.to_string()),
+                        );
+                    }
                     None => {
                         state.publish_error(
                             &snapshots,
@@ -4089,11 +4131,8 @@ fn overlay_typed_rows(
     }
 }
 
-fn resource_watcher_config(
-    settings: &KubernetesSettings,
-    request: &WatchRequest,
-) -> watcher::Config {
-    let mut config = if settings.streaming_lists && request.kind.known_kind().is_some() {
+fn resource_watcher_config(streaming_lists: bool, request: &WatchRequest) -> watcher::Config {
+    let mut config = if streaming_lists && request.kind.known_kind().is_some() {
         watcher::Config::default().streaming_lists()
     } else {
         watcher::Config::default().page_size(500)
@@ -4105,6 +4144,11 @@ fn resource_watcher_config(
         config = config.labels(selector);
     }
     config
+}
+
+fn is_streaming_list_unsupported(error: &watcher::Error) -> bool {
+    let message = error.to_string();
+    message.contains("sendInitialEvents") || message.contains("WatchList")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8454,6 +8498,70 @@ mod tests {
         );
         assert_eq!(snapshot.state, SourceState::Loading { loaded: 1 });
         assert_eq!(snapshot.revision, 2);
+    }
+
+    #[test]
+    fn typed_watch_preserves_ready_rows_across_reinit_and_enrichment() {
+        let kind: ResourceDescriptor = ResourceKind::Nodes.into();
+        let request = WatchRequest {
+            instance: None,
+            generation: 9,
+            context: "demo".to_owned(),
+            kind: kind.clone(),
+            namespace: None,
+            field_selector: None,
+            label_selector: None,
+        };
+        let (snapshots, receiver) = watch::channel(ResourceSnapshot::loading(9, kind));
+        let mut state = TypedWatchState::default();
+        let enrichment = EnrichmentState::default();
+
+        let make_node = |name: &str| {
+            let mut node = Node::default();
+            node.metadata.name = Some(name.to_owned());
+            node
+        };
+
+        state.apply_event(
+            watcher::Event::Init,
+            node_row,
+            &enrichment,
+            &snapshots,
+            &request,
+        );
+        state.apply_event(
+            watcher::Event::InitApply(make_node("worker-0")),
+            node_row,
+            &enrichment,
+            &snapshots,
+            &request,
+        );
+        state.apply_event(
+            watcher::Event::InitDone,
+            node_row,
+            &enrichment,
+            &snapshots,
+            &request,
+        );
+        assert_eq!(receiver.borrow().rows.len(), 1);
+        assert_eq!(receiver.borrow().state, SourceState::Ready);
+
+        // Watcher restarts (e.g. watch timeout or relist): Init followed by an enrichment tick
+        // before InitApply/InitDone must NOT publish an empty "No resources found" snapshot.
+        state.apply_event(
+            watcher::Event::Init,
+            node_row,
+            &enrichment,
+            &snapshots,
+            &request,
+        );
+        state.apply_enrichment(&enrichment);
+        state.publish_ready(&snapshots, &request);
+
+        let snapshot = receiver.borrow();
+        assert_eq!(snapshot.rows.len(), 1);
+        assert_eq!(snapshot.rows[0].name.as_ref(), "worker-0");
+        assert_eq!(snapshot.state, SourceState::Ready);
     }
 
     #[test]
