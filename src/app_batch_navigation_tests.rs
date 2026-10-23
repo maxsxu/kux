@@ -130,6 +130,10 @@ fn cronjob_and_job_enter_read_selected_resource_then_open_exact_child_scope() {
             AppCommand::Request(original)
         );
         assert_eq!(
+            app.query, "selected",
+            "parent filter should be restored when returning from child view"
+        );
+        assert_eq!(
             app.handle_key(key(KeyCode::Char(']'))),
             AppCommand::Request(view)
         );

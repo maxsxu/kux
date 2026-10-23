@@ -5,8 +5,8 @@ use std::{
 };
 
 use super::{
-    ActionIntent, App, AppCommand, InputMode, Overlay, ResourceDescriptor, ResourceKind,
-    ResourceTarget, SortField, UiFlags, ViewState,
+    ActionIntent, App, AppCommand, ColumnSortKey, FilterMatcher, InputMode, Overlay,
+    ResourceDescriptor, ResourceKind, ResourceTarget, SortField, UiFlags, ViewState,
 };
 use crate::model::{ResourceOperations, ResourceRow, ResourceSnapshot, SourceState};
 use crate::source::BatchNavigationFilter;
@@ -26,6 +26,7 @@ struct WorkloadHistory {
     query: String,
     sort: SortField,
     descending: bool,
+    column_sort_override: Option<ColumnSortKey>,
     selected: Option<Arc<str>>,
     marks: HashSet<Arc<str>>,
     mark_anchor: Option<usize>,
@@ -125,7 +126,7 @@ impl App {
     }
 
     pub(super) fn save_workloads_history(&mut self) {
-        if !self.kind.is_workloads() || !self.is_resource_view() {
+        if !self.is_resource_view() {
             return;
         }
         self.navigation.workload_history.insert(
@@ -136,6 +137,7 @@ impl App {
                 query: self.query.clone(),
                 sort: self.sort_field,
                 descending: self.sort_descending,
+                column_sort_override: self.column_sort_override.clone(),
                 selected: self.selected_row().map(|row| Arc::clone(&row.key)),
                 marks: self.marks.clone(),
                 mark_anchor: self.mark_anchor,
@@ -168,8 +170,10 @@ impl App {
         self.snapshot = saved.snapshot;
         self.snapshot.generation = self.generation;
         self.query = saved.query;
+        self.filter_error = FilterMatcher::new(&self.query).error().map(str::to_owned);
         self.sort_field = saved.sort;
         self.sort_descending = saved.descending;
+        self.column_sort_override = saved.column_sort_override;
         self.marks = saved.marks;
         self.mark_anchor = saved.mark_anchor;
         self.selected_column = saved.selected_column;
@@ -190,7 +194,7 @@ impl App {
         snapshot: &ResourceSnapshot,
     ) -> Option<Arc<str>> {
         let (generation, key) = self.navigation.restored_selection.as_ref()?;
-        if *generation != snapshot.generation || !snapshot.kind.is_workloads() {
+        if *generation != snapshot.generation {
             self.navigation.restored_selection = None;
             return None;
         }
@@ -645,6 +649,10 @@ mod tests {
             assert_eq!(
                 app.handle_key(key(KeyCode::Esc)),
                 AppCommand::Request(original)
+            );
+            assert_eq!(
+                app.query, "api",
+                "parent filter should be restored when returning from child view"
             );
             assert_eq!(
                 app.handle_key(key(KeyCode::Char(']'))),

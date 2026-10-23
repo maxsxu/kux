@@ -1823,13 +1823,10 @@ impl App {
             {
                 self.open_deployment_replica_sets()
             }
-            KeyCode::Char('c')
-                if self.is_resource_view() && known_kind == Some(ResourceKind::Nodes) =>
-            {
-                self.open_node_cordon_confirmation(true)
-            }
             KeyCode::Char('c') => self.copy_name(),
-            KeyCode::Char('n') => self.copy_namespace(),
+            KeyCode::Char('n') if self.is_resource_view() && self.kind.is_namespaced() => {
+                self.copy_namespace()
+            }
             KeyCode::Char('y') if self.is_resource_view() => self.content_action(ContentKind::Yaml),
             KeyCode::Char('d') if self.is_resource_view() => {
                 self.content_action(ContentKind::Describe)
@@ -2715,6 +2712,14 @@ impl App {
         match key.code {
             KeyCode::Char('y') => self.namespace_content_action(&visible),
             KeyCode::Char('e') => self.namespace_edit_action(&visible),
+            KeyCode::Char('c') => visible
+                .iter()
+                .copied()
+                .find(|index| *index == self.overlay_selected)
+                .and_then(|index| self.namespace_options.get(index))
+                .map_or(AppCommand::None, |namespace| {
+                    AppCommand::Copy(namespace.name.clone())
+                }),
             KeyCode::Char('u') => {
                 let Some(index) = visible
                     .iter()
@@ -4353,6 +4358,8 @@ impl App {
         let resource_kind_changed = self.kind != view.kind
             || ((self.kind.is_dir() || self.kind.is_xray())
                 && self.field_selector != view.field_selector);
+        let scope_selector_changed = self.field_selector != view.field_selector
+            || self.label_selector != view.label_selector;
         if push_history && self.current_view() != view {
             self.save_workloads_history();
             self.truncate_workloads_history();
@@ -4420,7 +4427,7 @@ impl App {
         self.details_row = None;
         self.log_view = None;
         self.body_query.clear();
-        if resource_kind_changed {
+        if resource_kind_changed || scope_selector_changed {
             self.query.clear();
             self.filter_error = None;
         }
@@ -5354,7 +5361,6 @@ impl App {
             };
             let namespace = (!matches!(name.as_str(), "all" | "<all>")).then_some(name);
             self.use_active_namespace(namespace.clone());
-            self.query.clear();
             return self.request_view(
                 ViewState {
                     instance: None,
@@ -5381,7 +5387,6 @@ impl App {
                 let Some(node) = self.selected_row().map(|row| row.name.to_string()) else {
                     return AppCommand::None;
                 };
-                self.query.clear();
                 self.request_view(
                     ViewState {
                         instance: None,
@@ -6378,28 +6383,6 @@ impl App {
         self.pending_delete = Some(PendingDelete::NodeScheduling {
             names,
             unschedulable: !currently_unschedulable,
-        });
-        self.confirm_armed = false;
-        self.notice = None;
-        self.overlay = Overlay::ConfirmDelete;
-        AppCommand::None
-    }
-
-    fn open_node_cordon_confirmation(&mut self, unschedulable: bool) -> AppCommand {
-        if self.read_only {
-            return self.unsupported("Cordon/uncordon is disabled in read-only mode");
-        }
-        let names = self
-            .selected_or_marked_targets()
-            .into_iter()
-            .map(|target| target.name)
-            .collect::<Vec<_>>();
-        if names.is_empty() {
-            return AppCommand::None;
-        }
-        self.pending_delete = Some(PendingDelete::NodeScheduling {
-            names,
-            unschedulable,
         });
         self.confirm_armed = false;
         self.notice = None;
@@ -11166,7 +11149,7 @@ mod tests {
         assert_eq!(app.port_forwards[0].address, "127.0.0.1");
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
-        // Node `c` explicit Cordon (single and multi-node batch)
+        // Node `u` Cordon/Uncordon (single and multi-node batch) and `c` Copy Name
         let node_row = ResourceRow::new("-", "node-1", "Ready", "worker", "v1.32.0", 0)
             .with_node_data(crate::model::NodeData::default());
         let node_row2 = ResourceRow::new("-", "node-2", "Ready", "worker", "v1.32.0", 0)
@@ -11181,7 +11164,11 @@ mod tests {
             revision: 1,
             emitted_at: Instant::now(),
         });
-        node_app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert_eq!(
+            node_app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            AppCommand::Copy("node-1".to_owned())
+        );
+        node_app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
         assert_eq!(
             node_app.pending_delete,
             Some(PendingDelete::NodeScheduling {
@@ -11193,7 +11180,7 @@ mod tests {
         node_app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         node_app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         node_app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
-        node_app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        node_app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
         assert_eq!(
             node_app.pending_delete,
             Some(PendingDelete::NodeScheduling {

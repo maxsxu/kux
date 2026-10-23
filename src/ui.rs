@@ -691,6 +691,7 @@ fn action_hints(app: &App) -> Vec<HeaderHint> {
                 action_hint("enter", "Switch"),
                 action_hint("u", "Use"),
                 action_hint("y", "YAML"),
+                action_hint("c", "Copy Name"),
                 action_hint("j/k", "Move"),
                 action_hint("esc", "Back"),
             ]);
@@ -962,10 +963,11 @@ fn resource_action_hints(app: &App) -> Vec<HeaderHint> {
         action_hint("y", "YAML"),
         action_hint("d", "Describe"),
         action_hint("c", "Copy Name"),
-        action_hint("n", "Copy Namespace"),
-        action_hint("?", "Help"),
-        action_hint("ctrl-r", "Refresh"),
     ];
+    if app.kind.is_namespaced() {
+        hints.push(action_hint("n", "Copy Namespace"));
+    }
+    hints.extend([action_hint("?", "Help"), action_hint("ctrl-r", "Refresh")]);
     if app.kind.is_workloads() {
         hints.extend([
             action_hint("shift-k", "Sort Kind"),
@@ -1151,7 +1153,6 @@ fn append_mutation_action_hints(hints: &mut Vec<HeaderHint>, app: &App) {
         if app.user_config.node_shell_enabled(&app.context) {
             hints.push(action_hint("s", "Shell"));
         }
-        hints.push(action_hint("c", "Cordon"));
         let scheduling_action = if app
             .selected_row()
             .and_then(crate::model::ResourceRow::node_data)
@@ -6236,6 +6237,11 @@ mod tests {
                 .iter()
                 .any(|hint| hint.key == "y" && hint.label == "YAML")
         );
+        assert!(
+            action_hints(&app)
+                .iter()
+                .any(|hint| hint.key == "c" && hint.label == "Copy Name")
+        );
     }
 
     #[test]
@@ -6255,10 +6261,15 @@ mod tests {
         let mut app = app_with_rendered_pod();
         app.kind = ResourceKind::Nodes.into();
 
+        let hints = action_hints(&app);
         assert!(
-            action_hints(&app)
+            hints
                 .iter()
                 .any(|hint| hint.key == "shift-j" && hint.label == "Owner")
+        );
+        assert!(
+            hints.iter().all(|hint| hint.key != "n"),
+            "cluster-scoped resources should not advertise <n> Copy Namespace"
         );
     }
 
@@ -6977,7 +6988,7 @@ mod tests {
         assert!(
             rendered_lines(&terminal, 100)
                 .join("\n")
-                .contains("nodes(all)[0]")
+                .contains("nodes(all)[1]")
         );
     }
 
