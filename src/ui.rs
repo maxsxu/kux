@@ -1945,7 +1945,6 @@ fn node_columns(app: &App, wide: bool) -> Vec<ViewColumn> {
             Constraint::Length(status_width),
             0,
         ),
-        view_column("ROLE", SortField::Ready, Constraint::Length(16), 54),
         plain_view_column("ARCH", Constraint::Length(13), 80),
         view_column("TAINTS", SortField::Taints, Constraint::Length(8), 70),
         view_column("VERSION", SortField::Version, Constraint::Length(22), 88),
@@ -7167,11 +7166,12 @@ mod tests {
             .expect("draw node columns");
         let rendered = rendered_lines(&terminal, 220).join("\n");
         for header in [
-            "NAME", "STATUS", "ROLE", "ARCH", "TAINTS", "VERSION", "PODS", "CPU", "MEM", "%CPU",
-            "%MEM", "CPU/A", "MEM/A", "AGE",
+            "NAME", "STATUS", "ARCH", "TAINTS", "VERSION", "PODS", "CPU", "MEM", "%CPU", "%MEM",
+            "CPU/A", "MEM/A", "AGE",
         ] {
             assert!(rendered.contains(header), "missing node column {header}");
         }
+        assert!(!rendered.contains("ROLE"));
         assert!(rendered.contains("gke-api-us-central1-pool-node-abcdef01-xyz9"));
         assert!(rendered.contains("NotReady,Unschedulable"));
         let header = rendered
@@ -7179,11 +7179,11 @@ mod tests {
             .find(|line| line.contains("STATUS") && line.contains("TAINTS"))
             .expect("node table header");
         let status_start = header.find("STATUS").expect("status column");
-        let role_start = header.find("ROLE").expect("role column");
+        let arch_start = header.find("ARCH").expect("arch column");
         let taints_start = header.find("TAINTS").expect("taints column");
         let version_start = header.find("VERSION").expect("version column");
         assert_eq!(
-            role_start - status_start,
+            arch_start - status_start,
             "NotReady,Unschedulable".chars().count() + 1
         );
         assert_eq!(version_start - taints_start, 9);
