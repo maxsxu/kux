@@ -113,8 +113,8 @@ fn workload_columns_preserve_pinned_order_scope_and_wide_export() {
                 labels,
                 ["KIND", "NAMESPACE", "NAME", "STATUS", "READY", "AGE"]
             );
-            assert_eq!(columns[1].field, Some(SortField::Kind));
-            assert_eq!(columns[2].field, Some(SortField::Namespace));
+            assert_eq!(columns[0].field, Some(SortField::Kind));
+            assert_eq!(columns[1].field, Some(SortField::Namespace));
             assert!(columns.last().unwrap().table_age);
         }
         let mut csv = Vec::new();
@@ -228,17 +228,14 @@ fn degraded_workload_cells_use_pending_color_without_hiding_selection_or_marks()
         .unwrap();
     for token in ["apps/v1/deployments", "team-a", "same", "DEGRADED", "1/2"] {
         let column = rendered[row_index].find(token).unwrap();
-        assert_eq!(
-            terminal.backend().buffer()[(
-                u16::try_from(column).unwrap(),
-                u16::try_from(row_index).unwrap(),
-            )]
-                .fg,
-            YELLOW,
-            "{token}"
-        );
+        let cell = &terminal.backend().buffer()[(
+            u16::try_from(column).unwrap(),
+            u16::try_from(row_index).unwrap(),
+        )];
+        assert_eq!(cell.fg, YELLOW, "{token}");
+        assert_eq!(cell.bg, MARKED_BG, "{token} marked background");
     }
-    assert!(rendered[row_index].contains('●'));
+    assert!(!rendered[row_index].contains('●'));
 }
 
 #[test]

@@ -57,6 +57,8 @@ const ORANGE: Color = Color::Rgb(255, 184, 108);
 const PINK: Color = Color::Rgb(255, 121, 198);
 const MUTED: Color = Color::Rgb(98, 114, 164);
 const SELECTED: Color = Color::Rgb(68, 71, 90);
+const MARKED_BG: Color = Color::Rgb(58, 86, 120);
+const MARKED_SELECTED_BG: Color = Color::Rgb(78, 108, 148);
 const ROW_ALT: Color = Color::Rgb(44, 47, 62);
 const BODY_BORDER: Color = Color::Rgb(82, 104, 158);
 const HEADER_MENU_ROWS: usize = 6;
@@ -1288,17 +1290,7 @@ fn columns_for_view_options(app: &App, width: u16, include_hidden: bool) -> Vec<
         ];
     }
     let scrollable_resources = is_scrollable_resource_list(app);
-    let mut columns = vec![ViewColumn {
-        label: String::new(),
-        field: None,
-        computed_key: None,
-        table_index: None,
-        json_path: None,
-        table_age: false,
-        kubectl_age: false,
-        width: Constraint::Length(2),
-        visible_from: 0,
-    }];
+    let mut columns = Vec::new();
     let show_namespace = app.is_resource_view()
         && app.kind.is_namespaced()
         && !app.kind.is_workloads()
@@ -1945,7 +1937,6 @@ fn node_columns(app: &App, wide: bool) -> Vec<ViewColumn> {
             Constraint::Length(status_width),
             0,
         ),
-        plain_view_column("ARCH", Constraint::Length(13), 80),
         view_column("TAINTS", SortField::Taints, Constraint::Length(8), 70),
         view_column("VERSION", SortField::Version, Constraint::Length(22), 88),
     ];
@@ -2045,7 +2036,7 @@ fn draw_resources(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let rows = app.visible_rows().map(|(position, item)| {
         let selected = position == app.selected;
         let marked = app.marks.contains(&item.key);
-        let style = resource_row_style(&app.theme, position, selected);
+        let style = resource_row_style(&app.theme, position, selected, marked);
         let cells = columns.iter().map(|column| {
             resource_cell(
                 &app.theme,
@@ -2236,21 +2227,19 @@ fn resource_cell(
     };
 
     let cell = highlighted_cell(skin, value.clone(), filter_matcher);
-    if !selected
-        && matches!(row.data, crate::model::ResourceData::Workload { .. })
-        && row.status.as_ref() == "DEGRADED"
-    {
-        return cell.style(skin.foreground(
-            "frame.status.pendingColor",
-            skin.style("views.table", Style::default().fg(YELLOW)),
-        ));
-    }
     if selected {
         return cell;
     }
-    if let Some(field) = column.field {
+    let mut style = if matches!(row.data, crate::model::ResourceData::Workload { .. })
+        && row.status.as_ref() == "DEGRADED"
+    {
+        skin.foreground(
+            "frame.status.pendingColor",
+            skin.style("views.table", Style::default().fg(YELLOW)),
+        )
+    } else if let Some(field) = column.field {
         if is_policy_verb(field) {
-            cell.style(if policy_verb_allowed(row, field) {
+            if policy_verb_allowed(row, field) {
                 skin.foreground(
                     "frame.status.addColor",
                     skin.style("views.table", Style::default().fg(GREEN)),
@@ -2260,20 +2249,17 @@ fn resource_cell(
                     "frame.status.pendingColor",
                     skin.style("views.table", Style::default().fg(ORANGE)),
                 )
-            })
+            }
         } else {
-            cell.style(resource_value_style(
-                skin,
-                field,
-                row,
-                &value,
-                now_unix,
-                &settings.thresholds,
-            ))
+            resource_value_style(skin, field, row, &value, now_unix, &settings.thresholds)
         }
     } else {
-        cell.style(non_field_column_style(skin, column, row, &value, now_unix))
+        non_field_column_style(skin, column, row, &value, now_unix)
+    };
+    if marked {
+        style.bg = None;
     }
+    cell.style(style)
 }
 
 fn filter_match_style(skin: &Skin) -> Style {
@@ -2335,7 +2321,17 @@ fn highlight_line_matches(
     Line::from(highlighted)
 }
 
-fn resource_row_style(skin: &Skin, position: usize, selected: bool) -> Style {
+fn resource_row_style(skin: &Skin, position: usize, selected: bool, marked: bool) -> Style {
+    if selected && marked {
+        return skin
+            .table_cursor(
+                skin.style("views.table", Style::default())
+                    .fg(Color::White)
+                    .bg(SELECTED)
+                    .bold(),
+            )
+            .bg(MARKED_SELECTED_BG);
+    }
     if selected {
         return skin.table_cursor(
             skin.style("views.table", Style::default())
@@ -2343,6 +2339,12 @@ fn resource_row_style(skin: &Skin, position: usize, selected: bool) -> Style {
                 .bg(SELECTED)
                 .bold(),
         );
+    }
+    if marked {
+        return skin
+            .style("views.table", Style::default())
+            .bg(MARKED_BG)
+            .bold();
     }
     if position % 2 == 1 {
         skin.style("views.table", Style::default().bg(ROW_ALT))
@@ -7166,12 +7168,13 @@ mod tests {
             .expect("draw node columns");
         let rendered = rendered_lines(&terminal, 220).join("\n");
         for header in [
-            "NAME", "STATUS", "ARCH", "TAINTS", "VERSION", "PODS", "CPU", "MEM", "%CPU", "%MEM",
-            "CPU/A", "MEM/A", "AGE",
+            "NAME", "STATUS", "TAINTS", "VERSION", "PODS", "CPU", "MEM", "%CPU", "%MEM", "CPU/A",
+            "MEM/A", "AGE",
         ] {
             assert!(rendered.contains(header), "missing node column {header}");
         }
         assert!(!rendered.contains("ROLE"));
+        assert!(!rendered.contains("ARCH"));
         assert!(rendered.contains("gke-api-us-central1-pool-node-abcdef01-xyz9"));
         assert!(rendered.contains("NotReady,Unschedulable"));
         let header = rendered
@@ -7179,11 +7182,10 @@ mod tests {
             .find(|line| line.contains("STATUS") && line.contains("TAINTS"))
             .expect("node table header");
         let status_start = header.find("STATUS").expect("status column");
-        let arch_start = header.find("ARCH").expect("arch column");
         let taints_start = header.find("TAINTS").expect("taints column");
         let version_start = header.find("VERSION").expect("version column");
         assert_eq!(
-            arch_start - status_start,
+            taints_start - status_start,
             "NotReady,Unschedulable".chars().count() + 1
         );
         assert_eq!(version_start - taints_start, 9);
@@ -7989,15 +7991,28 @@ mod tests {
 
     #[test]
     fn resource_rows_use_subtle_banding_without_overriding_selection() {
-        assert_eq!(resource_row_style(&Skin::default(), 0, false).bg, None);
         assert_eq!(
-            resource_row_style(&Skin::default(), 1, false).bg,
+            resource_row_style(&Skin::default(), 0, false, false).bg,
+            None
+        );
+        assert_eq!(
+            resource_row_style(&Skin::default(), 1, false, false).bg,
             Some(ROW_ALT)
         );
         assert_eq!(
-            resource_row_style(&Skin::default(), 1, true).bg,
+            resource_row_style(&Skin::default(), 1, true, false).bg,
             Some(SELECTED),
             "selection remains the strongest row treatment"
+        );
+        assert_eq!(
+            resource_row_style(&Skin::default(), 0, false, true).bg,
+            Some(MARKED_BG),
+            "marked rows use highlight background"
+        );
+        assert_eq!(
+            resource_row_style(&Skin::default(), 0, true, true).bg,
+            Some(MARKED_SELECTED_BG),
+            "marked and selected rows use combined highlight background"
         );
     }
 

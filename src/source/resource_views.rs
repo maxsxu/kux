@@ -582,7 +582,8 @@ async fn load_workload_kind(
             .list(&params)
             .map_err(|error| error.to_string())?;
         let value = read_api(
-            client.request::<serde_json::Value>(table_request(raw)?),
+            client
+                .request::<serde_json::Value>(super::table_request_with_include(raw, "Metadata")?),
             timeout,
             &format!("list {} for workloads", kind.qualified_name()),
         )

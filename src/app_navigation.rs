@@ -126,6 +126,7 @@ impl App {
     }
 
     pub(super) fn save_workloads_history(&mut self) {
+        const MAX_SAVED_HISTORY_SNAPSHOTS: usize = 8;
         if !self.is_resource_view() {
             return;
         }
@@ -147,6 +148,12 @@ impl App {
                 faults: self.ui.faults(),
             },
         );
+        while self.navigation.workload_history.len() > MAX_SAVED_HISTORY_SNAPSHOTS {
+            let Some((&oldest, _)) = self.navigation.workload_history.iter().next() else {
+                break;
+            };
+            self.navigation.workload_history.remove(&oldest);
+        }
     }
 
     pub(super) fn truncate_workloads_history(&mut self) {

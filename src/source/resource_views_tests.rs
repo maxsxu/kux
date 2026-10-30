@@ -371,7 +371,7 @@ async fn workload_aggregate_reads_six_real_tables_and_keeps_same_named_resources
     let (client, mut paths, server) = fixture(|path, raw| {
         assert!(raw.contains("as=Table"));
         assert!(path.contains("labelSelector=app%3Dfixture"));
-        assert!(path.contains("includeObject=Object"));
+        assert!(path.contains("includeObject=Metadata"));
         assert!(path.contains("/namespaces/target/"));
         Reply::Json(200, table(&kind_for_path(path), "same"))
     })

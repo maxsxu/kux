@@ -102,7 +102,7 @@ def singleton_and_mixed_marks(session):
     table = export_csv(session, 'one-of-each-kind')
     check(len(table) == 7 and set(row[0] for row in table[1:]) == KINDS, 'filter keeps one of each kind')
     session.send('g j ')
-    check(session.screen.text().count('●') == 2, 'two differently typed rows are marked')
+    check('Delete (2)' in session.screen.text(), 'two differently typed rows are marked')
     session.send(b'\x04')
     check('Delete all 2 selected resources?' in session.screen.text(), 'mixed delete confirmation uses resource label')
     session.save('mixed-delete-canceled')
@@ -119,7 +119,7 @@ def singleton_and_mixed_marks(session):
     session.save('singleton')
     session.send('\x1b', 0.3)
     text = session.wait(lambda text: 'workloads(all)[6]' in text and '/0000000' in text, 'aggregate return state')
-    check(text.count('●') == 2, 'marks restored after singleton return')
+    check('Delete (2)' in text, 'marks restored after singleton return')
     returned = export_csv(session, 'restored-filter-and-order')
     check([row[:5] for row in returned] == [row[:5] for row in table], 'filter and row order restored')
 

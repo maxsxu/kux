@@ -2472,8 +2472,9 @@ async fn list_pod_pages<F>(
         let Ok(page) = api.list(&params).await else {
             return;
         };
-        for pod in &page.items {
-            let row = Arc::new(pod_row(pod));
+        for mut pod in page.items {
+            strip_resource_meta(&mut pod);
+            let row = Arc::new(pod_row(&pod));
             rows.insert(Arc::clone(&row.key), row);
         }
         on_page(&rows);
@@ -3887,6 +3888,7 @@ impl TypedWatchState {
         snapshots: &watch::Sender<ResourceSnapshot>,
         request: &WatchRequest,
     ) where
+        K: Resource,
         F: Fn(&K) -> ResourceRow,
     {
         match event {
@@ -3894,7 +3896,8 @@ impl TypedWatchState {
                 self.initializing = Some(FxHashMap::default());
                 self.initial_progress = InitialListProgress::default();
             }
-            watcher::Event::InitApply(object) => {
+            watcher::Event::InitApply(mut object) => {
+                strip_resource_meta(&mut object);
                 let mut row = map_row(&object);
                 enrichment.apply(&mut row);
                 apply_initial_row(
@@ -3910,7 +3913,9 @@ impl TypedWatchState {
                 self.dirty = true;
             }
             watcher::Event::InitDone => {
-                if let Some(initial) = self.initializing.take() {
+                if let Some(initial) = self.initializing.take()
+                    && (!initial.is_empty() || self.rows.is_empty())
+                {
                     self.rows = initial;
                 }
                 self.initial_load_complete = true;
@@ -3926,7 +3931,8 @@ impl TypedWatchState {
                 );
                 self.dirty = false;
             }
-            watcher::Event::Apply(object) => {
+            watcher::Event::Apply(mut object) => {
+                strip_resource_meta(&mut object);
                 let mut row = map_row(&object);
                 enrichment.apply(&mut row);
                 let row = Arc::new(row);
@@ -4036,16 +4042,19 @@ async fn watch_api<K, F>(
     K: Clone + Resource + DeserializeOwned + Debug + Send + 'static,
     F: Fn(&K) -> ResourceRow + Copy + Send + 'static,
 {
-    let (mut fast_initial_updates, _fast_initial_task) =
+    let (mut fast_initial_updates, fast_initial_task) =
         spawn_fast_initial_list(client.clone(), &request);
+    let mut fast_initial_task = Some(fast_initial_task);
     let mut state = TypedWatchState::new(typed_table_columns(&request.kind));
     let mut fast_initial_finished = false;
     if let Ok(update) =
         tokio::time::timeout(FAST_INITIAL_LIST_HEAD_START, fast_initial_updates.recv()).await
     {
-        match update {
-            Some(update) => state.apply_fast_initial(update, &snapshots, &request),
-            None => fast_initial_finished = true,
+        if let Some(update) = update {
+            state.apply_fast_initial(update, &snapshots, &request);
+        } else {
+            fast_initial_finished = true;
+            drop(fast_initial_task.take());
         }
     }
 
@@ -4071,13 +4080,19 @@ async fn watch_api<K, F>(
         tokio::select! {
             event = stream.next() => {
                 match event {
-                    Some(Ok(event)) => state.apply_event(
-                        event,
-                        map_row,
-                        &enrichment,
-                        &snapshots,
-                        &request,
-                    ),
+                    Some(Ok(event)) => {
+                        state.apply_event(
+                            event,
+                            map_row,
+                            &enrichment,
+                            &snapshots,
+                            &request,
+                        );
+                        if state.initial_load_complete && !fast_initial_finished {
+                            fast_initial_finished = true;
+                            drop(fast_initial_task.take());
+                        }
+                    }
                     Some(Err(error)) => {
                         if streaming_lists && is_streaming_list_unsupported(&error) {
                             streaming_lists = false;
@@ -4105,9 +4120,11 @@ async fn watch_api<K, F>(
                 }
             }
             update = fast_initial_updates.recv(), if !fast_initial_finished => {
-                match update {
-                    Some(update) => state.apply_fast_initial(update, &snapshots, &request),
-                    None => fast_initial_finished = true,
+                if let Some(update) = update {
+                    state.apply_fast_initial(update, &snapshots, &request);
+                } else {
+                    fast_initial_finished = true;
+                    drop(fast_initial_task.take());
                 }
             }
             Some(update) = enrichment_updates.recv() => {
@@ -4729,11 +4746,20 @@ fn decode_server_table(table: ServerTable, previous_columns: &[TableColumn]) -> 
     }
 }
 
-fn server_table_row(row: ServerTableRow, columns: &[TableColumn]) -> ResourceRow {
-    let raw_value = row.object.clone();
-    let object = row
+fn server_table_row(mut row: ServerTableRow, columns: &[TableColumn]) -> ResourceRow {
+    if let Some(raw_value) = row.object.as_mut() {
+        strip_heavy_json_fields(raw_value);
+    }
+    let metadata = row
         .object
-        .and_then(|object| serde_json::from_value::<DynamicObject>(object).ok());
+        .as_ref()
+        .and_then(|object| object.get("metadata"))
+        .and_then(|meta| {
+            serde_json::from_value::<k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta>(
+                meta.clone(),
+            )
+            .ok()
+        });
     let cells: Vec<TableCell> = row
         .cells
         .iter()
@@ -4747,14 +4773,14 @@ fn server_table_row(row: ServerTableRow, columns: &[TableColumn]) -> ResourceRow
             .and_then(|index| cells.get(index))
             .map(|cell| cell.text.to_string())
     };
-    let namespace = object
+    let namespace = metadata
         .as_ref()
-        .and_then(ResourceExt::namespace)
+        .and_then(|meta| meta.namespace.clone())
         .or_else(|| column_text("namespace"))
         .unwrap_or_else(|| "-".to_owned());
-    let name = object
+    let name = metadata
         .as_ref()
-        .map(ResourceExt::name_any)
+        .and_then(|meta| meta.name.clone())
         .filter(|name| !name.is_empty())
         .or_else(|| column_text("name"))
         .unwrap_or_else(|| "<unknown>".to_owned());
@@ -4774,15 +4800,15 @@ fn server_table_row(row: ServerTableRow, columns: &[TableColumn]) -> ResourceRow
         .or_else(|| column_text("volume"))
         .or_else(|| column_text("data"))
         .unwrap_or_else(|| "-".to_owned());
-    let created_unix = object
+    let created_unix = metadata
         .as_ref()
-        .and_then(|object| object.meta().creation_timestamp.as_ref())
+        .and_then(|meta| meta.creation_timestamp.as_ref())
         .map(|time| time.0.as_second())
         .or_else(|| cells.iter().find_map(|cell| cell.timestamp_unix))
         .unwrap_or(0);
-    let labels = object
+    let labels = metadata
         .as_ref()
-        .and_then(|object| object.meta().labels.as_ref())
+        .and_then(|meta| meta.labels.as_ref())
         .map(|labels| {
             labels
                 .iter()
@@ -4791,9 +4817,8 @@ fn server_table_row(row: ServerTableRow, columns: &[TableColumn]) -> ResourceRow
                 .join(",")
         })
         .unwrap_or_default();
-    let owner = object
-        .as_ref()
-        .and_then(|object| owner_reference_data(object.meta()));
+    let owner = metadata.as_ref().and_then(owner_reference_data);
+    let raw_value = row.object.take();
     let row = ResourceRow::new(namespace, name, status, ready, details, created_unix)
         .with_labels(labels)
         .with_table_cells(cells);
@@ -4801,8 +4826,8 @@ fn server_table_row(row: ServerTableRow, columns: &[TableColumn]) -> ResourceRow
         Some(owner) => row.with_owner_reference_data(owner),
         None => row,
     };
-    if let Some(object) = object.as_ref() {
-        row.owner_names = owner_reference_names(object.meta());
+    if let Some(meta) = metadata.as_ref() {
+        row.owner_names = owner_reference_names(meta);
     }
     if let Some(raw_value) = raw_value {
         row = row.with_raw_object(raw_value);
@@ -5504,7 +5529,6 @@ fn service_row(service: &Service) -> ResourceRow {
     let ports_count = spec
         .and_then(|spec| spec.ports.as_ref())
         .map_or(0, Vec::len);
-    let raw_value = serde_json::to_value(service).ok();
     let mut row = resource_row(
         service,
         service.namespace().unwrap_or_default(),
@@ -5518,9 +5542,6 @@ fn service_row(service: &Service) -> ResourceRow {
         },
     )
     .with_port_forward_ports(service_forward_ports(service));
-    if let Some(raw_value) = raw_value {
-        row = row.with_raw_object(raw_value);
-    }
     let created_unix = row.created_unix;
     let row_name = row.name.to_string();
     let labels = row.labels.to_string();
@@ -5996,6 +6017,38 @@ fn workload_status(deleting: bool, ready: i32, desired: i32) -> String {
     .to_owned()
 }
 
+fn strip_resource_meta<K: Resource>(object: &mut K) {
+    let meta = object.meta_mut();
+    meta.managed_fields = None;
+    if let Some(annotations) = meta.annotations.as_mut() {
+        annotations.remove("kubectl.kubernetes.io/last-applied-configuration");
+    }
+}
+
+fn strip_heavy_json_fields(value: &mut serde_json::Value) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    if let Some(meta) = obj
+        .get_mut("metadata")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        meta.remove("managedFields");
+        if let Some(annotations) = meta
+            .get_mut("annotations")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            annotations.remove("kubectl.kubernetes.io/last-applied-configuration");
+        }
+    }
+    if let Some(status) = obj
+        .get_mut("status")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        status.remove("images");
+    }
+}
+
 fn resource_row<K: ResourceExt + serde::Serialize>(
     resource: &K,
     namespace: String,
@@ -6028,7 +6081,8 @@ fn resource_row<K: ResourceExt + serde::Serialize>(
         None => row,
     };
     row.owner_names = owner_reference_names(resource.meta());
-    if let Ok(raw_value) = serde_json::to_value(resource) {
+    if let Ok(mut raw_value) = serde_json::to_value(resource) {
+        strip_heavy_json_fields(&mut raw_value);
         row = row.with_raw_object(raw_value);
     }
     row
